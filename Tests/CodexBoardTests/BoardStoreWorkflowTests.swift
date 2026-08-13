@@ -188,6 +188,50 @@ final class BoardStoreWorkflowTests: XCTestCase {
         )
     }
 
+    func testRunningTasksPrioritizeExecutionAndCanBeFocused() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+
+        let executingID = try XCTUnwrap(fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Executing task",
+            sourceKind: .issue,
+            sourceText: "Execute this task",
+            autoRun: true
+        ))
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Execution plan"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually { fixture.client.executionTurnCount == 1 }
+
+        let planningID = try XCTUnwrap(fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Planning task",
+            sourceKind: .developmentPlan,
+            sourceText: "Plan this task",
+            autoRun: false
+        ))
+        try await eventually { fixture.client.planningTurnCount == 2 }
+
+        XCTAssertEqual(fixture.store.runningTaskCount, 2)
+        XCTAssertEqual(fixture.store.runningTasks.map(\.id), [executingID, planningID])
+        XCTAssertEqual(fixture.store.projectName(for: fixture.store.runningTasks[0]), fixture.directory.lastPathComponent)
+
+        fixture.store.focusTask(executingID)
+        XCTAssertEqual(fixture.store.selectedProjectID, fixture.projectPath)
+        XCTAssertEqual(fixture.store.selectedTaskID, executingID)
+    }
+
     private func eventually(
         timeout: TimeInterval = 2,
         condition: @escaping @MainActor () -> Bool

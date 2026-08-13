@@ -39,6 +39,7 @@ struct ContentView: View {
                 }
         }
         .navigationTitle(store.selectedProject?.name ?? "CodexBoard")
+        .background(MainWindowMarker())
         .sheet(isPresented: $showingComposer) {
             TaskComposer(store: store, isPresented: $showingComposer)
         }

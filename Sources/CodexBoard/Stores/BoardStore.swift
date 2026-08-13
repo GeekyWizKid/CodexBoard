@@ -66,6 +66,35 @@ final class BoardStore: ObservableObject {
         tasks.count(where: { $0.stage == .executing })
     }
 
+    var runningTasks: [BoardTask] {
+        tasks
+            .filter { $0.stage.isActive }
+            .sorted { lhs, rhs in
+                if lhs.stage != rhs.stage {
+                    return lhs.stage == .executing
+                }
+                if lhs.updatedAt == rhs.updatedAt {
+                    return lhs.id.uuidString < rhs.id.uuidString
+                }
+                return lhs.updatedAt > rhs.updatedAt
+            }
+    }
+
+    var runningTaskCount: Int {
+        tasks.count(where: { $0.stage.isActive })
+    }
+
+    func projectName(for task: BoardTask) -> String {
+        projects.first(where: { $0.id == task.projectID })?.name
+            ?? URL(fileURLWithPath: task.projectID).lastPathComponent
+    }
+
+    func focusTask(_ taskID: UUID) {
+        guard let task = tasks.first(where: { $0.id == taskID }) else { return }
+        selectedProjectID = task.projectID
+        selectedTaskID = taskID
+    }
+
     func tasks(in stage: TaskStage) -> [BoardTask] {
         filteredTasks
             .filter { $0.stage == stage }

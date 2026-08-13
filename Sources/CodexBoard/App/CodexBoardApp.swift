@@ -30,6 +30,22 @@ struct CodexBoardApp: App {
         Settings {
             SettingsView(store: store)
         }
+
+        MenuBarExtra {
+            RunningTasksMenuView(store: store)
+        } label: {
+            if store.runningTaskCount > 0 {
+                Label(
+                    store.runningTaskCount.formatted(),
+                    systemImage: "bolt.circle.fill"
+                )
+                .accessibilityLabel("CodexBoard，\(store.runningTaskCount) 个任务进行中")
+            } else {
+                Image(systemName: "rectangle.3.group")
+                    .accessibilityLabel("CodexBoard，没有进行中的任务")
+            }
+        }
+        .menuBarExtraStyle(.window)
     }
 }
 
@@ -40,7 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
     }
 }
 
