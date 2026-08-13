@@ -59,8 +59,8 @@ struct RunningTasksMenuView: View {
                 Text("CodexBoard")
                     .font(.headline)
                 Text(runningTaskCount == 0
-                     ? "所有任务均处于空闲状态"
-                     : "\(runningTaskCount) 个任务进行中")
+                     ? L10n.text("所有任务均处于空闲状态", fallback: "所有任务均处于空闲状态")
+                     : L10n.format("%lld 个任务运行中", fallback: "%lld 个任务运行中", Int64(runningTaskCount)))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -68,8 +68,12 @@ struct RunningTasksMenuView: View {
             Circle()
                 .fill(store.accountReady ? BoardTheme.completed : BoardTheme.danger)
                 .frame(width: 8, height: 8)
-                .accessibilityLabel(store.accountReady ? "本机 Codex 已连接" : "本机 Codex 未连接")
-                .help(store.accountReady ? "本机 Codex 已连接" : "Codex 未连接")
+                .accessibilityLabel(store.accountReady
+                    ? L10n.text("本机 Codex 已连接", fallback: "本机 Codex 已连接")
+                    : L10n.text("本机 Codex 未连接", fallback: "本机 Codex 未连接"))
+                .help(store.accountReady
+                    ? L10n.text("本机 Codex 已连接", fallback: "本机 Codex 已连接")
+                    : L10n.text("Codex 未连接", fallback: "Codex 未连接"))
         }
         .padding(12)
     }
@@ -139,7 +143,7 @@ private struct RunningTaskRow: View {
                         .foregroundStyle(.secondary)
 
                         if !task.liveMessage.isEmpty {
-                            Text(task.liveMessage)
+                            Text(L10n.localizedRuntimeText(task.liveMessage))
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
                                 .lineLimit(1)

@@ -170,6 +170,54 @@ struct CodexModel: Identifiable, Equatable, Sendable {
     }
 }
 
+struct CodexSkillMetadata: Identifiable, Hashable, Sendable {
+    var id: String { path }
+
+    let name: String
+    let description: String
+    let shortDescription: String?
+    let path: String
+    let scope: String
+    let enabled: Bool
+}
+
+struct CodexAppToolSummary: Identifiable, Hashable, Sendable {
+    var id: String { name }
+
+    let name: String
+    let title: String?
+    let description: String
+    let isEnabled: Bool
+    let isReadOnly: Bool
+    let disabledReason: String?
+}
+
+struct CodexApp: Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+    let invocationName: String
+    let description: String
+    let isAccessible: Bool
+    let isEnabled: Bool
+    let isCallable: Bool
+    let tools: [CodexAppToolSummary]
+
+    var enabledTools: [CodexAppToolSummary] {
+        tools.filter(\.isEnabled)
+    }
+
+    var supportsReadOnlyUse: Bool {
+        isEnabled
+            && isCallable
+            && !enabledTools.isEmpty
+            && enabledTools.allSatisfy(\.isReadOnly)
+    }
+
+    var containsWriteTools: Bool {
+        enabledTools.contains { !$0.isReadOnly }
+    }
+}
+
 struct CodexStartedThread: Equatable, Sendable {
     let threadID: String
     let sessionID: String
@@ -185,6 +233,8 @@ struct CodexStartedTurn: Equatable, Sendable {
 enum CodexTurnInput: Equatable, Sendable {
     case text(String)
     case localImage(path: String)
+    case skill(name: String, path: String)
+    case mention(name: String, path: String)
 
     var wireValue: JSONValue {
         switch self {
@@ -198,13 +248,160 @@ enum CodexTurnInput: Equatable, Sendable {
                 "type": .string("localImage"),
                 "path": .string(path)
             ])
+        case let .skill(name, path):
+            .object([
+                "type": .string("skill"),
+                "name": .string(name),
+                "path": .string(path)
+            ])
+        case let .mention(name, path):
+            .object([
+                "type": .string("mention"),
+                "name": .string(name),
+                "path": .string(path)
+            ])
         }
     }
+}
+
+enum CodexRequestID: Hashable, Sendable {
+    case string(String)
+    case integer(Int64)
+
+    var displayValue: String {
+        switch self {
+        case let .string(value): value
+        case let .integer(value): String(value)
+        }
+    }
+}
+
+enum CodexApprovalDecision: String, CaseIterable, Hashable, Sendable {
+    case accept
+    case acceptForSession
+    case decline
+    case cancel
+}
+
+struct CodexCommandApproval: Equatable, Sendable {
+    let command: String?
+    let cwd: String?
+    let reason: String?
+    let commandActions: JSONValue?
+    let requestedPermissions: JSONValue?
+    let availableDecisions: [CodexApprovalDecision]?
+}
+
+struct CodexFileChangeApproval: Equatable, Sendable {
+    let reason: String?
+    let grantRoot: String?
+}
+
+struct CodexUserInputOption: Hashable, Sendable {
+    let label: String
+    let description: String
+}
+
+struct CodexUserInputQuestion: Identifiable, Hashable, Sendable {
+    let id: String
+    let header: String
+    let question: String
+    let isOther: Bool
+    let isSecret: Bool
+    let options: [CodexUserInputOption]?
+}
+
+struct CodexUserInputRequest: Equatable, Sendable {
+    let questions: [CodexUserInputQuestion]
+    let isBlocking: Bool
+}
+
+struct CodexPermissionsApproval: Equatable, Sendable {
+    let cwd: String
+    let reason: String?
+    let permissions: JSONValue
+}
+
+enum CodexMCPElicitationMode: String, Hashable, Sendable {
+    case form
+    case openAIForm = "openai/form"
+    case url
+}
+
+struct CodexMCPElicitation: Equatable, Sendable {
+    let serverName: String
+    let mode: CodexMCPElicitationMode
+    let message: String
+    let requestedSchema: JSONValue?
+    let url: URL?
+    let elicitationID: String?
+    let metadata: JSONValue?
+}
+
+struct CodexInteractionRequest: Identifiable, Equatable, Sendable {
+    enum Kind: Equatable, Sendable {
+        case commandApproval(CodexCommandApproval)
+        case fileChangeApproval(CodexFileChangeApproval)
+        case userInput(CodexUserInputRequest)
+        case permissionsApproval(CodexPermissionsApproval)
+        case mcpElicitation(CodexMCPElicitation)
+    }
+
+    let id: CodexRequestID
+    let threadID: String
+    let turnID: String?
+    let itemID: String?
+    let kind: Kind
+    let createdAt: Date
+}
+
+enum CodexPermissionScope: String, Hashable, Sendable {
+    case turn
+    case session
+}
+
+enum CodexPermissionDecision: Equatable, Sendable {
+    case deny(scope: CodexPermissionScope)
+    case grant(permissions: JSONValue, scope: CodexPermissionScope)
+}
+
+enum CodexMCPElicitationResponse: Equatable, Sendable {
+    case accept(content: JSONValue, metadata: JSONValue?)
+    case acceptURL
+    case decline
+    case cancel
+}
+
+enum CodexInteractionResponse: Equatable, Sendable {
+    case approval(CodexApprovalDecision)
+    case userInput([String: [String]])
+    case permissions(CodexPermissionDecision)
+    case mcpElicitation(CodexMCPElicitationResponse)
+}
+
+struct CodexMCPServerStatus: Identifiable, Hashable, Sendable {
+    var id: String { name }
+
+    let name: String
+    let authStatus: String
+    let title: String?
+    let description: String?
+    let version: String?
+    let websiteURL: URL?
+    let toolNames: [String]
+}
+
+struct CodexMCPOAuthCompletion: Equatable, Sendable {
+    let serverName: String
+    let threadID: String?
+    let success: Bool
+    let error: String?
 }
 
 enum CodexEvent: Sendable {
     case agentDelta(threadID: String, turnID: String, delta: String)
     case agentFinal(threadID: String, turnID: String, text: String)
+    case turnDiffUpdated(threadID: String, turnID: String, diff: String)
     case planFinal(threadID: String, turnID: String, text: String)
     case planUpdated(threadID: String, turnID: String, explanation: String?, steps: [CodexPlanStep])
     case turnCompleted(threadID: String, turnID: String, status: String, error: String?)
@@ -212,6 +409,9 @@ enum CodexEvent: Sendable {
     case configurationWarning(threadID: String?, turnID: String?, message: String)
     case warning(threadID: String?, turnID: String?, message: String)
     case threadStatus(threadID: String, status: String)
+    case interactionRequested(CodexInteractionRequest)
+    case interactionResolved(threadID: String, requestID: CodexRequestID)
+    case mcpOAuthCompleted(CodexMCPOAuthCompletion)
     case connectionLost(message: String)
 }
 

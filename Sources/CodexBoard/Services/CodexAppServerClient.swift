@@ -2,6 +2,10 @@ import Foundation
 
 @MainActor
 final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
+    static let mcpServerStatusListMethod = "mcpServerStatus/list"
+    static let mcpOAuthLoginMethod = "mcpServer/oauth/login"
+    static let mcpOAuthCompletionMethod = "mcpServer/oauthLogin/completed"
+
     @Published private(set) var connectionState: CodexConnectionState = .disconnected
     @Published private(set) var lastError: String?
 
@@ -11,6 +15,43 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         var timeoutTask: Task<Void, Never>?
     }
 
+    private struct PendingInteraction {
+        let method: String
+        let request: CodexInteractionRequest
+    }
+
+    struct AppListPage: Equatable {
+        let apps: [ParsedAppInfo]
+        let nextCursor: String?
+    }
+
+    struct ParsedAppInfo: Equatable {
+        let id: String
+        let name: String
+        let description: String?
+        let isAccessible: Bool
+        let isEnabled: Bool
+    }
+
+    struct ParsedInstalledApp: Equatable {
+        let id: String
+        let isEnabled: Bool
+        let isCallable: Bool
+        let runtimeName: String?
+    }
+
+    struct ParsedConnectorMetadata: Equatable {
+        let id: String
+        let name: String?
+        let description: String?
+        let tools: [CodexAppToolSummary]
+    }
+
+    struct MCPServerPage: Equatable {
+        let servers: [CodexMCPServerStatus]
+        let nextCursor: String?
+    }
+
     private let resolver: CodexExecutableResolver
     private let parser = RPCMessageParser()
     private let requestTimeout: TimeInterval
@@ -18,7 +59,12 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     private var connectWaiters: [CheckedContinuation<Void, Error>] = []
     private var nextRequestID = 1
     private var pendingRequests: [Int: PendingRequest] = [:]
+    private var pendingInteractions: [CodexRequestID: PendingInteraction] = [:]
     private var eventContinuation: AsyncStream<CodexEvent>.Continuation?
+
+    var pendingInteractionIDs: Set<CodexRequestID> {
+        Set(pendingInteractions.keys)
+    }
 
     lazy var events: AsyncStream<CodexEvent> = AsyncStream { [weak self] continuation in
         Task { @MainActor [weak self] in
@@ -57,16 +103,8 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             newTransport.delegate = self
             transport = newTransport
             try newTransport.start()
-            _ = try await request(method: "initialize", params: .object([
-                "clientInfo": .object([
-                    "name": .string("codex_board"),
-                    "title": .string("CodexBoard"),
-                    "version": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0")
-                ]),
-                "capabilities": .object([
-                    "experimentalApi": .bool(true)
-                ])
-            ]))
+            let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
+            _ = try await request(method: "initialize", params: Self.makeInitializeParams(version: version))
             try notify(method: "initialized", params: .object([:]))
             connectionState = .connected
             resumeConnectWaiters()
@@ -121,6 +159,119 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         return models
     }
 
+    func listSkills(cwds: [String], forceReload: Bool) async throws -> [String: [CodexSkillMetadata]] {
+        try await ensureConnected()
+        let value = try await request(
+            method: "skills/list",
+            params: Self.makeSkillsListParams(cwds: cwds, forceReload: forceReload)
+        )
+        return try Self.parseSkillsListResponse(value)
+    }
+
+    func listApps(forceRefresh: Bool) async throws -> [CodexApp] {
+        try await listApps(forceRefresh: forceRefresh, threadID: nil)
+    }
+
+    func listApps(forceRefresh: Bool, threadID: String?) async throws -> [CodexApp] {
+        try await ensureConnected()
+        var listedApps: [ParsedAppInfo] = []
+        var cursor: String?
+        var seenCursors: Set<String> = []
+        var isFirstPage = true
+
+        repeat {
+            let value = try await request(
+                method: "app/list",
+                params: Self.makeAppsListParams(
+                    cursor: cursor,
+                    forceRefetch: isFirstPage && forceRefresh,
+                    threadID: threadID
+                )
+            )
+            let page = try Self.parseAppListResponse(value)
+            listedApps.append(contentsOf: page.apps)
+            cursor = page.nextCursor
+            if let cursor, !seenCursors.insert(cursor).inserted {
+                throw CodexClientError.invalidResponse("app/list 返回了重复 cursor")
+            }
+            isFirstPage = false
+        } while cursor != nil
+
+        let installedValue = try await request(
+            method: "app/installed",
+            params: Self.makeAppsInstalledParams(
+                forceRefresh: forceRefresh,
+                threadID: threadID
+            )
+        )
+        let installedApps = try Self.parseAppsInstalledResponse(installedValue)
+
+        var seenAppIDs: Set<String> = []
+        let accessibleAppIDs = listedApps.compactMap { app -> String? in
+            guard app.isAccessible, seenAppIDs.insert(app.id).inserted else { return nil }
+            return app.id
+        }
+        var connectorMetadata: [ParsedConnectorMetadata] = []
+        for appIDs in Self.appIDBatches(accessibleAppIDs) {
+            let value = try await request(
+                method: "app/read",
+                params: Self.makeAppsReadParams(appIDs: appIDs)
+            )
+            connectorMetadata.append(contentsOf: try Self.parseAppsReadResponse(value))
+        }
+
+        return Self.mergeApps(
+            listed: listedApps,
+            installed: installedApps,
+            metadata: connectorMetadata
+        )
+    }
+
+    func listMCPServers(threadID: String?) async throws -> [CodexMCPServerStatus] {
+        try await ensureConnected()
+        var servers: [CodexMCPServerStatus] = []
+        var cursor: String?
+        var seenCursors: Set<String> = []
+
+        repeat {
+            let value = try await request(
+                method: Self.mcpServerStatusListMethod,
+                params: Self.makeMCPServerListParams(cursor: cursor, threadID: threadID)
+            )
+            let page = try Self.parseMCPServerListResponse(value)
+            servers.append(contentsOf: page.servers)
+            cursor = page.nextCursor
+            if let cursor, !seenCursors.insert(cursor).inserted {
+                throw CodexClientError.invalidResponse("mcpServerStatus/list 返回了重复 cursor")
+            }
+        } while cursor != nil
+
+        var seenNames: Set<String> = []
+        return servers.filter { seenNames.insert($0.name).inserted }
+    }
+
+    func beginMCPOAuth(serverName: String, threadID: String?) async throws -> URL {
+        try await ensureConnected()
+        let value = try await request(
+            method: Self.mcpOAuthLoginMethod,
+            params: Self.makeMCPOAuthLoginParams(serverName: serverName, threadID: threadID)
+        )
+        return try Self.parseMCPOAuthLoginResponse(value)
+    }
+
+    func respond(to requestID: CodexRequestID, with response: CodexInteractionResponse) async throws {
+        guard let pending = pendingInteractions[requestID] else {
+            throw CodexClientError.invalidResponse("交互请求已失效或已响应")
+        }
+        let result = try Self.makeInteractionResponse(
+            method: pending.method,
+            request: pending.request,
+            response: response
+        )
+        try respond(id: Self.wireValue(for: requestID), result: result)
+        pendingInteractions.removeValue(forKey: requestID)
+    }
+
     func listThreads(cursor: String?, archived: Bool) async throws -> CodexThreadPage {
         try await ensureConnected()
         var params: [String: JSONValue] = [
@@ -160,11 +311,10 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
 
     func resumeThread(threadID: String, cwd: String) async throws -> CodexStartedThread {
         try await ensureConnected()
-        let value = try await request(method: "thread/resume", params: .object([
-            "threadId": .string(threadID),
-            "cwd": .string(cwd),
-            "runtimeWorkspaceRoots": .array([.string(cwd)])
-        ]))
+        let value = try await request(
+            method: "thread/resume",
+            params: Self.makeThreadResumeParams(threadID: threadID, cwd: cwd)
+        )
         guard let thread = value["thread"],
               let resultThreadID = thread["id"]?.stringValue,
               let sessionID = thread["sessionId"]?.stringValue,
@@ -231,7 +381,7 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
                 "excludeTmpdirEnvVar": .bool(true),
                 "excludeSlashTmp": .bool(true)
             ]),
-            approvalPolicy: "never"
+            approvalPolicy: "on-request"
         )
     }
 
@@ -289,6 +439,91 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         return .object(params)
     }
 
+    static func makeThreadResumeParams(threadID: String, cwd: String) -> JSONValue {
+        .object([
+            "threadId": .string(threadID),
+            "cwd": .string(cwd),
+            "runtimeWorkspaceRoots": .array([.string(cwd)]),
+            // CodexBoard persists its own task/run projections and never reads
+            // thread.turns from this response. Excluding them also prevents a
+            // long-running thread from becoming one enormous JSONL line.
+            "excludeTurns": .bool(true)
+        ])
+    }
+
+    static func makeInitializeParams(version: String) -> JSONValue {
+        .object([
+            "clientInfo": .object([
+                "name": .string("codex_board"),
+                "title": .string("CodexBoard"),
+                "version": .string(version)
+            ]),
+            "capabilities": .object([
+                "experimentalApi": .bool(true),
+                "extensions": .object([
+                    "openai/form": .object([:])
+                ])
+            ])
+        ])
+    }
+
+    static func makeSkillsListParams(cwds: [String], forceReload: Bool) -> JSONValue {
+        .object([
+            "cwds": .array(cwds.map(JSONValue.string)),
+            "forceReload": .bool(forceReload)
+        ])
+    }
+
+    static func makeAppsListParams(
+        cursor: String?,
+        forceRefetch: Bool,
+        threadID: String? = nil
+    ) -> JSONValue {
+        var params: [String: JSONValue] = ["limit": .integer(100)]
+        if let cursor { params["cursor"] = .string(cursor) }
+        if forceRefetch { params["forceRefetch"] = .bool(true) }
+        if let threadID { params["threadId"] = .string(threadID) }
+        return .object(params)
+    }
+
+    static func makeAppsInstalledParams(
+        forceRefresh: Bool,
+        threadID: String? = nil
+    ) -> JSONValue {
+        var params: [String: JSONValue] = ["forceRefresh": .bool(forceRefresh)]
+        if let threadID { params["threadId"] = .string(threadID) }
+        return .object(params)
+    }
+
+    static func makeAppsReadParams(appIDs: [String]) -> JSONValue {
+        .object([
+            "appIds": .array(appIDs.map(JSONValue.string)),
+            "includeTools": .bool(true)
+        ])
+    }
+
+    static func makeMCPServerListParams(cursor: String?, threadID: String?) -> JSONValue {
+        var params: [String: JSONValue] = [
+            "limit": .integer(100),
+            "detail": .string("toolsAndAuthOnly")
+        ]
+        if let cursor { params["cursor"] = .string(cursor) }
+        if let threadID { params["threadId"] = .string(threadID) }
+        return .object(params)
+    }
+
+    static func makeMCPOAuthLoginParams(serverName: String, threadID: String?) -> JSONValue {
+        var params: [String: JSONValue] = ["name": .string(serverName)]
+        if let threadID { params["threadId"] = .string(threadID) }
+        return .object(params)
+    }
+
+    static func appIDBatches(_ appIDs: [String]) -> [[String]] {
+        stride(from: 0, to: appIDs.count, by: 100).map { start in
+            Array(appIDs[start..<min(start + 100, appIDs.count)])
+        }
+    }
+
     static func makeTurnStartParams(
         threadID: String,
         cwd: String,
@@ -308,6 +543,7 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             "summary": .string("concise"),
             "personality": .string("pragmatic"),
             "approvalPolicy": .string(approvalPolicy),
+            "approvalsReviewer": .string("user"),
             "sandboxPolicy": sandboxPolicy,
             "runtimeWorkspaceRoots": .array([.string(cwd)]),
             "collaborationMode": .object([
@@ -376,6 +612,15 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         ])))
     }
 
+    private func respond(id: JSONValue, errorCode: Int64, message: String) throws {
+        guard let transport else { throw CodexClientError.disconnected }
+        try transport.send(try JSONEncoder().encode(Self.makeRPCErrorResponse(
+            id: id,
+            code: errorCode,
+            message: message
+        )))
+    }
+
     private func receive(_ data: Data) {
         let message: RPCMessage
         do {
@@ -407,38 +652,32 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         handleNotification(method: method, params: message.params)
     }
 
-    private func handleServerRequest(id: JSONValue, method: String, params: JSONValue?) {
+    func handleServerRequest(id: JSONValue, method: String, params: JSONValue?) {
         do {
             switch method {
             case "currentTime/read":
                 try respond(id: id, result: .object([
                     "currentTimeAt": .integer(Int64(Date().timeIntervalSince1970))
                 ]))
-            case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
-                try respond(id: id, result: .object(["decision": .string("decline")]))
-                emitWarning(params: params, message: "Codex 请求了超出当前任务沙箱的操作，已自动拒绝。")
-            case "item/tool/requestUserInput":
-                var answers: [String: JSONValue] = [:]
-                for question in params?["questions"]?.arrayValue ?? [] {
-                    if let questionID = question["id"]?.stringValue {
-                        answers[questionID] = .object(["answers": .array([])])
-                    }
+            case "item/commandExecution/requestApproval",
+                 "item/fileChange/requestApproval",
+                 "item/tool/requestUserInput",
+                 "item/permissions/requestApproval",
+                 "mcpServer/elicitation/request":
+                guard let request = Self.parseInteractionRequest(
+                    id: id,
+                    method: method,
+                    params: params
+                ) else {
+                    try respond(id: id, errorCode: -32602, message: "Invalid interaction request params")
+                    return
                 }
-                try respond(id: id, result: .object(["answers": .object(answers)]))
-                emitWarning(params: params, message: "任务需要补充输入；请在 CodexBoard 中检查并重新规划。")
-            case "item/permissions/requestApproval":
-                try respond(id: id, result: .object([
-                    "permissions": .object([:]),
-                    "scope": .string("turn")
-                ]))
-                emitWarning(params: params, message: "Codex 请求了额外权限，已拒绝扩大当前任务边界。")
-            case "mcpServer/elicitation/request":
-                try respond(id: id, result: .object([
-                    "action": .string("cancel"),
-                    "content": .null,
-                    "_meta": .null
-                ]))
-                emitWarning(params: params, message: "外部工具请求了额外输入，已取消并暂停自动推断。")
+                guard pendingInteractions[request.id] == nil else {
+                    try respond(id: id, errorCode: -32600, message: "Duplicate interaction request id")
+                    return
+                }
+                pendingInteractions[request.id] = PendingInteraction(method: method, request: request)
+                eventContinuation?.yield(.interactionRequested(request))
             case "applyPatchApproval", "execCommandApproval":
                 try respond(id: id, result: .object([
                     "decision": .object([
@@ -447,18 +686,34 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
                 ]))
                 emitWarning(params: params, message: "旧版 Codex 请求了沙箱外操作，已拒绝。")
             default:
-                try respond(id: id, result: .object([:]))
-                emitWarning(params: params, message: "未支持的 Codex 请求已安全忽略：\(method)")
+                try respond(id: id, errorCode: -32601, message: "Method not found: \(method)")
+                emitWarning(params: params, message: "未支持的 Codex 请求已拒绝：\(method)")
             }
         } catch {
             lastError = error.localizedDescription
         }
     }
 
-    private func handleNotification(method: String, params: JSONValue?) {
+    func handleNotification(method: String, params: JSONValue?) {
         guard let params else { return }
         let threadID = params["threadId"]?.stringValue
         let turnID = params["turnId"]?.stringValue
+        if method == "serverRequest/resolved",
+           let threadID,
+           let requestIDValue = params["requestId"],
+           let requestID = Self.parseRequestID(requestIDValue) {
+            pendingInteractions.removeValue(forKey: requestID)
+            eventContinuation?.yield(.interactionResolved(threadID: threadID, requestID: requestID))
+            return
+        }
+        if let completion = Self.parseMCPOAuthCompletion(method: method, params: params) {
+            eventContinuation?.yield(.mcpOAuthCompleted(completion))
+            return
+        }
+        if let event = Self.turnDiffEvent(method: method, params: params) {
+            eventContinuation?.yield(event)
+            return
+        }
         if let event = Self.warningEvent(method: method, params: params) {
             eventContinuation?.yield(event)
             return
@@ -507,6 +762,15 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         }
     }
 
+    static func turnDiffEvent(method: String, params: JSONValue) -> CodexEvent? {
+        guard method == "turn/diff/updated",
+              let threadID = params["threadId"]?.stringValue,
+              let turnID = params["turnId"]?.stringValue,
+              let diff = params["diff"]?.stringValue
+        else { return nil }
+        return .turnDiffUpdated(threadID: threadID, turnID: turnID, diff: diff)
+    }
+
     static func warningEvent(method: String, params: JSONValue) -> CodexEvent? {
         let threadID = params["threadId"]?.stringValue
         let turnID = params["turnId"]?.stringValue
@@ -527,6 +791,459 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             turnID: params?["turnId"]?.stringValue,
             message: message
         ))
+    }
+
+    static func parseRequestID(_ value: JSONValue) -> CodexRequestID? {
+        switch value {
+        case let .string(id): .string(id)
+        case let .integer(id): .integer(id)
+        default: nil
+        }
+    }
+
+    static func wireValue(for requestID: CodexRequestID) -> JSONValue {
+        switch requestID {
+        case let .string(id): .string(id)
+        case let .integer(id): .integer(id)
+        }
+    }
+
+    static func makeRPCErrorResponse(id: JSONValue, code: Int64, message: String) -> JSONValue {
+        .object([
+            "id": id,
+            "error": .object([
+                "code": .integer(code),
+                "message": .string(message)
+            ])
+        ])
+    }
+
+    static func parseInteractionRequest(
+        id: JSONValue,
+        method: String,
+        params: JSONValue?,
+        receivedAt: Date = Date()
+    ) -> CodexInteractionRequest? {
+        guard let requestID = parseRequestID(id),
+              let params,
+              let threadID = params["threadId"]?.stringValue
+        else { return nil }
+
+        let turnID = params["turnId"]?.stringValue
+        let itemID = params["itemId"]?.stringValue
+        let createdAt = interactionCreatedAt(params: params, fallback: receivedAt)
+        let kind: CodexInteractionRequest.Kind
+
+        switch method {
+        case "item/commandExecution/requestApproval":
+            guard turnID != nil,
+                  itemID != nil,
+                  case .integer? = params["startedAtMs"]
+            else { return nil }
+            let availableDecisions: [CodexApprovalDecision]?
+            if let values = params["availableDecisions"]?.arrayValue {
+                availableDecisions = values.compactMap { value in
+                    value.stringValue.flatMap { CodexApprovalDecision(rawValue: $0) }
+                }
+            } else {
+                availableDecisions = nil
+            }
+            kind = .commandApproval(CodexCommandApproval(
+                command: params["command"]?.stringValue,
+                cwd: params["cwd"]?.stringValue,
+                reason: params["reason"]?.stringValue,
+                commandActions: params["commandActions"],
+                requestedPermissions: params["additionalPermissions"],
+                availableDecisions: availableDecisions
+            ))
+        case "item/fileChange/requestApproval":
+            guard turnID != nil,
+                  itemID != nil,
+                  case .integer? = params["startedAtMs"]
+            else { return nil }
+            kind = .fileChangeApproval(CodexFileChangeApproval(
+                reason: params["reason"]?.stringValue,
+                grantRoot: params["grantRoot"]?.stringValue
+            ))
+        case "item/tool/requestUserInput":
+            guard turnID != nil,
+                  itemID != nil,
+                  let isBlocking = params["isBlocking"]?.boolValue,
+                  let questionValues = params["questions"]?.arrayValue,
+                  (1...3).contains(questionValues.count)
+            else { return nil }
+            let questions = questionValues.compactMap(Self.parseUserInputQuestion)
+            guard questions.count == questionValues.count,
+                  Set(questions.map(\.id)).count == questions.count
+            else { return nil }
+            kind = .userInput(CodexUserInputRequest(
+                questions: questions,
+                isBlocking: isBlocking
+            ))
+        case "item/permissions/requestApproval":
+            guard turnID != nil,
+                  itemID != nil,
+                  case .integer? = params["startedAtMs"],
+                  let cwd = params["cwd"]?.stringValue,
+                  let permissions = params["permissions"],
+                  permissions.objectValue != nil
+            else { return nil }
+            kind = .permissionsApproval(CodexPermissionsApproval(
+                cwd: cwd,
+                reason: params["reason"]?.stringValue,
+                permissions: permissions
+            ))
+        case "mcpServer/elicitation/request":
+            guard let serverName = params["serverName"]?.stringValue,
+                  let rawMode = params["mode"]?.stringValue,
+                  let mode = CodexMCPElicitationMode(rawValue: rawMode),
+                  let message = params["message"]?.stringValue
+            else { return nil }
+            let url: URL?
+            switch mode {
+            case .form, .openAIForm:
+                guard params["requestedSchema"] != nil else { return nil }
+                url = nil
+            case .url:
+                guard params["elicitationId"]?.stringValue != nil,
+                      let rawURL = params["url"]?.stringValue,
+                      let safeURL = safeHTTPURL(rawURL)
+                else { return nil }
+                url = safeURL
+            }
+            kind = .mcpElicitation(CodexMCPElicitation(
+                serverName: serverName,
+                mode: mode,
+                message: message,
+                requestedSchema: params["requestedSchema"],
+                url: url,
+                elicitationID: params["elicitationId"]?.stringValue,
+                metadata: params["_meta"]
+            ))
+        default:
+            return nil
+        }
+
+        return CodexInteractionRequest(
+            id: requestID,
+            threadID: threadID,
+            turnID: turnID,
+            itemID: itemID,
+            kind: kind,
+            createdAt: createdAt
+        )
+    }
+
+    static func parseUserInputQuestion(_ value: JSONValue) -> CodexUserInputQuestion? {
+        guard let id = value["id"]?.stringValue,
+              let header = value["header"]?.stringValue,
+              let question = value["question"]?.stringValue
+        else { return nil }
+
+        let options: [CodexUserInputOption]?
+        if let values = value["options"]?.arrayValue {
+            let parsed = values.compactMap { option -> CodexUserInputOption? in
+                guard let label = option["label"]?.stringValue,
+                      let description = option["description"]?.stringValue
+                else { return nil }
+                return CodexUserInputOption(label: label, description: description)
+            }
+            guard parsed.count == values.count else { return nil }
+            options = parsed
+        } else {
+            options = nil
+        }
+
+        return CodexUserInputQuestion(
+            id: id,
+            header: header,
+            question: question,
+            isOther: value["isOther"]?.boolValue ?? false,
+            isSecret: value["isSecret"]?.boolValue ?? false,
+            options: options
+        )
+    }
+
+    static func makeInteractionResponse(
+        method: String,
+        request: CodexInteractionRequest,
+        response: CodexInteractionResponse
+    ) throws -> JSONValue {
+        guard method == interactionMethod(for: request.kind) else {
+            throw CodexClientError.invalidResponse("交互请求 method 与类型不匹配")
+        }
+
+        switch (request.kind, response) {
+        case let (.commandApproval(approval), .approval(decision)):
+            if let available = approval.availableDecisions, !available.contains(decision) {
+                throw CodexClientError.invalidResponse("命令审批 decision 不在服务端允许范围内")
+            }
+            return .object(["decision": .string(decision.rawValue)])
+        case (.fileChangeApproval, let .approval(decision)):
+            return .object(["decision": .string(decision.rawValue)])
+        case let (.userInput(input), .userInput(answers)):
+            let expectedIDs = Set(input.questions.map(\.id))
+            guard Set(answers.keys) == expectedIDs else {
+                throw CodexClientError.invalidResponse("用户输入答案与 question id 不匹配")
+            }
+            return .object([
+                "answers": .object(answers.mapValues { values in
+                    .object(["answers": .array(values.map(JSONValue.string))])
+                })
+            ])
+        case let (.permissionsApproval(approval), .permissions(decision)):
+            switch decision {
+            case let .deny(scope):
+                return .object([
+                    "permissions": .object([:]),
+                    "scope": .string(scope.rawValue)
+                ])
+            case let .grant(permissions, scope):
+                guard permissions.objectValue != nil,
+                      permissions == approval.permissions
+                else {
+                    throw CodexClientError.invalidResponse("permissions grant 必须精确匹配服务端请求")
+                }
+                return .object([
+                    "permissions": permissions,
+                    "scope": .string(scope.rawValue)
+                ])
+            }
+        case let (.mcpElicitation(elicitation), .mcpElicitation(elicitationResponse)):
+            switch (elicitation.mode, elicitationResponse) {
+            case let (.form, .accept(content, metadata)),
+                 let (.openAIForm, .accept(content, metadata)):
+                guard content.objectValue != nil else {
+                    throw CodexClientError.invalidResponse("MCP 表单响应必须是 JSON object")
+                }
+                var result: [String: JSONValue] = [
+                    "action": .string("accept"),
+                    "content": content
+                ]
+                if let metadata { result["_meta"] = metadata }
+                return .object(result)
+            case (.url, .acceptURL):
+                return .object(["action": .string("accept")])
+            case (_, .decline):
+                return .object(["action": .string("decline")])
+            case (_, .cancel):
+                return .object(["action": .string("cancel")])
+            case (.url, .accept), (.form, .acceptURL), (.openAIForm, .acceptURL):
+                throw CodexClientError.invalidResponse("MCP 响应类型与 elicitation mode 不匹配")
+            }
+        default:
+            throw CodexClientError.invalidResponse("响应类型与交互请求不匹配")
+        }
+    }
+
+    static func interactionMethod(for kind: CodexInteractionRequest.Kind) -> String {
+        switch kind {
+        case .commandApproval: "item/commandExecution/requestApproval"
+        case .fileChangeApproval: "item/fileChange/requestApproval"
+        case .userInput: "item/tool/requestUserInput"
+        case .permissionsApproval: "item/permissions/requestApproval"
+        case .mcpElicitation: "mcpServer/elicitation/request"
+        }
+    }
+
+    static func parseMCPServerListResponse(_ value: JSONValue) throws -> MCPServerPage {
+        guard let data = value["data"]?.arrayValue else {
+            throw CodexClientError.invalidResponse("mcpServerStatus/list 缺少 data")
+        }
+        return MCPServerPage(
+            servers: data.compactMap(Self.parseMCPServerStatus),
+            nextCursor: value["nextCursor"]?.stringValue
+        )
+    }
+
+    static func parseMCPServerStatus(_ value: JSONValue) -> CodexMCPServerStatus? {
+        guard let name = value["name"]?.stringValue else { return nil }
+        let serverInfo = value["serverInfo"]
+        return CodexMCPServerStatus(
+            name: name,
+            authStatus: value["authStatus"]?.stringValue ?? "unknown",
+            title: serverInfo?["title"]?.stringValue,
+            description: serverInfo?["description"]?.stringValue,
+            version: serverInfo?["version"]?.stringValue,
+            websiteURL: serverInfo?["websiteUrl"]?.stringValue.flatMap { safeHTTPURL($0) },
+            toolNames: value["tools"]?.objectValue?.keys.sorted() ?? []
+        )
+    }
+
+    static func parseMCPOAuthLoginResponse(_ value: JSONValue) throws -> URL {
+        guard let rawURL = value["authorizationUrl"]?.stringValue,
+              let url = safeHTTPURL(rawURL)
+        else {
+            throw CodexClientError.invalidResponse("mcpServer/oauth/login 返回了非 HTTP(S) URL")
+        }
+        return url
+    }
+
+    static func parseMCPOAuthCompletion(method: String, params: JSONValue) -> CodexMCPOAuthCompletion? {
+        guard method == mcpOAuthCompletionMethod,
+              let serverName = params["name"]?.stringValue,
+              let success = params["success"]?.boolValue
+        else { return nil }
+        return CodexMCPOAuthCompletion(
+            serverName: serverName,
+            threadID: params["threadId"]?.stringValue,
+            success: success,
+            error: params["error"]?.stringValue
+        )
+    }
+
+    private static func interactionCreatedAt(params: JSONValue, fallback: Date) -> Date {
+        guard case let .integer(milliseconds)? = params["startedAtMs"] else { return fallback }
+        return Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000)
+    }
+
+    private static func safeHTTPURL(_ rawValue: String) -> URL? {
+        guard let url = URL(string: rawValue),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil
+        else { return nil }
+        return url
+    }
+
+    static func parseSkillsListResponse(_ value: JSONValue) throws -> [String: [CodexSkillMetadata]] {
+        guard let entries = value["data"]?.arrayValue else {
+            throw CodexClientError.invalidResponse("skills/list 缺少 data")
+        }
+
+        var result: [String: [CodexSkillMetadata]] = [:]
+        for entry in entries {
+            guard let cwd = entry["cwd"]?.stringValue else { continue }
+            let skills = entry["skills"]?.arrayValue?.compactMap(Self.parseSkillMetadata) ?? []
+            result[cwd, default: []].append(contentsOf: skills)
+        }
+        return result
+    }
+
+    static func parseSkillMetadata(_ value: JSONValue) -> CodexSkillMetadata? {
+        guard let name = value["name"]?.stringValue,
+              let path = value["path"]?.stringValue
+        else { return nil }
+
+        return CodexSkillMetadata(
+            name: name,
+            description: value["description"]?.stringValue ?? "",
+            shortDescription: value["interface"]?["shortDescription"]?.stringValue
+                ?? value["shortDescription"]?.stringValue,
+            path: path,
+            scope: value["scope"]?.stringValue ?? "unknown",
+            enabled: value["enabled"]?.boolValue ?? false
+        )
+    }
+
+    static func parseAppListResponse(_ value: JSONValue) throws -> AppListPage {
+        guard let data = value["data"]?.arrayValue else {
+            throw CodexClientError.invalidResponse("app/list 缺少 data")
+        }
+        return AppListPage(
+            apps: data.compactMap(Self.parseAppInfo),
+            nextCursor: value["nextCursor"]?.stringValue
+        )
+    }
+
+    static func parseAppInfo(_ value: JSONValue) -> ParsedAppInfo? {
+        guard let id = value["id"]?.stringValue,
+              let name = value["name"]?.stringValue
+        else { return nil }
+
+        return ParsedAppInfo(
+            id: id,
+            name: name,
+            description: value["description"]?.stringValue,
+            isAccessible: value["isAccessible"]?.boolValue ?? false,
+            isEnabled: value["isEnabled"]?.boolValue ?? true
+        )
+    }
+
+    static func parseAppsInstalledResponse(_ value: JSONValue) throws -> [ParsedInstalledApp] {
+        guard let apps = value["apps"]?.arrayValue else {
+            throw CodexClientError.invalidResponse("app/installed 缺少 apps")
+        }
+        return apps.compactMap(Self.parseInstalledApp)
+    }
+
+    static func parseInstalledApp(_ value: JSONValue) -> ParsedInstalledApp? {
+        guard let id = value["id"]?.stringValue else { return nil }
+        return ParsedInstalledApp(
+            id: id,
+            isEnabled: value["enabled"]?.boolValue ?? false,
+            isCallable: value["callable"]?.boolValue ?? false,
+            runtimeName: value["runtimeName"]?.stringValue
+        )
+    }
+
+    static func parseAppsReadResponse(_ value: JSONValue) throws -> [ParsedConnectorMetadata] {
+        guard let apps = value["apps"]?.arrayValue else {
+            throw CodexClientError.invalidResponse("app/read 缺少 apps")
+        }
+        return apps.compactMap(Self.parseConnectorMetadata)
+    }
+
+    static func parseConnectorMetadata(_ value: JSONValue) -> ParsedConnectorMetadata? {
+        guard let id = value["id"]?.stringValue else { return nil }
+        let tools = value["toolSummaries"]?.arrayValue?.compactMap(Self.parseAppToolSummary) ?? []
+        return ParsedConnectorMetadata(
+            id: id,
+            name: value["name"]?.stringValue,
+            description: value["description"]?.stringValue,
+            tools: tools
+        )
+    }
+
+    static func parseAppToolSummary(_ value: JSONValue) -> CodexAppToolSummary? {
+        guard let name = value["name"]?.stringValue else { return nil }
+        return CodexAppToolSummary(
+            name: name,
+            title: value["title"]?.stringValue,
+            description: value["description"]?.stringValue ?? "",
+            isEnabled: value["isEnabled"]?.boolValue ?? true,
+            isReadOnly: value["isReadOnly"]?.boolValue ?? false,
+            disabledReason: value["disabledReason"]?.stringValue
+        )
+    }
+
+    static func mergeApps(
+        listed: [ParsedAppInfo],
+        installed: [ParsedInstalledApp],
+        metadata: [ParsedConnectorMetadata]
+    ) -> [CodexApp] {
+        let installedByID = Dictionary(
+            installed.map { ($0.id, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        let metadataByID = Dictionary(
+            metadata.map { ($0.id, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        var seenAppIDs: Set<String> = []
+
+        return listed.compactMap { app in
+            guard app.isAccessible, seenAppIDs.insert(app.id).inserted else { return nil }
+            let runtime = installedByID[app.id]
+            let connector = metadataByID[app.id]
+            let canonicalName = nonEmpty(connector?.name) ?? app.name
+            let invocationName = nonEmpty(runtime?.runtimeName) ?? canonicalName
+            return CodexApp(
+                id: app.id,
+                name: canonicalName,
+                invocationName: invocationName,
+                description: nonEmpty(connector?.description) ?? app.description ?? "",
+                isAccessible: app.isAccessible,
+                isEnabled: runtime?.isEnabled ?? app.isEnabled,
+                isCallable: runtime?.isCallable ?? false,
+                tools: connector?.tools ?? []
+            )
+        }
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        return value
     }
 
     static func parseModel(_ value: JSONValue) -> CodexModel? {
@@ -652,6 +1369,7 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         oldTransport?.stop()
         let pending = pendingRequests.values
         pendingRequests.removeAll()
+        pendingInteractions.removeAll()
         for request in pending {
             request.timeoutTask?.cancel()
             request.continuation.resume(throwing: error)

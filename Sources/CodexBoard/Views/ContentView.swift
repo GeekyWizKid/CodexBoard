@@ -42,5 +42,9 @@ struct ContentView: View {
         .sheet(isPresented: $mainWindowState.isComposerPresented) {
             TaskComposer(store: store, isPresented: $mainWindowState.isComposerPresented)
         }
+        .onChange(of: store.taskFocusRequest?.nonce, initial: true) { _, nonce in
+            guard nonce != nil else { return }
+            showingInspector = true
+        }
     }
 }

@@ -6,6 +6,13 @@ protocol AppServerTransportDelegate: AnyObject, Sendable {
 }
 
 final class AppServerTransport: @unchecked Sendable {
+    static let launchArguments = [
+        "app-server",
+        "-c", "apps._default.default_tools_approval_mode=\"prompt\"",
+        "-c", "apps._default.approvals_reviewer=\"user\"",
+        "--stdio"
+    ]
+
     weak var delegate: (any AppServerTransportDelegate)?
 
     private let executableURL: URL
@@ -24,11 +31,15 @@ final class AppServerTransport: @unchecked Sendable {
     private var outputHandle: FileHandle?
     private var errorHandle: FileHandle?
     private var buffer = Data()
+    // Number of bytes in `buffer` that were already checked for a newline.
+    // Keeping this cursor is important for large JSONL messages: rescanning an
+    // incomplete line from byte zero for every pipe chunk becomes O(n²).
+    private var scannedByteCount = 0
     private var didExit = false
     private var stdoutReachedEOF = false
     private var terminationStatus: Int32?
 
-    init(executableURL: URL, maximumLineBytes: Int = 8 * 1_024 * 1_024) {
+    init(executableURL: URL, maximumLineBytes: Int = 64 * 1_024 * 1_024) {
         self.executableURL = executableURL
         self.maximumLineBytes = maximumLineBytes
     }
@@ -39,7 +50,10 @@ final class AppServerTransport: @unchecked Sendable {
         let outputPipe = Pipe()
         let errorPipe = Pipe()
         process.executableURL = executableURL
-        process.arguments = ["app-server", "--stdio"]
+        // CodexBoard owns the approval UI for this private app-server process.
+        // Force the default connector policy to prompt so an App write cannot
+        // silently inherit a permissive global default.
+        process.arguments = Self.launchArguments
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
@@ -57,6 +71,7 @@ final class AppServerTransport: @unchecked Sendable {
         stdoutReachedEOF = false
         terminationStatus = nil
         buffer.removeAll(keepingCapacity: true)
+        scannedByteCount = 0
         stateLock.unlock()
 
         outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -122,17 +137,55 @@ final class AppServerTransport: @unchecked Sendable {
     private func consume(_ bytes: Data) {
         var lines: [Data] = []
         var exceededLimit = false
+        var oversizedProcess: Process?
         stateLock.lock()
+        guard !didExit else {
+            stateLock.unlock()
+            return
+        }
         buffer.append(bytes)
-        while let newline = buffer.firstIndex(of: 0x0A) {
-            var line = Data(buffer[..<newline])
-            buffer.removeSubrange(...newline)
+
+        var lineStart = buffer.startIndex
+        var searchStart = buffer.index(
+            buffer.startIndex,
+            offsetBy: min(scannedByteCount, buffer.count)
+        )
+        while searchStart < buffer.endIndex,
+              let newline = buffer[searchStart...].firstIndex(of: 0x0A) {
+            let lineByteCount = buffer.distance(from: lineStart, to: newline)
+            guard lineByteCount <= maximumLineBytes else {
+                exceededLimit = true
+                break
+            }
+            var line = Data(buffer[lineStart..<newline])
             if line.last == 0x0D { line.removeLast() }
             if !line.isEmpty { lines.append(line) }
+            lineStart = buffer.index(after: newline)
+            searchStart = lineStart
         }
-        if buffer.count > maximumLineBytes {
-            buffer.removeAll()
+
+        if !exceededLimit,
+           buffer.distance(from: lineStart, to: buffer.endIndex) > maximumLineBytes {
             exceededLimit = true
+        }
+        if exceededLimit {
+            buffer.removeAll()
+            scannedByteCount = 0
+            lines.removeAll()
+            // Mark the transport failed while still holding the lock so a
+            // second readability callback cannot consume bytes in between the
+            // limit check and process termination.
+            didExit = true
+            oversizedProcess = process
+            outputHandle?.readabilityHandler = nil
+        } else {
+            // Everything after the final complete line has now been scanned.
+            // Remove completed lines once, rather than repeatedly deleting the
+            // front of Data for every line in the chunk.
+            scannedByteCount = buffer.distance(from: lineStart, to: buffer.endIndex)
+            if lineStart != buffer.startIndex {
+                buffer.removeSubrange(buffer.startIndex..<lineStart)
+            }
         }
         stateLock.unlock()
         for line in lines {
@@ -140,7 +193,10 @@ final class AppServerTransport: @unchecked Sendable {
                 self?.delegate?.transportDidReceive(line)
             }
         }
-        if exceededLimit { failForOversizedLine() }
+        if exceededLimit {
+            enqueueExit(status: -1)
+            if oversizedProcess?.isRunning == true { oversizedProcess?.terminate() }
+        }
     }
 
     private func recordStdoutEOF() {
@@ -171,17 +227,4 @@ final class AppServerTransport: @unchecked Sendable {
         }
     }
 
-    private func failForOversizedLine() {
-        stateLock.lock()
-        guard !didExit else {
-            stateLock.unlock()
-            return
-        }
-        didExit = true
-        let process = process
-        outputHandle?.readabilityHandler = nil
-        stateLock.unlock()
-        enqueueExit(status: -1)
-        if process?.isRunning == true { process?.terminate() }
-    }
 }

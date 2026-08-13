@@ -25,6 +25,12 @@ private struct TaskRunHistoryRow: View {
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                if let codeDelivery = run.codeDelivery {
+                    TaskCodeDiffView(delivery: codeDelivery)
+                }
+                if let evidence = run.evidence, evidence.hasStructuredDetails {
+                    runDeliverySummary(evidence)
+                }
                 if let reviewNote = run.reviewNote {
                     labeledText("验收反馈", reviewNote, tint: BoardTheme.approval)
                 }
@@ -71,9 +77,30 @@ private struct TaskRunHistoryRow: View {
         }
     }
 
+    private func runDeliverySummary(_ evidence: TaskDeliveryEvidence) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("本轮交付")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(BoardTheme.accent)
+            if !evidence.artifacts.isEmpty {
+                Label("\(evidence.artifacts.count) 个可用交付物", systemImage: "shippingbox")
+            }
+            if run.codeDelivery == nil, !evidence.changedFiles.isEmpty {
+                Label("\(evidence.changedFiles.count) 个改动文件", systemImage: "doc.badge.gearshape")
+            }
+            if !evidence.testSummary.isEmpty {
+                Label(evidence.testSummary, systemImage: "checkmark.circle")
+                    .lineLimit(3)
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private func labeledText(_ label: String, _ value: String, tint: Color) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(label)
+            Text(LocalizedStringKey(label))
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(tint)
             Text(value)
@@ -84,7 +111,7 @@ private struct TaskRunHistoryRow: View {
 
     private func metadata(_ label: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline) {
-            Text(label)
+            Text(LocalizedStringKey(label))
                 .foregroundStyle(.secondary)
             Spacer()
             Text(value)
@@ -100,9 +127,16 @@ private struct TaskRunHistoryRow: View {
 
     private func duration(from start: Date, to end: Date) -> String {
         let seconds = max(0, Int(end.timeIntervalSince(start)))
-        if seconds < 60 { return "\(seconds) 秒" }
+        if seconds < 60 {
+            return L10n.format("%lld 秒", fallback: "%lld 秒", Int64(seconds))
+        }
         let minutes = seconds / 60
         let remainder = seconds % 60
-        return "\(minutes) 分 \(remainder) 秒"
+        return L10n.format(
+            "%lld 分 %lld 秒",
+            fallback: "%lld 分 %lld 秒",
+            Int64(minutes),
+            Int64(remainder)
+        )
     }
 }

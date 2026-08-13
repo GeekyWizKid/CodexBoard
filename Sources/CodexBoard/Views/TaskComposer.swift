@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct TaskComposer: View {
     let store: BoardStore
@@ -13,6 +12,10 @@ struct TaskComposer: View {
     @State private var model: String
     @State private var effort: ReasoningEffort
     @State private var fastMode = false
+    @State private var workspaceKind: TaskWorkspaceKind
+    @State private var dependencyIDs = Set<UUID>()
+    @State private var selectedSkillIDs = Set<String>()
+    @State private var selectedAppIDs = Set<String>()
     @State private var attachments: [TaskAttachmentDraft] = []
     @State private var submissionError: String?
     @State private var isSubmitting = false
@@ -20,7 +23,10 @@ struct TaskComposer: View {
     init(store: BoardStore, isPresented: Binding<Bool>) {
         self.store = store
         _isPresented = isPresented
-        _projectID = State(initialValue: store.selectedProjectID ?? store.visibleProjects.first?.id ?? "")
+        let initialProjectID = store.selectedProjectID ?? store.visibleProjects.first?.id ?? ""
+        _projectID = State(initialValue: initialProjectID)
+        let initialProject = store.visibleProjects.first(where: { $0.id == initialProjectID })
+        _workspaceKind = State(initialValue: initialProject?.isGitRepository == true ? .worktree : .project)
         _autoRun = State(initialValue: store.preferences.defaultAutoRun)
         let configuredModel = store.preferences.modelOverride.trimmingCharacters(in: .whitespacesAndNewlines)
         let initialModel: String
@@ -41,7 +47,7 @@ struct TaskComposer: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("创建 Codex 任务")
                         .font(.title2.weight(.semibold))
-                    Text("先生成只读方案，再确认执行。")
+                    Text(autoRun ? "创建后自动规划并执行。" : "创建后等待你手动开始规划。")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -65,36 +71,37 @@ struct TaskComposer: View {
 
                 TextField("标题（可留空自动提取）", text: $title)
 
+                TaskWorkflowOptionsView(
+                    store: store,
+                    projectID: projectID,
+                    workspaceKind: $workspaceKind,
+                    dependencyIDs: $dependencyIDs
+                )
+
+                TaskCapabilitiesPicker(
+                    store: store,
+                    projectID: projectID,
+                    selectedSkillIDs: $selectedSkillIDs,
+                    selectedAppIDs: $selectedAppIDs
+                )
+
                 codexOptionsEditor
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(sourceKind == .issue ? "Issue 内容" : "开发计划")
-                        .font(.callout.weight(.medium))
-                    TextEditor(text: $sourceText)
-                        .font(.body)
-                        .scrollContentBackground(.hidden)
-                        .padding(8)
-                        .frame(minHeight: 145)
-                        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
-                        .overlay {
-                            if sourceText.isEmpty {
-                                Text(sourceKind == .issue
-                                     ? "粘贴 GitHub Issue、缺陷描述或需求…"
-                                     : "输入里程碑、功能清单、约束与验收标准…")
-                                    .foregroundStyle(.tertiary)
-                                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                                    .padding(12)
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                }
-
-                attachmentEditor
+                TaskPromptInputView(
+                    text: $sourceText,
+                    attachments: $attachments,
+                    label: sourceKind == .issue ? "Issue 内容" : "开发计划",
+                    placeholder: sourceKind == .issue
+                        ? "粘贴 GitHub Issue、缺陷描述或需求…"
+                        : "输入里程碑、功能清单、约束与验收标准…",
+                    chooseFiles: chooseFiles,
+                    reportImportMessage: { submissionError = $0 }
+                )
 
                 Toggle(isOn: $autoRun) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("全自动模式")
-                        Text("规划完成后跳过方案确认并自动进入执行队列；不会扩大项目写入权限。")
+                        Text("开启后立即开始规划，并在方案完成后自动执行；关闭则在待办中等待手动开始。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -114,7 +121,7 @@ struct TaskComposer: View {
                     }
                 }
                 Spacer()
-                Button("创建并规划") {
+                Button(submitButtonTitle) {
                     submit()
                 }
                 .buttonStyle(.borderedProminent)
@@ -129,7 +136,7 @@ struct TaskComposer: View {
             }
         }
         .padding(22)
-        .frame(width: 640, height: 700)
+        .frame(width: 660, height: 780)
         .onAppear {
             synchronizeModelSelection(selectDefaultWhenEmpty: true)
         }
@@ -137,6 +144,14 @@ struct TaskComposer: View {
             if store.availableModels.isEmpty && !store.isLoadingModels {
                 await store.refreshModels()
             }
+        }
+        .task(id: projectID) {
+            guard !projectID.isEmpty else { return }
+            await store.refreshCapabilities(projectID: projectID)
+        }
+        .onChange(of: projectID) { _, _ in
+            selectedSkillIDs.removeAll()
+            selectedAppIDs.removeAll()
         }
         .onChange(of: model) { _, _ in
             synchronizeModelCapabilities()
@@ -238,8 +253,8 @@ struct TaskComposer: View {
 
     private var fastModeHelp: String {
         supportsFast
-            ? "获得更快响应，但会增加用量。"
-            : "所选模型不提供 Fast 服务层级。"
+            ? L10n.text("获得更快响应，但会增加用量。", fallback: "获得更快响应，但会增加用量。")
+            : L10n.text("所选模型不提供 Fast 服务层级。", fallback: "所选模型不提供 Fast 服务层级。")
     }
 
     private func synchronizeModelSelection(selectDefaultWhenEmpty: Bool) {
@@ -264,115 +279,18 @@ struct TaskComposer: View {
         }
     }
 
-    private var attachmentEditor: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("附件")
-                    .font(.callout.weight(.medium))
-                Spacer()
-                Button {
-                    chooseFiles()
-                } label: {
-                    Label("添加文件…", systemImage: "paperclip")
-                }
-                Button {
-                    pasteScreenshot()
-                } label: {
-                    Label("粘贴截图", systemImage: "doc.on.clipboard")
-                }
-                .keyboardShortcut("v", modifiers: [.command, .shift])
-            }
-
-            if attachments.isEmpty {
-                Text("可添加多个本地文件，或从剪贴板粘贴截图。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-                    .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 6) {
-                        ForEach(attachments) { attachment in
-                            attachmentRow(attachment)
-                        }
-                    }
-                }
-                .frame(maxHeight: 110)
-            }
-        }
-    }
-
-    private func attachmentRow(_ attachment: TaskAttachmentDraft) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: draftSymbol(attachment))
-                .foregroundStyle(BoardTheme.accent)
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(attachment.displayName)
-                    .lineLimit(1)
-                Text(attachment.byteCount.map {
-                    ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
-                } ?? "大小未知")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button {
-                attachments.removeAll { $0.id == attachment.id }
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("移除附件")
-        }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 6)
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 7))
-        .help(draftPath(attachment) ?? attachment.displayName)
-    }
-
     private func chooseFiles() {
         let panel = NSOpenPanel()
-        panel.title = "添加任务附件"
-        panel.prompt = "添加"
+        panel.title = L10n.text("添加任务附件", fallback: "添加任务附件")
+        panel.prompt = L10n.text("添加", fallback: "添加")
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
         guard panel.runModal() == .OK else { return }
 
-        let existingPaths = Set(attachments.compactMap(draftPath))
-        let newDrafts = panel.urls
-            .map(TaskAttachmentDraft.file)
-            .filter { draft in
-                guard let path = draftPath(draft) else { return true }
-                return !existingPaths.contains(path)
-                    && !attachments.contains(where: { draftPath($0) == path })
-            }
-        attachments.append(contentsOf: newDrafts)
-        submissionError = nil
-    }
-
-    private func pasteScreenshot() {
-        guard let image = NSPasteboard.general.readObjects(forClasses: [NSImage.self])?.first as? NSImage,
-              let tiffData = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
-              let pngData = bitmap.representation(using: .png, properties: [:])
-        else {
-            submissionError = "剪贴板中没有可用的图片。"
-            return
-        }
-        let number = attachments.count { draft in
-            if case .pastedImage = draft.source { return true }
-            return false
-        } + 1
-        attachments.append(TaskAttachmentDraft(
-            displayName: "剪贴板截图 \(number).png",
-            byteCount: Int64(pngData.count),
-            source: .pastedImage(pngData)
-        ))
-        submissionError = nil
+        let outcome = TaskAttachmentDraftImporter.importFiles(panel.urls, existing: attachments)
+        attachments.append(contentsOf: outcome.drafts)
+        submissionError = outcome.message
     }
 
     private func submit() {
@@ -390,7 +308,13 @@ struct TaskComposer: View {
                     autoRun: autoRun,
                     model: model.isEmpty ? nil : model,
                     effort: effort,
-                    fastMode: fastMode
+                    fastMode: fastMode,
+                    selectedSkills: frozenSkillSelections,
+                    selectedApps: frozenAppSelections,
+                    workspaceKind: workspaceKind,
+                    dependencyIDs: store.dependencyCandidates(for: projectID)
+                        .map(\.id)
+                        .filter(dependencyIDs.contains)
                 )
                 isPresented = false
             } catch {
@@ -399,20 +323,43 @@ struct TaskComposer: View {
         }
     }
 
-    private func draftPath(_ draft: TaskAttachmentDraft) -> String? {
-        guard case let .file(url) = draft.source else { return nil }
-        return url.standardizedFileURL.resolvingSymlinksInPath().path
-    }
-
-    private func draftSymbol(_ draft: TaskAttachmentDraft) -> String {
-        switch draft.source {
-        case .pastedImage:
-            return "photo"
-        case let .file(url):
-            guard let type = UTType(filenameExtension: url.pathExtension), type.conforms(to: .image) else {
-                return "doc"
-            }
-            return "photo"
+    private var frozenSkillSelections: [TaskSkillSelection] {
+        store.availableSkills.compactMap { skill in
+            guard skill.enabled, selectedSkillIDs.contains(skill.id) else { return nil }
+            return TaskSkillSelection(
+                name: skill.name,
+                description: skill.description,
+                path: skill.path,
+                scope: skill.scope
+            )
         }
     }
+
+    private var frozenAppSelections: [TaskAppSelection] {
+        store.availableApps.compactMap { app in
+            guard app.supportsReadOnlyUse,
+                  selectedAppIDs.contains(app.id)
+            else { return nil }
+            return TaskAppSelection(
+                id: app.id,
+                name: app.name,
+                invocationName: app.invocationName,
+                description: app.description,
+                requiresApproval: false
+            )
+        }
+    }
+
+    private var submitButtonTitle: String {
+        let hasBlockingDependencies = store.dependencyCandidates(for: projectID).contains {
+            dependencyIDs.contains($0.id) && $0.stage != .completed
+        }
+        if hasBlockingDependencies {
+            return L10n.text("创建并等待", fallback: "创建并等待")
+        }
+        return autoRun
+            ? L10n.text("创建并自动运行", fallback: "创建并自动运行")
+            : L10n.text("创建任务", fallback: "创建任务")
+    }
+
 }

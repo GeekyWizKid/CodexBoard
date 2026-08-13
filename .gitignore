@@ -3,3 +3,4 @@
 dist/
 *.xcuserstate
 *.log
+.vscode/

@@ -69,7 +69,7 @@ struct ProjectSidebar: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("CodexBoard")
                     .font(.headline)
-                Text(store.statusMessage)
+                Text(L10n.localizedRuntimeText(store.statusMessage))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -99,8 +99,13 @@ struct ProjectSidebar: View {
                     }
                 }
                 Text(project.existsOnDisk
-                     ? "\(project.threadCount) 个会话 · \(BoardFormatters.relativeDate(project.latestActivityAt))"
-                     : "目录已不存在")
+                     ? L10n.format(
+                        "%lld 个会话 · %@",
+                        fallback: "%lld 个会话 · %@",
+                        Int64(project.threadCount),
+                        BoardFormatters.relativeDate(project.latestActivityAt)
+                     )
+                     : L10n.text("目录已不存在", fallback: "目录已不存在"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -111,7 +116,7 @@ struct ProjectSidebar: View {
 
     private func chooseProjectDirectory() {
         let panel = NSOpenPanel()
-        panel.title = "添加项目文件夹"
+        panel.title = L10n.text("添加项目文件夹", fallback: "添加项目文件夹")
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false

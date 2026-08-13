@@ -39,6 +39,7 @@ enum TaskDeliveryEvidenceParser {
         TaskDeliveryEvidence(
             summary: evidence.summary.trimmingCharacters(in: .whitespacesAndNewlines),
             changedFiles: normalizedList(evidence.changedFiles),
+            artifacts: normalizedArtifacts(evidence.artifacts),
             verificationCommands: normalizedList(evidence.verificationCommands),
             testSummary: evidence.testSummary.trimmingCharacters(in: .whitespacesAndNewlines),
             commitSHA: normalizedOptional(evidence.commitSHA),
@@ -53,6 +54,22 @@ enum TaskDeliveryEvidenceParser {
             let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !clean.isEmpty, seen.insert(clean).inserted else { return nil }
             return clean
+        }
+    }
+
+    private static func normalizedArtifacts(_ artifacts: [TaskDeliveryArtifact]) -> [TaskDeliveryArtifact] {
+        var seen = Set<String>()
+        return artifacts.compactMap { artifact in
+            let path = artifact.path.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !path.isEmpty, seen.insert(path).inserted else { return nil }
+            let providedTitle = artifact.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let fallbackTitle = URL(fileURLWithPath: path).lastPathComponent
+            let kind = artifact.kind.trimmingCharacters(in: .whitespacesAndNewlines)
+            return TaskDeliveryArtifact(
+                title: providedTitle.isEmpty ? fallbackTitle : providedTitle,
+                path: path,
+                kind: kind.isEmpty ? "other" : kind
+            )
         }
     }
 

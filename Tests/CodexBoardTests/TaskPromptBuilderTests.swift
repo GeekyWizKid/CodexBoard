@@ -2,6 +2,35 @@ import XCTest
 @testable import CodexBoard
 
 final class TaskPromptBuilderTests: XCTestCase {
+    func testPlanningPromptIncludesAcceptedDependencyHandoff() {
+        let task = BoardTask(
+            projectID: "/tmp/project",
+            title: "Downstream",
+            sourceKind: .issue,
+            sourceText: "Build on upstream",
+            autoRun: false
+        )
+        let dependencyID = UUID()
+        let prompt = TaskPromptBuilder.planningPrompt(
+            for: task,
+            projectPath: "/tmp/project",
+            dependencies: [TaskDependencyHandoff(
+                id: dependencyID,
+                title: "Upstream",
+                summary: "Added the API",
+                changedFiles: ["Sources/API.swift"],
+                testSummary: "Tests passed",
+                commitSHA: "abc123",
+                pullRequestURL: nil
+            )]
+        )
+
+        XCTAssertTrue(prompt.contains("已验收的前置任务交接信息"))
+        XCTAssertTrue(prompt.contains(dependencyID.uuidString))
+        XCTAssertTrue(prompt.contains("Sources/API.swift"))
+        XCTAssertTrue(prompt.contains("Tests passed"))
+    }
+
     func testPlanningPromptEnforcesReadOnlyAndKeepsOriginalInput() {
         let task = BoardTask(
             projectID: "/tmp/project",
@@ -37,6 +66,7 @@ final class TaskPromptBuilderTests: XCTestCase {
         XCTAssertTrue(prompt.contains("保护用户已有改动和数据"))
         XCTAssertTrue(prompt.contains("```codexboard-evidence"))
         XCTAssertTrue(prompt.contains("\"changedFiles\""))
+        XCTAssertTrue(prompt.contains("\"artifacts\""))
         XCTAssertTrue(prompt.contains("\"verificationCommands\""))
     }
 
@@ -85,6 +115,36 @@ final class TaskPromptBuilderTests: XCTestCase {
         )
     }
 
+    func testDeliveryEvidenceParserNormalizesArtifactMetadata() {
+        let result = """
+        已生成报告。
+
+        ```codexboard-evidence
+        {
+          "summary": "生成交付报告",
+          "changedFiles": [],
+          "artifacts": [
+            {"title": "  风险报告  ", "path": " reports/risk.pdf ", "kind": " document "},
+            {"title": "重复", "path": "reports/risk.pdf", "kind": "document"},
+            {"title": "", "path": "exports/data.csv", "kind": ""}
+          ],
+          "verificationCommands": [],
+          "testSummary": "",
+          "commitSHA": null,
+          "pullRequestURL": null,
+          "residualRisks": []
+        }
+        ```
+        """
+
+        let evidence = TaskDeliveryEvidenceParser.parse(from: result)
+
+        XCTAssertEqual(evidence.artifacts, [
+            TaskDeliveryArtifact(title: "风险报告", path: "reports/risk.pdf", kind: "document"),
+            TaskDeliveryArtifact(title: "data.csv", path: "exports/data.csv", kind: "other")
+        ])
+    }
+
     func testAttachmentsAreListedAndImagesBecomeStructuredInput() {
         let task = BoardTask(
             projectID: "/tmp/project",
@@ -120,5 +180,98 @@ final class TaskPromptBuilderTests: XCTestCase {
             input[1].wireValue,
             .object(["type": .string("localImage"), "path": .string("/tmp/screen.png")])
         )
+    }
+
+    func testCapabilitiesBecomeStructuredTurnInputInStableOrder() {
+        let task = BoardTask(
+            projectID: "/tmp/project",
+            title: "Use capabilities",
+            sourceKind: .issue,
+            sourceText: "Inspect external context",
+            selectedSkills: [TaskSkillSelection(
+                name: "repo-audit",
+                description: "Audit the repository",
+                path: "/tmp/project/.agents/skills/repo-audit/SKILL.md",
+                scope: "repo"
+            )],
+            selectedApps: [TaskAppSelection(
+                id: "connector_readonly",
+                name: "Read-only Connector",
+                invocationName: "readonly",
+                description: "Read external records"
+            )],
+            autoRun: false
+        )
+
+        let input = TaskPromptBuilder.planningInput(for: task, projectPath: "/tmp/project")
+
+        XCTAssertEqual(input.count, 3)
+        guard case let .text(prompt) = input[0] else {
+            return XCTFail("The first item must remain text")
+        }
+        XCTAssertTrue(prompt.contains("已为本任务选择的能力"))
+        XCTAssertTrue(prompt.contains("规划和执行阶段可用"))
+        XCTAssertTrue(prompt.contains("规划阶段也只允许调用标记为只读的工具"))
+        XCTAssertEqual(input[1], .skill(
+            name: "repo-audit",
+            path: "/tmp/project/.agents/skills/repo-audit/SKILL.md"
+        ))
+        XCTAssertEqual(input[2], .mention(name: "readonly", path: "app://connector_readonly"))
+    }
+
+    func testWriteCapableAppIsContextOnlyAndNeverInjected() {
+        var task = BoardTask(
+            projectID: "/tmp/project",
+            title: "Use mixed apps",
+            sourceKind: .issue,
+            sourceText: "Read context, then update the external record",
+            selectedApps: [
+                TaskAppSelection(
+                    id: "connector_readonly",
+                    name: "Read-only Connector",
+                    invocationName: "readonly",
+                    description: "Reads external records"
+                ),
+                TaskAppSelection(
+                    id: "connector_write",
+                    name: "Write Connector",
+                    invocationName: "writer",
+                    description: "Updates external records",
+                    requiresApproval: true
+                )
+            ],
+            autoRun: false
+        )
+        task.planText = "Read the current record and apply the approved update."
+
+        let planningInput = TaskPromptBuilder.planningInput(for: task, projectPath: "/tmp/project")
+        let executionInput = TaskPromptBuilder.executionInput(for: task, projectPath: "/tmp/project")
+
+        XCTAssertEqual(planningInput.count, 2)
+        guard case let .text(planningPrompt) = planningInput[0] else {
+            return XCTFail("The first planning item must remain text")
+        }
+        XCTAssertTrue(planningPrompt.contains("Write Connector（已阻止：包含写入工具）"))
+        XCTAssertTrue(planningPrompt.contains("标记为“已阻止”的 App 不会注入任何 Turn"))
+        XCTAssertEqual(
+            planningInput[1],
+            .mention(name: "readonly", path: "app://connector_readonly")
+        )
+        XCTAssertFalse(planningInput.contains(
+            .mention(name: "writer", path: "app://connector_write")
+        ))
+
+        XCTAssertEqual(executionInput.count, 2)
+        XCTAssertEqual(
+            executionInput[1],
+            .mention(name: "readonly", path: "app://connector_readonly")
+        )
+        XCTAssertFalse(executionInput.contains(
+            .mention(name: "writer", path: "app://connector_write")
+        ))
+        guard case let .text(executionPrompt) = executionInput[0] else {
+            return XCTFail("The first execution item must remain text")
+        }
+        XCTAssertTrue(executionPrompt.contains("标记为“已阻止”的 App 不会注入本轮"))
     }
 }

@@ -15,7 +15,8 @@ let package = Package(
             name: "CodexBoard",
             path: "Sources/CodexBoard",
             linkerSettings: [
-                .linkedFramework("Security")
+                .linkedFramework("Security"),
+                .linkedFramework("UserNotifications")
             ]
         ),
         .testTarget(

@@ -8,8 +8,8 @@ enum TaskWorkspaceKind: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .project: "当前项目"
-        case .worktree: "独立 Worktree"
+        case .project: L10n.text("workspace.project", fallback: "Current Project")
+        case .worktree: L10n.text("workspace.worktree", fallback: "Isolated Worktree")
         }
     }
 }
@@ -35,6 +35,68 @@ struct TaskWorkspaceConfiguration: Codable, Hashable, Sendable {
     }
 }
 
+struct TaskDependencyHandoff: Hashable, Sendable {
+    let id: UUID
+    let title: String
+    let summary: String
+    let changedFiles: [String]
+    let testSummary: String
+    let commitSHA: String?
+    let pullRequestURL: String?
+}
+
+enum TaskFailureKind: String, Codable, CaseIterable, Identifiable, Sendable {
+    case startup
+    case authentication
+    case rateLimit
+    case workspace
+    case connection
+    case execution
+    case interrupted
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .startup: L10n.text("failure.startup", fallback: "Startup Failed")
+        case .authentication: L10n.text("failure.authentication", fallback: "Authentication Failed")
+        case .rateLimit: L10n.text("failure.rate_limit", fallback: "Rate Limited")
+        case .workspace: L10n.text("failure.workspace", fallback: "Workspace Failed")
+        case .connection: L10n.text("failure.connection", fallback: "Connection Lost")
+        case .execution: L10n.text("failure.execution", fallback: "Execution Failed")
+        case .interrupted: L10n.text("failure.interrupted", fallback: "Stopped Manually")
+        }
+    }
+}
+
+struct TaskFailureState: Codable, Hashable, Sendable {
+    var kind: TaskFailureKind
+    var consecutiveCount: Int
+    var automaticRetryCount: Int
+    var circuitOpen: Bool
+    var occurredAt: Date
+    var nextRetryAt: Date?
+    var message: String
+
+    init(
+        kind: TaskFailureKind,
+        consecutiveCount: Int = 1,
+        automaticRetryCount: Int = 0,
+        circuitOpen: Bool = false,
+        occurredAt: Date = Date(),
+        nextRetryAt: Date? = nil,
+        message: String
+    ) {
+        self.kind = kind
+        self.consecutiveCount = consecutiveCount
+        self.automaticRetryCount = automaticRetryCount
+        self.circuitOpen = circuitOpen
+        self.occurredAt = occurredAt
+        self.nextRetryAt = nextRetryAt
+        self.message = message
+    }
+}
+
 enum TaskRunPhase: String, Codable, CaseIterable, Identifiable, Sendable {
     case planning
     case execution
@@ -43,8 +105,8 @@ enum TaskRunPhase: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .planning: "规划"
-        case .execution: "执行"
+        case .planning: L10n.text("run.phase.planning", fallback: "Planning")
+        case .execution: L10n.text("run.phase.execution", fallback: "Execution")
         }
     }
 
@@ -69,22 +131,82 @@ enum TaskRunOutcome: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .running: "运行中"
-        case .completed: "已完成"
-        case .awaitingReview: "等待验收"
-        case .accepted: "验收通过"
-        case .changesRequested: "要求修改"
-        case .failed: "失败"
-        case .interrupted: "已停止"
+        case .running: L10n.text("run.outcome.running", fallback: "Running")
+        case .completed: L10n.text("run.outcome.completed", fallback: "Completed")
+        case .awaitingReview: L10n.text("run.outcome.awaiting_review", fallback: "Awaiting Review")
+        case .accepted: L10n.text("run.outcome.accepted", fallback: "Accepted")
+        case .changesRequested: L10n.text("run.outcome.changes_requested", fallback: "Changes Requested")
+        case .failed: L10n.text("run.outcome.failed", fallback: "Failed")
+        case .interrupted: L10n.text("run.outcome.interrupted", fallback: "Stopped")
         }
     }
 
     var isActive: Bool { self == .running }
 }
 
+struct TaskDeliveryArtifact: Codable, Hashable, Sendable {
+    var title: String
+    var path: String
+    var kind: String
+
+    init(title: String = "", path: String, kind: String = "file") {
+        self.title = title
+        self.path = path
+        self.kind = kind
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case title, path, kind
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        path = try container.decodeIfPresent(String.self, forKey: .path) ?? ""
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? "file"
+    }
+}
+
+struct TaskCodeDelivery: Codable, Hashable, Sendable {
+    static let maximumStoredBytes = 1_500_000
+
+    var unifiedDiff: String
+    var isTruncated: Bool
+
+    init(unifiedDiff: String, isTruncated: Bool = false) {
+        self.unifiedDiff = unifiedDiff
+        self.isTruncated = isTruncated
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case unifiedDiff, isTruncated
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        unifiedDiff = try container.decodeIfPresent(String.self, forKey: .unifiedDiff) ?? ""
+        isTruncated = try container.decodeIfPresent(Bool.self, forKey: .isTruncated) ?? false
+    }
+
+    static func capturing(_ diff: String) -> TaskCodeDelivery? {
+        guard diff.contains(where: { !$0.isWhitespace }) else { return nil }
+        guard diff.utf8.count > maximumStoredBytes else {
+            return TaskCodeDelivery(unifiedDiff: diff)
+        }
+
+        var stored = String(decoding: Data(diff.utf8.prefix(maximumStoredBytes)), as: UTF8.self)
+        if let finalNewline = stored.lastIndex(of: "\n"),
+           stored.distance(from: finalNewline, to: stored.endIndex) < 8_192 {
+            stored = String(stored[...finalNewline])
+        }
+        return TaskCodeDelivery(unifiedDiff: stored, isTruncated: true)
+    }
+}
+
 struct TaskDeliveryEvidence: Codable, Hashable, Sendable {
     var summary: String
     var changedFiles: [String]
+    var artifacts: [TaskDeliveryArtifact]
     var verificationCommands: [String]
     var testSummary: String
     var commitSHA: String?
@@ -94,6 +216,7 @@ struct TaskDeliveryEvidence: Codable, Hashable, Sendable {
     init(
         summary: String = "",
         changedFiles: [String] = [],
+        artifacts: [TaskDeliveryArtifact] = [],
         verificationCommands: [String] = [],
         testSummary: String = "",
         commitSHA: String? = nil,
@@ -102,6 +225,7 @@ struct TaskDeliveryEvidence: Codable, Hashable, Sendable {
     ) {
         self.summary = summary
         self.changedFiles = changedFiles
+        self.artifacts = artifacts
         self.verificationCommands = verificationCommands
         self.testSummary = testSummary
         self.commitSHA = commitSHA
@@ -111,6 +235,7 @@ struct TaskDeliveryEvidence: Codable, Hashable, Sendable {
 
     var hasStructuredDetails: Bool {
         !changedFiles.isEmpty
+            || !artifacts.isEmpty
             || !verificationCommands.isEmpty
             || !testSummary.isEmpty
             || commitSHA != nil
@@ -119,7 +244,7 @@ struct TaskDeliveryEvidence: Codable, Hashable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case summary, changedFiles, verificationCommands, testSummary
+        case summary, changedFiles, artifacts, verificationCommands, testSummary
         case commitSHA, pullRequestURL, residualRisks
     }
 
@@ -127,6 +252,7 @@ struct TaskDeliveryEvidence: Codable, Hashable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         summary = try container.decodeIfPresent(String.self, forKey: .summary) ?? ""
         changedFiles = try container.decodeIfPresent([String].self, forKey: .changedFiles) ?? []
+        artifacts = try container.decodeIfPresent([TaskDeliveryArtifact].self, forKey: .artifacts) ?? []
         verificationCommands = try container.decodeIfPresent([String].self, forKey: .verificationCommands) ?? []
         testSummary = try container.decodeIfPresent(String.self, forKey: .testSummary) ?? ""
         commitSHA = try container.decodeIfPresent(String.self, forKey: .commitSHA)
@@ -150,6 +276,7 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
     var fastMode: Bool
     var summary: String
     var evidence: TaskDeliveryEvidence?
+    var codeDelivery: TaskCodeDelivery?
     var error: String?
     var reviewNote: String?
     var reviewedAt: Date?
@@ -169,6 +296,7 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
         fastMode: Bool,
         summary: String = "",
         evidence: TaskDeliveryEvidence? = nil,
+        codeDelivery: TaskCodeDelivery? = nil,
         error: String? = nil,
         reviewNote: String? = nil,
         reviewedAt: Date? = nil
@@ -187,6 +315,7 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
         self.fastMode = fastMode
         self.summary = summary
         self.evidence = evidence
+        self.codeDelivery = codeDelivery
         self.error = error
         self.reviewNote = reviewNote
         self.reviewedAt = reviewedAt
@@ -200,6 +329,14 @@ extension BoardTask {
 
     var latestDeliveryEvidence: TaskDeliveryEvidence? {
         latestExecutionRun?.evidence
+    }
+
+    var latestCodeDelivery: TaskCodeDelivery? {
+        latestExecutionRun?.codeDelivery
+    }
+
+    var hasDeliverables: Bool {
+        latestDeliveryEvidence?.hasStructuredDetails == true || latestCodeDelivery != nil
     }
 
     var executionAttemptCount: Int {

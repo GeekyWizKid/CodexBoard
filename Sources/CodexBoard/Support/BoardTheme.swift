@@ -36,7 +36,6 @@ enum BoardTheme {
 enum BoardFormatters {
     static let relative: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
         formatter.unitsStyle = .short
         return formatter
     }()
@@ -49,7 +48,8 @@ enum BoardFormatters {
     }()
 
     static func relativeDate(_ date: Date?) -> String {
-        guard let date else { return "暂无活动" }
+        guard let date else { return L10n.text("date.no_activity", fallback: "No activity") }
+        relative.locale = L10n.locale
         return relative.localizedString(for: date, relativeTo: Date())
     }
 

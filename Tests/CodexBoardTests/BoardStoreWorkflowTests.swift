@@ -3,7 +3,342 @@ import XCTest
 
 @MainActor
 final class BoardStoreWorkflowTests: XCTestCase {
-    func testManualPlanCompletionWaitsForConfirmation() async throws {
+    func testDeliveryArtifactResolutionStaysInsideTaskWorkspace() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let artifactDirectory = fixture.directory.appendingPathComponent("reports", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactDirectory, withIntermediateDirectories: true)
+        let reportURL = artifactDirectory.appendingPathComponent("delivery.pdf")
+        try Data("report".utf8).write(to: reportURL)
+        let outsideURL = fixture.directory
+            .deletingLastPathComponent()
+            .appendingPathComponent("codexboard-outside-\(UUID().uuidString).txt")
+        try Data("outside".utf8).write(to: outsideURL)
+        defer { try? FileManager.default.removeItem(at: outsideURL) }
+
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Artifact safety",
+            sourceKind: .issue,
+            sourceText: "Produce a report",
+            autoRun: false
+        )
+        let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+
+        XCTAssertEqual(
+            fixture.store.deliveryArtifactURL(
+                TaskDeliveryArtifact(path: "reports/delivery.pdf"),
+                for: task
+            ),
+            reportURL.standardizedFileURL
+        )
+        XCTAssertNil(fixture.store.deliveryArtifactURL(
+            TaskDeliveryArtifact(path: "../\(outsideURL.lastPathComponent)"),
+            for: task
+        ))
+        XCTAssertNil(fixture.store.deliveryArtifactURL(
+            TaskDeliveryArtifact(path: outsideURL.path),
+            for: task
+        ))
+    }
+
+    func testAutoRunTaskWaitsForAcceptedDependencyAndReceivesHandoff() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+
+        let parentID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Upstream API",
+            sourceKind: .issue,
+            sourceText: "Add the API",
+            autoRun: true
+        )
+        try await eventually { fixture.client.planningTurnCount == 1 }
+
+        let childID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Downstream UI",
+            sourceKind: .issue,
+            sourceText: "Use the API",
+            autoRun: true,
+            dependencyIDs: [parentID]
+        )
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(fixture.client.planningTurnCount, 1)
+        XCTAssertEqual(fixture.store.tasks.first(where: { $0.id == childID })?.stage, .inbox)
+        XCTAssertEqual(
+            fixture.store.taskCards.first(where: { $0.id == childID })?.blockingDependencyCount,
+            1
+        )
+
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Implement and test the upstream API"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually { fixture.client.executionTurnCount == 1 }
+        fixture.client.send(.agentFinal(
+            threadID: "thread-1",
+            turnID: "execute-1",
+            text: "Upstream implementation completed and verified."
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "execute-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == parentID })?.stage == .review
+        }
+        fixture.store.acceptReview(taskID: parentID)
+
+        try await eventually { fixture.client.planningTurnCount == 2 }
+        XCTAssertEqual(
+            fixture.store.taskCards.first(where: { $0.id == childID })?.blockingDependencyCount,
+            0
+        )
+        guard case let .text(prompt) = fixture.client.planningInputs[1][0] else {
+            return XCTFail("Expected planning text input")
+        }
+        XCTAssertTrue(prompt.contains("已验收的前置任务交接信息"))
+        XCTAssertTrue(prompt.contains("Upstream API"))
+        XCTAssertTrue(prompt.contains("Upstream implementation completed"))
+    }
+
+    func testAuthenticationFailureOpensCircuitWithoutAutomaticRetry() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        fixture.client.planningFailures = [.authentication]
+
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Requires login",
+            sourceKind: .issue,
+            sourceText: "Plan this",
+            autoRun: true
+        )
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+        try await Task.sleep(for: .milliseconds(1_100))
+
+        let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(fixture.client.planningTurnCount, 1)
+        XCTAssertEqual(task.failureState?.kind, .authentication)
+        XCTAssertEqual(task.failureState?.automaticRetryCount, 0)
+        XCTAssertEqual(task.failureState?.circuitOpen, true)
+    }
+
+    func testTransientPlanningStartupFailureRetriesOnce() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        fixture.client.planningFailures = [.startup]
+
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Retry startup",
+            sourceKind: .issue,
+            sourceText: "Plan this",
+            autoRun: true
+        )
+        try await Task.sleep(for: .milliseconds(1_500))
+        let diagnostic = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(
+            fixture.client.planningTurnCount,
+            2,
+            "stage=\(diagnostic.stage.rawValue), failure=\(String(describing: diagnostic.failureState)), logs=\(diagnostic.logs.map(\.message))"
+        )
+
+        let retrying = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(retrying.stage, .planning)
+        XCTAssertEqual(retrying.failureState?.automaticRetryCount, 1)
+        XCTAssertEqual(retrying.failureState?.circuitOpen, false)
+        let retryThreadID = try XCTUnwrap(retrying.threadID)
+        let retryTurnID = try XCTUnwrap(retrying.planningTurnID)
+
+        fixture.client.send(.planFinal(
+            threadID: retryThreadID,
+            turnID: retryTurnID,
+            text: "Recovered plan"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: retryThreadID,
+            turnID: retryTurnID,
+            status: "completed",
+            error: nil
+        ))
+        try await Task.sleep(for: .milliseconds(250))
+        let recovered = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(
+            recovered.stage,
+            .executing,
+            "plan=\(recovered.planText), final=\(recovered.hasFinalPlan), logs=\(recovered.logs.map(\.message))"
+        )
+        XCTAssertEqual(fixture.client.executionTurnCount, 1)
+        XCTAssertNil(recovered.failureState)
+    }
+
+    func testCancelDuringPendingPlanningStartupFailureSuppressesAutomaticRetry() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        fixture.client.planningTurnDelayMilliseconds = 250
+        fixture.client.planningFailures = [.startup]
+
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Cancel pending planning startup",
+            sourceKind: .issue,
+            sourceText: "Do not retry after the user stops this task",
+            autoRun: true
+        )
+        try await eventually {
+            fixture.client.planningTurnCount == 1
+                && fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .planning
+        }
+
+        await fixture.store.cancel(taskID: taskID)
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+
+        let interrupted = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(interrupted.failureState?.kind, .interrupted)
+        XCTAssertEqual(interrupted.runs.last?.outcome, .interrupted)
+        XCTAssertEqual(interrupted.failureState?.automaticRetryCount, 0)
+        XCTAssertTrue(interrupted.failureState?.circuitOpen == true)
+        XCTAssertNil(interrupted.failureState?.nextRetryAt)
+
+        try await Task.sleep(for: .milliseconds(1_200))
+        let settled = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(fixture.client.planningTurnCount, 1)
+        XCTAssertEqual(settled.stage, .needsAttention)
+        XCTAssertEqual(settled.failureState?.kind, .interrupted)
+        XCTAssertNil(settled.failureState?.nextRetryAt)
+    }
+
+    func testImageTaskThreadStartTimeoutDoesNotCreateAutomaticRetry() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        fixture.client.threadStartFailures = [.requestTimedOut("thread/start")]
+        let pngData = try XCTUnwrap(Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z4i0AAAAASUVORK5CYII="
+        ))
+
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Image startup timeout",
+            sourceKind: .issue,
+            sourceText: "Inspect this screenshot",
+            attachmentDrafts: [TaskAttachmentDraft(
+                displayName: "Screenshot.png",
+                byteCount: Int64(pngData.count),
+                source: .pastedImage(pngData)
+            )],
+            autoRun: true
+        )
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+        try await Task.sleep(for: .milliseconds(1_200))
+
+        let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(fixture.client.threadStartCount, 1)
+        XCTAssertEqual(fixture.client.planningTurnCount, 0)
+        XCTAssertTrue(fixture.client.planningInputs.isEmpty)
+        XCTAssertEqual(task.attachments.count, 1)
+        XCTAssertEqual(task.failureState?.automaticRetryCount, 0)
+        XCTAssertEqual(task.failureState?.circuitOpen, true)
+        XCTAssertEqual(task.liveMessage, "请求状态不确定，已暂停以避免重复执行")
+        XCTAssertTrue(task.logs.contains { $0.message.contains("未自动重试") })
+    }
+
+    func testExecutionUsesPreparedWorktreeAndCleanupClearsOnlyManagedCheckout() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let projectURL = directory.appendingPathComponent("repository", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        try runGit(["-C", projectURL.path, "init", "-b", "main"])
+        try runGit(["-C", projectURL.path, "config", "user.email", "codexboard@example.test"])
+        try runGit(["-C", projectURL.path, "config", "user.name", "CodexBoard Tests"])
+        try Data("fixture\n".utf8).write(to: projectURL.appendingPathComponent("README.md"))
+        try runGit(["-C", projectURL.path, "add", "README.md"])
+        try runGit(["-C", projectURL.path, "commit", "-m", "Initial"])
+
+        let client = MockCodexTaskClient(projectPath: projectURL.path)
+        let store = BoardStore(
+            client: client,
+            persistence: BoardPersistence(fileURL: directory.appendingPathComponent("board.json")),
+            attachmentStorage: AttachmentStorage(rootDirectory: directory.appendingPathComponent("attachments")),
+            worktreeManager: WorktreeManager(managedRoot: directory.appendingPathComponent("worktrees"))
+        )
+        store.start()
+        try await eventually {
+            store.projects.first(where: { $0.id == projectURL.path })?.isGitRepository == true
+        }
+
+        let taskID = try await store.createTask(
+            projectID: projectURL.path,
+            title: "Isolated execution",
+            sourceKind: .issue,
+            sourceText: "Execute in a worktree",
+            autoRun: true,
+            workspaceKind: .worktree
+        )
+        try await eventually { client.planningTurnCount == 1 }
+        client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Use the isolated workspace"
+        ))
+        client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually { client.executionCalls.count == 1 }
+
+        let executing = try XCTUnwrap(store.tasks.first(where: { $0.id == taskID }))
+        let worktreePath = try XCTUnwrap(executing.workspace.path)
+        XCTAssertNotEqual(worktreePath, projectURL.path)
+        XCTAssertEqual(client.executionCalls[0].cwd, worktreePath)
+        XCTAssertTrue(executing.workspace.branch?.hasPrefix("codex/task-") == true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath))
+
+        client.send(.agentFinal(
+            threadID: "thread-1",
+            turnID: "execute-1",
+            text: "No file changes were required."
+        ))
+        client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "execute-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually { store.tasks.first(where: { $0.id == taskID })?.stage == .review }
+        await store.cleanupWorktree(taskID: taskID)
+
+        let cleaned = try XCTUnwrap(store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertNil(cleaned.workspace.path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: projectURL.path))
+    }
+
+    func testManualTaskWaitsInInboxUntilExplicitlyStartedAndThenRequiresConfirmation() async throws {
         let fixture = try Fixture(autoRunDefault: false)
         defer { fixture.cleanup() }
         try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
@@ -15,15 +350,410 @@ final class BoardStoreWorkflowTests: XCTestCase {
             autoRun: false
         )
 
-        try await eventually { fixture.client.planningTurnCount == 1 }
+        try await Task.sleep(for: .milliseconds(100))
+        let waitingTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(waitingTask.stage, .inbox)
+        XCTAssertNil(waitingTask.threadID)
+        XCTAssertNil(waitingTask.planningTurnID)
+        XCTAssertTrue(waitingTask.runs.isEmpty)
+        XCTAssertEqual(fixture.client.threadStartCount, 0)
+        XCTAssertEqual(fixture.client.planningTurnCount, 0)
+        XCTAssertEqual(fixture.client.executionTurnCount, 0)
+
+        await fixture.store.startPlanning(taskID: taskID)
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually {
+            fixture.client.planningTurnCount == 1
+                && fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .planning
+        }
+        XCTAssertEqual(fixture.client.threadStartCount, 1)
+        XCTAssertEqual(fixture.client.planningTurnCount, 1)
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == taskID })?.runs.filter { $0.phase == .planning }.count,
+            1
+        )
+
+        let interactionID = CodexRequestID.string("manual-plan-interaction")
+        fixture.client.send(.interactionRequested(CodexInteractionRequest(
+            id: interactionID,
+            threadID: "thread-1",
+            turnID: "plan-1",
+            itemID: nil,
+            kind: .userInput(CodexUserInputRequest(questions: [], isBlocking: true)),
+            createdAt: Date()
+        )))
+        try await eventually {
+            fixture.store.interactions(for: taskID).contains(where: { $0.id == interactionID })
+                && fixture.store.attentionNotices.contains(where: {
+                    $0.taskID == taskID && $0.kind == .interaction
+                })
+        }
+        fixture.store.selectedTaskID = nil
+        let interactionFocusNonce = try XCTUnwrap(fixture.store.taskFocusRequest?.nonce)
+
         fixture.client.send(.planFinal(threadID: "thread-1", turnID: "plan-1", text: "1. Inspect\n2. Fix"))
         fixture.client.send(.turnCompleted(threadID: "thread-1", turnID: "plan-1", status: "completed", error: nil))
-        try await eventually { fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .awaitingApproval }
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .awaitingApproval
+                && fixture.store.attentionNotices.contains(where: {
+                    $0.taskID == taskID && $0.kind == .planApproval
+                })
+        }
 
         XCTAssertEqual(fixture.client.executionTurnCount, 0)
+        XCTAssertFalse(fixture.store.hasPendingInteraction(for: taskID))
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: { $0.kind == .interaction }))
+        XCTAssertEqual(fixture.store.selectedProjectID, fixture.projectPath)
+        XCTAssertEqual(fixture.store.selectedTaskID, taskID)
+        XCTAssertEqual(fixture.store.taskFocusRequest?.taskID, taskID)
+        XCTAssertEqual(fixture.store.taskFocusRequest?.stage, .awaitingApproval)
+        XCTAssertNotEqual(fixture.store.taskFocusRequest?.nonce, interactionFocusNonce)
         fixture.store.confirmPlan(taskID: taskID)
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: {
+            $0.taskID == taskID && $0.kind == .planApproval
+        }))
         try await eventually { fixture.client.executionTurnCount == 1 }
         XCTAssertEqual(fixture.store.tasks.first(where: { $0.id == taskID })?.stage, .executing)
+    }
+
+    func testReplayedPlanningCompletionDoesNotRegressExecutingManualTaskOrRefocus() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Ignore replayed planning completion",
+            sourceKind: .issue,
+            sourceText: "Keep executing after an old planning event is replayed",
+            autoRun: false
+        )
+
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually {
+            fixture.client.planningTurnCount == 1
+                && fixture.store.tasks.first(where: { $0.id == taskID })?.planningTurnID != nil
+        }
+        let planningTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let threadID = try XCTUnwrap(planningTask.threadID)
+        let planningTurnID = try XCTUnwrap(planningTask.planningTurnID)
+
+        fixture.client.send(.planFinal(
+            threadID: threadID,
+            turnID: planningTurnID,
+            text: "Implement the fix and verify it"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: threadID,
+            turnID: planningTurnID,
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .awaitingApproval
+                && fixture.store.attentionNotices.contains(where: {
+                    $0.taskID == taskID && $0.kind == .planApproval
+                })
+        }
+
+        fixture.store.confirmPlan(taskID: taskID)
+        try await eventually {
+            fixture.client.executionTurnCount == 1
+                && fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .executing
+                && fixture.store.tasks.first(where: { $0.id == taskID })?.executionTurnID != nil
+        }
+        let focusNonce = try XCTUnwrap(fixture.store.taskFocusRequest?.nonce)
+        let executionTurnID = try XCTUnwrap(
+            fixture.store.tasks.first(where: { $0.id == taskID })?.executionTurnID
+        )
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: {
+            $0.taskID == taskID && $0.kind == .planApproval
+        }))
+
+        fixture.client.send(.turnCompleted(
+            threadID: threadID,
+            turnID: planningTurnID,
+            status: "completed",
+            error: nil
+        ))
+        fixture.client.send(.activity(
+            threadID: threadID,
+            turnID: executionTurnID,
+            message: "Execution remains active after planning replay"
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.liveMessage
+                == "Execution remains active after planning replay"
+        }
+
+        XCTAssertEqual(fixture.store.tasks.first(where: { $0.id == taskID })?.stage, .executing)
+        XCTAssertEqual(fixture.client.executionTurnCount, 1)
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: {
+            $0.taskID == taskID && $0.kind == .planApproval
+        }))
+        XCTAssertEqual(fixture.store.taskFocusRequest?.nonce, focusNonce)
+    }
+
+    func testReplayedExecutionCompletionDoesNotRegressAcceptedTask() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Ignore replayed execution completion",
+            sourceKind: .issue,
+            sourceText: "Keep the accepted task completed after an old execution event is replayed",
+            autoRun: false
+        )
+
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually {
+            fixture.client.planningTurnCount == 1
+                && fixture.store.tasks.first(where: { $0.id == taskID })?.planningTurnID != nil
+        }
+        let planningTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let threadID = try XCTUnwrap(planningTask.threadID)
+        let planningTurnID = try XCTUnwrap(planningTask.planningTurnID)
+        fixture.client.send(.planFinal(
+            threadID: threadID,
+            turnID: planningTurnID,
+            text: "Implement and verify the requested behavior"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: threadID,
+            turnID: planningTurnID,
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .awaitingApproval
+        }
+
+        fixture.store.confirmPlan(taskID: taskID)
+        try await eventually {
+            fixture.client.executionTurnCount == 1
+                && fixture.store.tasks.first(where: { $0.id == taskID })?.executionTurnID != nil
+        }
+        let executionTurnID = try XCTUnwrap(
+            fixture.store.tasks.first(where: { $0.id == taskID })?.executionTurnID
+        )
+        fixture.client.send(.turnCompleted(
+            threadID: threadID,
+            turnID: executionTurnID,
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .review
+        }
+
+        fixture.store.acceptReview(taskID: taskID)
+        let acceptedTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let reviewedAt = try XCTUnwrap(acceptedTask.latestExecutionRun?.reviewedAt)
+        XCTAssertEqual(acceptedTask.stage, .completed)
+        XCTAssertEqual(acceptedTask.latestExecutionRun?.outcome, .accepted)
+
+        let replayProbe = "Execution completion replay was consumed"
+        fixture.client.send(.turnCompleted(
+            threadID: threadID,
+            turnID: executionTurnID,
+            status: "completed",
+            error: nil
+        ))
+        fixture.client.send(.configurationWarning(
+            threadID: threadID,
+            turnID: executionTurnID,
+            message: replayProbe
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.logs.contains(where: {
+                $0.message == replayProbe
+            }) == true
+        }
+
+        let settledTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(settledTask.stage, .completed)
+        XCTAssertEqual(settledTask.latestExecutionRun?.outcome, .accepted)
+        XCTAssertEqual(settledTask.latestExecutionRun?.reviewedAt, reviewedAt)
+    }
+
+    func testPersistedManualInboxTaskDoesNotStartWhenStoreReloads() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        let task = BoardTask(
+            projectID: directory.path,
+            title: "Wait after restart",
+            sourceKind: .issue,
+            sourceText: "Do not plan until I click start",
+            autoRun: false
+        )
+        try await persistence.save(BoardSnapshot(
+            version: BoardSnapshot.currentVersion,
+            tasks: [task],
+            manualProjectPaths: [directory.path],
+            preferences: BoardPreferences()
+        ))
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let store = BoardStore(
+            client: client,
+            persistence: persistence,
+            attachmentStorage: AttachmentStorage(rootDirectory: directory.appendingPathComponent("attachments"))
+        )
+
+        store.start()
+        try await eventually { store.projects.contains(where: { $0.id == directory.path }) }
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(store.tasks.first?.stage, .inbox)
+        XCTAssertEqual(store.tasks.first?.liveMessage, "等待开始规划")
+        XCTAssertEqual(client.threadStartCount, 0)
+        XCTAssertEqual(client.planningTurnCount, 0)
+    }
+
+    func testPersistedManualAwaitingApprovalTaskRestoresPlanAttentionAndSelection() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        let taskID = UUID()
+        let updatedAt = Date(timeIntervalSince1970: 1_750_000_000)
+        let task = BoardTask(
+            id: taskID,
+            projectID: directory.path,
+            title: "Restore pending plan",
+            sourceKind: .developmentPlan,
+            sourceText: "Keep waiting for manual confirmation after relaunch",
+            stage: .awaitingApproval,
+            autoRun: false,
+            executionApproved: false,
+            updatedAt: updatedAt,
+            planText: "1. Inspect\n2. Implement\n3. Verify",
+            hasFinalPlan: true,
+            liveMessage: "方案完成，等待确认",
+            threadID: "thread-persisted"
+        )
+        try await persistence.save(BoardSnapshot(
+            version: BoardSnapshot.currentVersion,
+            tasks: [task],
+            manualProjectPaths: [directory.path],
+            preferences: BoardPreferences()
+        ))
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let store = BoardStore(
+            client: client,
+            persistence: persistence,
+            attachmentStorage: AttachmentStorage(rootDirectory: directory.appendingPathComponent("attachments"))
+        )
+
+        store.start()
+        try await eventually {
+            store.projects.contains(where: { $0.id == directory.path })
+                && store.attentionNotices.contains(where: {
+                    $0.taskID == taskID && $0.kind == .planApproval
+                })
+                && store.taskFocusRequest?.taskID == taskID
+        }
+
+        XCTAssertEqual(store.selectedProjectID, directory.path)
+        XCTAssertEqual(store.selectedTaskID, taskID)
+        XCTAssertEqual(store.taskFocusRequest?.stage, .awaitingApproval)
+        XCTAssertEqual(
+            store.attentionNotices.first(where: {
+                $0.taskID == taskID && $0.kind == .planApproval
+            })?.createdAt,
+            updatedAt
+        )
+        XCTAssertEqual(client.executionTurnCount, 0)
+    }
+
+    func testMovingTaskWithFinalPlanToAwaitingApprovalCreatesAttentionAndFocusesIt() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let taskID = UUID()
+        let task = BoardTask(
+            id: taskID,
+            projectID: directory.path,
+            title: "Move plan for approval",
+            sourceKind: .developmentPlan,
+            sourceText: "Return this prepared plan to manual approval",
+            stage: .needsAttention,
+            autoRun: false,
+            executionApproved: false,
+            planText: "Review the current state, implement the change, and verify it.",
+            hasFinalPlan: true,
+            liveMessage: "等待人工处理"
+        )
+        let persistence = RecordingBoardPersistence(initialSnapshot: BoardSnapshot(
+            version: BoardSnapshot.currentVersion,
+            tasks: [task],
+            manualProjectPaths: [directory.path],
+            preferences: BoardPreferences()
+        ))
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let store = BoardStore(
+            client: client,
+            persistence: persistence,
+            attachmentStorage: AttachmentStorage(rootDirectory: directory.appendingPathComponent("attachments"))
+        )
+        store.start()
+        try await eventually { store.projects.contains(where: { $0.id == directory.path }) }
+        XCTAssertFalse(store.attentionNotices.contains(where: { $0.taskID == taskID }))
+
+        XCTAssertTrue(store.moveTask(taskID: taskID, to: .awaitingApproval))
+
+        XCTAssertEqual(store.tasks.first(where: { $0.id == taskID })?.stage, .awaitingApproval)
+        XCTAssertFalse(store.tasks.first(where: { $0.id == taskID })?.executionApproved ?? true)
+        XCTAssertEqual(store.selectedProjectID, directory.path)
+        XCTAssertEqual(store.selectedTaskID, taskID)
+        XCTAssertEqual(store.taskFocusRequest?.taskID, taskID)
+        XCTAssertEqual(store.taskFocusRequest?.stage, .awaitingApproval)
+        XCTAssertEqual(
+            store.attentionNotices.count(where: {
+                $0.taskID == taskID && $0.kind == .planApproval
+            }),
+            1
+        )
+    }
+
+    func testCompletingDependencyOnlyAutoStartsEligibleAutoRunTask() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let dependencyID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Dependency",
+            sourceKind: .issue,
+            sourceText: "Complete first",
+            autoRun: false
+        )
+        let automaticID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Automatic dependent",
+            sourceKind: .issue,
+            sourceText: "Start when unblocked",
+            autoRun: true,
+            dependencyIDs: [dependencyID]
+        )
+        let manualID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Manual dependent",
+            sourceKind: .issue,
+            sourceText: "Still wait for a click",
+            autoRun: false,
+            dependencyIDs: [dependencyID]
+        )
+
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(fixture.client.planningTurnCount, 0)
+        XCTAssertTrue(fixture.store.moveTask(taskID: dependencyID, to: .completed))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == automaticID })?.stage == .planning
+                && fixture.client.planningTurnCount == 1
+        }
+
+        let manualTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == manualID }))
+        XCTAssertEqual(manualTask.stage, .inbox)
+        XCTAssertEqual(manualTask.liveMessage, "等待开始规划")
+        XCTAssertNil(manualTask.threadID)
     }
 
     func testCreatingTaskUsesExplicitModelEffortAndFastMode() async throws {
@@ -45,6 +775,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             fastMode: true
         )
 
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningCalls.count == 1 }
         let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
         XCTAssertEqual(task.requestedModel, "gpt-selected")
@@ -79,6 +810,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             autoRun: false,
             fastMode: true
         )
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningCalls.count == 1 }
 
         fixture.store.updatePreferences {
@@ -118,6 +850,190 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertTrue(task.fastMode)
     }
 
+    func testSelectedCapabilitiesAreFrozenAcrossCatalogRefreshPlanningAndExecution() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+
+        let skillPath = fixture.directory
+            .appendingPathComponent(".agents/skills/repository-review/SKILL.md")
+            .path
+        let skill = CodexSkillMetadata(
+            name: "Repository Review",
+            description: "Review the repository without changing files.",
+            shortDescription: "Read-only repository review",
+            path: skillPath,
+            scope: "repo",
+            enabled: true
+        )
+        let readOnlyApp = CodexApp(
+            id: "knowledge-app",
+            name: "Knowledge",
+            invocationName: "knowledge",
+            description: "Search reference material.",
+            isAccessible: true,
+            isEnabled: true,
+            isCallable: true,
+            tools: [CodexAppToolSummary(
+                name: "search",
+                title: "Search",
+                description: "Search reference material.",
+                isEnabled: true,
+                isReadOnly: true,
+                disabledReason: nil
+            )]
+        )
+        let mixedApp = CodexApp(
+            id: "mixed-app",
+            name: "Mixed",
+            invocationName: "mixed",
+            description: "Reads and writes external data.",
+            isAccessible: true,
+            isEnabled: true,
+            isCallable: true,
+            tools: [
+                CodexAppToolSummary(
+                    name: "read",
+                    title: "Read",
+                    description: "Read external data.",
+                    isEnabled: true,
+                    isReadOnly: true,
+                    disabledReason: nil
+                ),
+                CodexAppToolSummary(
+                    name: "write",
+                    title: "Write",
+                    description: "Write external data.",
+                    isEnabled: true,
+                    isReadOnly: false,
+                    disabledReason: nil
+                )
+            ]
+        )
+        fixture.client.skillsCatalog = [fixture.projectPath: [skill]]
+        fixture.client.appsCatalog = [readOnlyApp, mixedApp]
+
+        await fixture.store.refreshCapabilities(projectID: fixture.projectPath, forceRefresh: true)
+        XCTAssertEqual(fixture.store.availableSkills, [skill])
+        XCTAssertEqual(fixture.store.availableApps, [readOnlyApp, mixedApp])
+        XCTAssertTrue(readOnlyApp.supportsReadOnlyUse)
+        XCTAssertFalse(mixedApp.supportsReadOnlyUse)
+
+        let selectedSkill = TaskSkillSelection(
+            name: skill.name,
+            description: skill.description,
+            path: skill.path,
+            scope: skill.scope
+        )
+        let selectedApp = TaskAppSelection(
+            id: readOnlyApp.id,
+            name: readOnlyApp.name,
+            invocationName: readOnlyApp.invocationName,
+            description: readOnlyApp.description
+        )
+        let blockedWriteApp = TaskAppSelection(
+            id: mixedApp.id,
+            name: mixedApp.name,
+            invocationName: mixedApp.invocationName,
+            description: mixedApp.description,
+            requiresApproval: true
+        )
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Frozen capabilities",
+            sourceKind: .issue,
+            sourceText: "Use the selected read-only capabilities",
+            autoRun: false,
+            selectedSkills: [selectedSkill],
+            selectedApps: [selectedApp, blockedWriteApp]
+        )
+
+        let replacementSkill = CodexSkillMetadata(
+            name: "Replacement Skill",
+            description: "A catalog entry added after task creation.",
+            shortDescription: nil,
+            path: fixture.directory.appendingPathComponent("replacement/SKILL.md").path,
+            scope: "user",
+            enabled: true
+        )
+        let writeDriftedApp = CodexApp(
+            id: readOnlyApp.id,
+            name: "Knowledge With Writes",
+            invocationName: readOnlyApp.invocationName,
+            description: "The same app gained an enabled write tool.",
+            isAccessible: true,
+            isEnabled: true,
+            isCallable: true,
+            tools: [
+                CodexAppToolSummary(
+                    name: "lookup",
+                    title: "Lookup",
+                    description: "Look up data.",
+                    isEnabled: true,
+                    isReadOnly: true,
+                    disabledReason: nil
+                ),
+                CodexAppToolSummary(
+                    name: "update",
+                    title: "Update",
+                    description: "Update external data.",
+                    isEnabled: true,
+                    isReadOnly: false,
+                    disabledReason: nil
+                )
+            ]
+        )
+        let frozenTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(frozenTask.selectedSkills, [selectedSkill])
+        XCTAssertEqual(frozenTask.selectedApps, [selectedApp])
+
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually { fixture.client.planningInputs.count == 1 }
+        let planningInput = fixture.client.planningInputs[0]
+        XCTAssertEqual(planningInput.count, 3)
+        guard case .text = planningInput[0] else {
+            return XCTFail("Planning text must precede frozen capability inputs")
+        }
+        XCTAssertEqual(planningInput[1], .skill(name: selectedSkill.name, path: selectedSkill.path))
+        XCTAssertEqual(planningInput[2], .mention(name: selectedApp.invocationName, path: "app://\(selectedApp.id)"))
+
+        fixture.client.skillsCatalog = [fixture.projectPath: [replacementSkill]]
+        fixture.client.appsCatalog = [writeDriftedApp]
+        await fixture.store.refreshCapabilities(projectID: fixture.projectPath, forceRefresh: true)
+
+        XCTAssertEqual(fixture.store.availableSkills, [replacementSkill])
+        XCTAssertEqual(fixture.store.availableApps, [writeDriftedApp])
+
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Use the frozen read-only capabilities"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .awaitingApproval
+        }
+        fixture.store.confirmPlan(taskID: taskID)
+        try await eventually { fixture.client.executionInputs.count == 1 }
+
+        let executionInput = fixture.client.executionInputs[0]
+        XCTAssertEqual(executionInput.count, 2)
+        guard case .text = executionInput[0] else {
+            return XCTFail("Execution text must precede frozen capability inputs")
+        }
+        XCTAssertEqual(executionInput[1], planningInput[1])
+        XCTAssertFalse(executionInput.contains(planningInput[2]))
+        let executingTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(executingTask.selectedSkills, [selectedSkill])
+        XCTAssertEqual(executingTask.selectedApps, [selectedApp])
+        XCTAssertEqual(fixture.client.appListThreadIDs, ["thread-1", "thread-1"])
+    }
+
     func testFastModeOffMapsToDefaultServiceTierForBothTurns() async throws {
         let fixture = try Fixture(autoRunDefault: false)
         defer { fixture.cleanup() }
@@ -133,6 +1049,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             fastMode: false
         )
 
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningCalls.count == 1 }
         XCTAssertEqual(fixture.client.threadStartCalls.first?.serviceTier, "default")
         XCTAssertEqual(fixture.client.planningCalls.first?.serviceTier, "default")
@@ -167,6 +1084,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             autoRun: false
         )
 
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningTurnCount == 1 }
         fixture.client.send(.planUpdated(
             threadID: "thread-1",
@@ -262,6 +1180,14 @@ final class BoardStoreWorkflowTests: XCTestCase {
             fixture.client.executionTurnCount == 1
                 && fixture.store.tasks.first(where: { $0.id == secondID })?.stage == .awaitingApproval
         }
+        XCTAssertTrue(try XCTUnwrap(
+            fixture.store.tasks.first(where: { $0.id == secondID })?.executionApproved
+        ))
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: {
+            $0.taskID == secondID && $0.kind == .planApproval
+        }))
+        fixture.store.focusTask(firstID)
+        let previousFocusNonce = try XCTUnwrap(fixture.store.taskFocusRequest?.nonce)
 
         XCTAssertTrue(fixture.store.updatePlan(
             taskID: secondID,
@@ -270,6 +1196,16 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(
             fixture.store.tasks.first(where: { $0.id == secondID })?.executionApproved
         ))
+        XCTAssertEqual(fixture.store.selectedTaskID, secondID)
+        XCTAssertEqual(fixture.store.taskFocusRequest?.taskID, secondID)
+        XCTAssertEqual(fixture.store.taskFocusRequest?.stage, .awaitingApproval)
+        XCTAssertNotEqual(fixture.store.taskFocusRequest?.nonce, previousFocusNonce)
+        XCTAssertEqual(
+            fixture.store.attentionNotices.count(where: {
+                $0.taskID == secondID && $0.kind == .planApproval
+            }),
+            1
+        )
 
         fixture.client.send(.turnCompleted(
             threadID: "thread-1",
@@ -284,6 +1220,9 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(fixture.client.executionTurnCount, 1)
 
         fixture.store.confirmPlan(taskID: secondID)
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: {
+            $0.taskID == secondID && $0.kind == .planApproval
+        }))
         try await eventually { fixture.client.executionTurnCount == 2 }
         let executionInput = try XCTUnwrap(fixture.client.executionInputs.last?.first)
         guard case let .text(prompt) = executionInput else {
@@ -305,12 +1244,19 @@ final class BoardStoreWorkflowTests: XCTestCase {
             autoRun: true
         )
 
-        try await eventually { fixture.client.planningTurnCount == 1 }
+        try await eventually {
+            fixture.client.planningTurnCount == 1
+                && fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .planning
+        }
+        XCTAssertEqual(fixture.client.threadStartCount, 1)
         fixture.client.send(.planFinal(threadID: "thread-1", turnID: "plan-1", text: "Approved plan"))
         fixture.client.send(.turnCompleted(threadID: "thread-1", turnID: "plan-1", status: "completed", error: nil))
 
         try await eventually { fixture.client.executionTurnCount == 1 }
         XCTAssertEqual(fixture.store.tasks.first(where: { $0.id == taskID })?.stage, .executing)
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: {
+            $0.taskID == taskID && $0.kind == .planApproval
+        }))
     }
 
     func testInterruptedPersistedTaskBecomesNeedsAttention() async throws {
@@ -416,6 +1362,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             sourceText: "Do not execute partial output",
             autoRun: false
         )
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningTurnCount == 1 }
         fixture.client.send(.agentDelta(threadID: "thread-1", turnID: "plan-1", delta: "Unfinished draft"))
         fixture.client.send(.turnCompleted(
@@ -443,6 +1390,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             sourceText: "Handle transport failure",
             autoRun: false
         )
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually {
             fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .planning
         }
@@ -467,6 +1415,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             sourceText: "Keep planning",
             autoRun: false
         )
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningTurnCount == 1 }
         let originalLiveMessage = try XCTUnwrap(
             fixture.store.tasks.first(where: { $0.id == taskID })?.liveMessage
@@ -512,6 +1461,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             sourceText: "Surface warning",
             autoRun: false
         )
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningTurnCount == 1 }
 
         fixture.client.send(.warning(
@@ -562,6 +1512,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             sourceText: "Plan this task",
             autoRun: false
         )
+        await fixture.store.startPlanning(taskID: planningID)
         try await eventually { fixture.client.planningTurnCount == 2 }
 
         XCTAssertEqual(fixture.store.runningTaskCount, 2)
@@ -594,6 +1545,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             autoRun: false
         )
 
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningInputs.count == 1 }
         let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
         XCTAssertEqual(task.title, "Screenshot.png")
@@ -656,6 +1608,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             autoRun: false
         )
 
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningTurnCount == 1 }
         fixture.client.send(.planFinal(
             threadID: "thread-1",
@@ -721,6 +1674,103 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertNotNil(task.latestExecutionRun?.reviewedAt)
     }
 
+    func testTurnDiffReplacesSnapshotAndRemainsOnCompletedExecutionRun() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Diff delivery",
+            sourceKind: .issue,
+            sourceText: "Implement a code change",
+            autoRun: false
+        )
+
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Implement and test the code change"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .awaitingApproval
+        }
+        fixture.store.confirmPlan(taskID: taskID)
+        try await eventually { fixture.client.executionTurnCount == 1 }
+
+        let firstSnapshot = """
+        diff --git a/Sources/Feature.swift b/Sources/Feature.swift
+        --- a/Sources/Feature.swift
+        +++ b/Sources/Feature.swift
+        @@ -1 +1 @@
+        -let enabled = false
+        +let enabled = true
+        """
+        let latestSnapshot = firstSnapshot + "\n+let delivered = true"
+        fixture.client.send(.turnDiffUpdated(
+            threadID: "thread-1",
+            turnID: "execute-1",
+            diff: firstSnapshot
+        ))
+        fixture.client.send(.turnDiffUpdated(
+            threadID: "thread-1",
+            turnID: "execute-1",
+            diff: latestSnapshot
+        ))
+
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?
+                .latestCodeDelivery?.unifiedDiff == latestSnapshot
+        }
+        XCTAssertFalse(
+            fixture.store.tasks.first(where: { $0.id == taskID })?
+                .latestCodeDelivery?.unifiedDiff.contains(firstSnapshot + firstSnapshot) == true
+        )
+
+        fixture.client.send(.agentFinal(
+            threadID: "thread-1",
+            turnID: "execute-1",
+            text: """
+            Implemented the code delivery.
+
+            ```codexboard-evidence
+            {
+              "summary": "Implemented the code delivery",
+              "changedFiles": ["Sources/Feature.swift"],
+              "artifacts": [],
+              "verificationCommands": ["swift test"],
+              "testSummary": "Passed",
+              "commitSHA": null,
+              "pullRequestURL": null,
+              "residualRisks": []
+            }
+            ```
+            """
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "execute-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .review
+        }
+
+        let run = try XCTUnwrap(
+            fixture.store.tasks.first(where: { $0.id == taskID })?.latestExecutionRun
+        )
+        XCTAssertEqual(run.codeDelivery?.unifiedDiff, latestSnapshot)
+        XCTAssertEqual(run.evidence?.summary, "Implemented the code delivery")
+    }
+
     func testRequestChangesStartsAnotherExecutionRunWithReviewFeedback() async throws {
         let fixture = try Fixture(autoRunDefault: false)
         defer { fixture.cleanup() }
@@ -733,6 +1783,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             autoRun: false
         )
 
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningTurnCount == 1 }
         fixture.client.send(.planFinal(
             threadID: "thread-1",
@@ -866,6 +1917,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             sourceText: "Stream a long plan",
             autoRun: false
         )
+        await store.startPlanning(taskID: taskID)
         try await eventually { client.planningTurnCount == 1 }
         try await Task.sleep(for: .seconds(1))
         let baselineSaveCount = await persistence.saveCount
@@ -916,6 +1968,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             sourceText: "Preserve pending content",
             autoRun: false
         )
+        await fixture.store.startPlanning(taskID: taskID)
         try await eventually { fixture.client.planningTurnCount == 1 }
 
         fixture.client.send(.agentDelta(
@@ -952,6 +2005,8 @@ final class BoardStoreWorkflowTests: XCTestCase {
             sourceText: "Second",
             autoRun: false
         )
+        await fixture.store.startPlanning(taskID: firstID)
+        await fixture.store.startPlanning(taskID: secondID)
         try await eventually { fixture.client.planningTurnCount == 2 }
 
         fixture.client.send(.agentDelta(
@@ -1029,6 +2084,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
             sourceText: "Stream without redrawing unrelated views",
             autoRun: false
         )
+        await store.startPlanning(taskID: streamingID)
         try await eventually { client.planningTurnCount == 1 }
         store.selectedTaskID = selectedID
         let selectedBefore = try XCTUnwrap(store.selectedTask)
@@ -1046,6 +2102,506 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(store.selectedTask, selectedBefore)
         XCTAssertEqual(store.taskCards, cardsBefore)
         XCTAssertEqual(store.taskCards.count, 300)
+    }
+
+    func testInteractionsRequireManualResponseStayTaskScopedAndClearOnDisconnect() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let automaticID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Automatic interaction",
+            sourceKind: .issue,
+            sourceText: "Wait for approval",
+            autoRun: true
+        )
+        let manualID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Manual interaction",
+            sourceKind: .issue,
+            sourceText: "Wait for an answer",
+            autoRun: false
+        )
+        await fixture.store.startPlanning(taskID: manualID)
+        try await eventually { fixture.client.planningTurnCount == 2 }
+
+        let approvalID = CodexRequestID.string("approval-1")
+        let approval = CodexInteractionRequest(
+            id: approvalID,
+            threadID: "thread-1",
+            turnID: "plan-1",
+            itemID: nil,
+            kind: .commandApproval(CodexCommandApproval(
+                command: "git status",
+                cwd: fixture.projectPath,
+                reason: "Inspect repository",
+                commandActions: nil,
+                requestedPermissions: nil,
+                availableDecisions: [.accept, .decline]
+            )),
+            createdAt: Date()
+        )
+        let questionID = CodexRequestID.integer(42)
+        let question = CodexInteractionRequest(
+            id: questionID,
+            threadID: "thread-2",
+            turnID: "plan-2",
+            itemID: nil,
+            kind: .userInput(CodexUserInputRequest(questions: [], isBlocking: true)),
+            createdAt: Date()
+        )
+        fixture.store.selectedProjectID = nil
+        XCTAssertNil(fixture.store.selectedTaskID)
+
+        fixture.client.send(.interactionRequested(approval))
+        try await eventually {
+            fixture.store.interactions(for: automaticID).count == 1
+                && fixture.store.attentionNotices.count(where: {
+                    $0.taskID == automaticID && $0.kind == .interaction
+                }) == 1
+                && fixture.store.taskFocusRequest?.taskID == automaticID
+        }
+        XCTAssertEqual(fixture.store.selectedProjectID, fixture.projectPath)
+        XCTAssertEqual(fixture.store.selectedTaskID, automaticID)
+        XCTAssertEqual(fixture.store.taskFocusRequest?.stage, .planning)
+        let approvalNoticeID = try XCTUnwrap(
+            fixture.store.attentionNotices.first(where: {
+                $0.taskID == automaticID && $0.kind == .interaction
+            })?.id
+        )
+        let approvalFocusNonce = try XCTUnwrap(fixture.store.taskFocusRequest?.nonce)
+
+        fixture.client.send(.interactionRequested(approval))
+        fixture.client.send(.activity(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            message: "Duplicate interaction processed"
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == automaticID })?.liveMessage
+                == "Duplicate interaction processed"
+        }
+        XCTAssertEqual(
+            fixture.store.attentionNotices.filter {
+                $0.taskID == automaticID && $0.kind == .interaction
+            }.map(\.id),
+            [approvalNoticeID]
+        )
+        XCTAssertEqual(fixture.store.taskFocusRequest?.nonce, approvalFocusNonce)
+
+        fixture.store.focusTask(manualID)
+        let manualFocusNonce = try XCTUnwrap(fixture.store.taskFocusRequest?.nonce)
+        let secondApprovalID = CodexRequestID.string("approval-2")
+        fixture.client.send(.interactionRequested(CodexInteractionRequest(
+            id: secondApprovalID,
+            threadID: "thread-1",
+            turnID: "plan-1",
+            itemID: "command-2",
+            kind: .commandApproval(CodexCommandApproval(
+                command: "git diff",
+                cwd: fixture.projectPath,
+                reason: "Inspect the pending change",
+                commandActions: nil,
+                requestedPermissions: nil,
+                availableDecisions: [.accept, .decline]
+            )),
+            createdAt: Date()
+        )))
+        try await eventually {
+            fixture.store.interactions(for: automaticID).count == 2
+                && fixture.store.attentionNotices.count(where: {
+                    $0.taskID == automaticID && $0.kind == .interaction
+                }) == 2
+                && fixture.store.selectedTaskID == automaticID
+                && fixture.store.taskFocusRequest?.nonce != manualFocusNonce
+        }
+        XCTAssertEqual(fixture.store.selectedTaskID, automaticID)
+        XCTAssertEqual(fixture.store.taskFocusRequest?.taskID, automaticID)
+        XCTAssertNotEqual(fixture.store.taskFocusRequest?.nonce, manualFocusNonce)
+
+        fixture.client.send(.interactionRequested(question))
+        try await eventually {
+            fixture.store.interactions(for: automaticID).count == 2
+                && fixture.store.interactions(for: manualID).count == 1
+                && fixture.store.attentionNotices.count(where: { $0.kind == .interaction }) == 3
+        }
+
+        XCTAssertTrue(fixture.client.interactionResponses.isEmpty)
+        XCTAssertEqual(fixture.store.interactions(for: automaticID).first?.id, approvalID)
+        XCTAssertEqual(fixture.store.interactions(for: automaticID).last?.id, secondApprovalID)
+        XCTAssertEqual(fixture.store.interactions(for: manualID).first?.id, questionID)
+        XCTAssertTrue(fixture.store.hasPendingInteraction(for: automaticID))
+        XCTAssertTrue(fixture.store.hasPendingInteraction(for: manualID))
+
+        fixture.client.send(.connectionLost(message: "transport closed"))
+        try await eventually {
+            !fixture.store.hasPendingInteraction(for: automaticID)
+                && !fixture.store.hasPendingInteraction(for: manualID)
+        }
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: { $0.kind == .interaction }))
+        XCTAssertTrue(fixture.client.interactionResponses.isEmpty)
+    }
+
+    func testFocusAttentionTaskRejectsStaleNoticeAndRefreshesFocusForSelectedTask() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Focus notification",
+            sourceKind: .issue,
+            sourceText: "Focus this card again when the notification is clicked",
+            autoRun: false
+        )
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        let requestID = CodexRequestID.string("focus-notification")
+        fixture.client.send(.interactionRequested(CodexInteractionRequest(
+            id: requestID,
+            threadID: "thread-1",
+            turnID: "plan-1",
+            itemID: nil,
+            kind: .fileChangeApproval(CodexFileChangeApproval(
+                reason: "Apply the requested change",
+                grantRoot: fixture.projectPath
+            )),
+            createdAt: Date()
+        )))
+        try await eventually {
+            fixture.store.attentionNotices.contains(where: {
+                $0.taskID == taskID && $0.kind == .interaction
+            })
+        }
+
+        let initialFocusNonce = try XCTUnwrap(fixture.store.taskFocusRequest?.nonce)
+        XCTAssertTrue(fixture.store.focusAttentionTask(taskID))
+        XCTAssertEqual(fixture.store.selectedProjectID, fixture.projectPath)
+        XCTAssertEqual(fixture.store.selectedTaskID, taskID)
+        XCTAssertEqual(fixture.store.taskFocusRequest?.taskID, taskID)
+        XCTAssertNotEqual(fixture.store.taskFocusRequest?.nonce, initialFocusNonce)
+        let refreshedFocusNonce = try XCTUnwrap(fixture.store.taskFocusRequest?.nonce)
+
+        fixture.client.send(.interactionResolved(threadID: "thread-1", requestID: requestID))
+        try await eventually {
+            !fixture.store.attentionNotices.contains(where: {
+                $0.taskID == taskID && $0.kind == .interaction
+            })
+        }
+        XCTAssertFalse(fixture.store.focusAttentionTask(taskID))
+        XCTAssertEqual(fixture.store.taskFocusRequest?.nonce, refreshedFocusNonce)
+    }
+
+    func testInteractionFailureKeepsRequestSuccessAndResolvedClearWithoutPersistingAnswers() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Sensitive answer",
+            sourceKind: .issue,
+            sourceText: "Ask before continuing",
+            autoRun: false
+        )
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        let requestID = CodexRequestID.string("question-secret")
+        fixture.client.send(.interactionRequested(CodexInteractionRequest(
+            id: requestID,
+            threadID: "thread-1",
+            turnID: "plan-1",
+            itemID: nil,
+            kind: .userInput(CodexUserInputRequest(questions: [], isBlocking: true)),
+            createdAt: Date()
+        )))
+        try await eventually {
+            fixture.store.hasPendingInteraction(for: taskID)
+                && fixture.store.attentionNotices.contains(where: {
+                    $0.taskID == taskID && $0.kind == .interaction
+                })
+        }
+        let failedResponseNoticeID = try XCTUnwrap(
+            fixture.store.attentionNotices.first(where: {
+                $0.taskID == taskID && $0.kind == .interaction
+            })?.id
+        )
+
+        fixture.client.interactionResponseFailures = [.interaction]
+        let response = CodexInteractionResponse.userInput(["token": ["super-secret-answer"]])
+        await fixture.store.respondToInteraction(
+            taskID: taskID,
+            requestID: requestID,
+            response: response
+        )
+        XCTAssertTrue(fixture.store.hasPendingInteraction(for: taskID))
+        XCTAssertTrue(fixture.store.tasks.first(where: { $0.id == taskID })?.lastError?.contains("交互响应失败") == true)
+        XCTAssertEqual(
+            fixture.store.attentionNotices.first(where: {
+                $0.taskID == taskID && $0.kind == .interaction
+            })?.id,
+            failedResponseNoticeID
+        )
+
+        await fixture.store.respondToInteraction(
+            taskID: taskID,
+            requestID: requestID,
+            response: response
+        )
+        XCTAssertFalse(fixture.store.hasPendingInteraction(for: taskID))
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: {
+            $0.taskID == taskID && $0.kind == .interaction
+        }))
+        XCTAssertEqual(fixture.client.interactionResponses.count, 1)
+
+        let resolvedRequestID = CodexRequestID.string("resolved-by-server")
+        fixture.client.send(.interactionRequested(CodexInteractionRequest(
+            id: resolvedRequestID,
+            threadID: "thread-1",
+            turnID: "plan-1",
+            itemID: nil,
+            kind: .userInput(CodexUserInputRequest(questions: [], isBlocking: true)),
+            createdAt: Date()
+        )))
+        try await eventually {
+            fixture.store.interactions(for: taskID).contains(where: { $0.id == resolvedRequestID })
+                && fixture.store.attentionNotices.contains(where: {
+                    $0.taskID == taskID && $0.kind == .interaction
+                })
+        }
+        fixture.client.send(.interactionResolved(threadID: "thread-1", requestID: resolvedRequestID))
+        fixture.client.send(.interactionResolved(threadID: "thread-1", requestID: resolvedRequestID))
+        try await eventually {
+            !fixture.store.hasPendingInteraction(for: taskID)
+                && !fixture.store.attentionNotices.contains(where: {
+                    $0.taskID == taskID && $0.kind == .interaction
+                })
+        }
+        try await Task.sleep(for: .milliseconds(900))
+
+        let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertFalse(task.logs.contains { $0.message.contains("super-secret-answer") })
+        let persistedText = String(
+            decoding: try Data(contentsOf: fixture.directory.appendingPathComponent("board.json")),
+            as: UTF8.self
+        )
+        XCTAssertFalse(persistedText.contains("super-secret-answer"))
+        XCTAssertFalse(persistedText.contains("question-secret"))
+    }
+
+    func testCancelRejectsPendingServerInteractionsBeforeInterruptingTurn() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Cancel interaction",
+            sourceKind: .issue,
+            sourceText: "Cancel safely",
+            autoRun: false
+        )
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        let requestID = CodexRequestID.string("permission-1")
+        fixture.client.send(.interactionRequested(CodexInteractionRequest(
+            id: requestID,
+            threadID: "thread-1",
+            turnID: "plan-1",
+            itemID: nil,
+            kind: .permissionsApproval(CodexPermissionsApproval(
+                cwd: fixture.projectPath,
+                reason: "Need access",
+                permissions: .object([:])
+            )),
+            createdAt: Date()
+        )))
+        try await eventually { fixture.store.hasPendingInteraction(for: taskID) }
+
+        await fixture.store.cancel(taskID: taskID)
+
+        XCTAssertFalse(fixture.store.hasPendingInteraction(for: taskID))
+        XCTAssertEqual(fixture.client.interactionResponses.count, 1)
+        XCTAssertEqual(fixture.client.interactionResponses.first?.requestID, requestID)
+        XCTAssertEqual(
+            fixture.client.interactionResponses.first?.response,
+            .permissions(.deny(scope: .turn))
+        )
+    }
+
+    func testCancelUsesAllowedDeclineAndKeepsRequestWhenResponseAndInterruptFail() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Retry cancellation",
+            sourceKind: .issue,
+            sourceText: "Keep the approval visible until cancellation succeeds",
+            autoRun: false
+        )
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        let requestID = CodexRequestID.string("command-decline-only")
+        fixture.client.send(.interactionRequested(CodexInteractionRequest(
+            id: requestID,
+            threadID: "thread-1",
+            turnID: "plan-1",
+            itemID: "command-1",
+            kind: .commandApproval(CodexCommandApproval(
+                command: "git status",
+                cwd: fixture.projectPath,
+                reason: nil,
+                commandActions: nil,
+                requestedPermissions: nil,
+                availableDecisions: [.accept, .decline]
+            )),
+            createdAt: Date()
+        )))
+        try await eventually { fixture.store.hasPendingInteraction(for: taskID) }
+
+        fixture.client.interactionResponseFailures = [.interaction]
+        fixture.client.interruptFailures = [.interaction]
+        await fixture.store.cancel(taskID: taskID)
+
+        XCTAssertTrue(fixture.store.hasPendingInteraction(for: taskID))
+        XCTAssertTrue(fixture.client.interactionResponses.isEmpty)
+        XCTAssertEqual(fixture.client.interruptCalls.count, 1)
+
+        await fixture.store.cancel(taskID: taskID)
+        XCTAssertFalse(fixture.store.hasPendingInteraction(for: taskID))
+        XCTAssertEqual(fixture.client.interactionResponses.count, 1)
+        XCTAssertEqual(fixture.client.interactionResponses.first?.response, .approval(.decline))
+        XCTAssertEqual(fixture.client.interruptCalls.count, 2)
+    }
+
+    func testCancelIntentPreventsAutoRunFromStartingExecutionDuringResponseRace() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Cancel automatic planning",
+            sourceKind: .issue,
+            sourceText: "Never execute after stop is clicked",
+            autoRun: true
+        )
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        let requestID = CodexRequestID.string("race-permission")
+        fixture.client.send(.interactionRequested(CodexInteractionRequest(
+            id: requestID,
+            threadID: "thread-1",
+            turnID: "plan-1",
+            itemID: "permission-race",
+            kind: .permissionsApproval(CodexPermissionsApproval(
+                cwd: fixture.projectPath,
+                reason: "Race fixture",
+                permissions: .object([:])
+            )),
+            createdAt: Date()
+        )))
+        try await eventually { fixture.store.hasPendingInteraction(for: taskID) }
+        fixture.client.interactionResponseDelayMilliseconds = 100
+
+        let cancellation = Task { await fixture.store.cancel(taskID: taskID) }
+        try await Task.sleep(for: .milliseconds(20))
+        fixture.client.send(.planFinal(threadID: "thread-1", turnID: "plan-1", text: "Finished plan"))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+        await cancellation.value
+
+        XCTAssertEqual(fixture.client.executionTurnCount, 0)
+        XCTAssertFalse(
+            fixture.store.tasks.first(where: { $0.id == taskID })?.executionApproved ?? true
+        )
+    }
+
+    func testCancelBeforeThreadStartReturnsPreventsPlanningTurn() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        fixture.client.threadStartDelayMilliseconds = 100
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Cancel during thread start",
+            sourceKind: .issue,
+            sourceText: "Do not start a turn after stop",
+            autoRun: true
+        )
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .planning
+                && fixture.client.threadStartCount == 1
+        }
+
+        await fixture.store.cancel(taskID: taskID)
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+
+        XCTAssertEqual(fixture.client.planningTurnCount, 0)
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == taskID })?.failureState?.kind,
+            .interrupted
+        )
+    }
+
+    func testMCPOAuthStateOpensOnlyFromUserActionAndRefreshesAfterCompletion() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        client.mcpServerCatalog = [CodexMCPServerStatus(
+            name: "example",
+            authStatus: "notLoggedIn",
+            title: "Example",
+            description: "Fixture server",
+            version: "1",
+            websiteURL: nil,
+            toolNames: ["lookup"]
+        )]
+        var openedURLs: [URL] = []
+        let store = BoardStore(
+            client: client,
+            persistence: BoardPersistence(fileURL: directory.appendingPathComponent("board.json")),
+            attachmentStorage: AttachmentStorage(rootDirectory: directory.appendingPathComponent("attachments")),
+            externalURLOpener: { url in
+                openedURLs.append(url)
+                return true
+            }
+        )
+        store.start()
+        try await eventually { store.projects.contains(where: { $0.id == directory.path }) }
+        await store.refreshMCPServers()
+        XCTAssertEqual(store.mcpServers.map(\.name), ["example"])
+        XCTAssertTrue(openedURLs.isEmpty)
+
+        await store.beginMCPOAuth(serverName: "example")
+        XCTAssertEqual(openedURLs, [client.oauthURL])
+        XCTAssertTrue(store.oauthServersInProgress.contains("example"))
+        XCTAssertEqual(client.oauthCalls.count, 1)
+        client.send(.mcpOAuthCompleted(CodexMCPOAuthCompletion(
+            serverName: "example",
+            threadID: nil,
+            success: true,
+            error: nil
+        )))
+        try await eventually {
+            !store.oauthServersInProgress.contains("example") && client.mcpServerListCount >= 2
+        }
+        XCTAssertNil(store.mcpServerError)
+
+        await store.beginMCPOAuth(serverName: "example")
+        client.send(.mcpOAuthCompleted(CodexMCPOAuthCompletion(
+            serverName: "example",
+            threadID: nil,
+            success: false,
+            error: "OAuth denied"
+        )))
+        try await eventually { store.mcpServerError == "OAuth denied" }
+        XCTAssertFalse(store.oauthServersInProgress.contains("example"))
     }
 
     private func eventually(
@@ -1066,6 +2622,29 @@ final class BoardStoreWorkflowTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private func runGit(_ arguments: [String]) throws {
+        let process = Process()
+        let output = Pipe()
+        let error = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let message = String(
+                decoding: error.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+            throw NSError(
+                domain: "BoardStoreWorkflowTests.Git",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
     }
 }
 
@@ -1101,6 +2680,20 @@ private struct MockTurnCall {
     let allowNetwork: Bool?
 }
 
+private enum MockClientError: LocalizedError {
+    case authentication
+    case startup
+    case interaction
+
+    var errorDescription: String? {
+        switch self {
+        case .authentication: "401 Unauthorized: Missing bearer authentication"
+        case .startup: "Temporary process startup failure"
+        case .interaction: "Interaction response failed"
+        }
+    }
+}
+
 @MainActor
 private final class MockCodexTaskClient: CodexTaskClient {
     var connectionState: CodexConnectionState = .connected
@@ -1110,11 +2703,27 @@ private final class MockCodexTaskClient: CodexTaskClient {
     var planningTurnCount = 0
     var executionTurnCount = 0
     var threadStartCount = 0
+    var threadStartDelayMilliseconds = 0
+    var planningTurnDelayMilliseconds = 0
+    var threadStartFailures: [CodexClientError] = []
     var planningInputs: [[CodexTurnInput]] = []
     var executionInputs: [[CodexTurnInput]] = []
     var threadStartCalls: [MockThreadStartCall] = []
     var planningCalls: [MockTurnCall] = []
     var executionCalls: [MockTurnCall] = []
+    var planningFailures: [MockClientError] = []
+    var skillsCatalog: [String: [CodexSkillMetadata]] = [:]
+    var appsCatalog: [CodexApp] = []
+    var appListThreadIDs: [String?] = []
+    var mcpServerCatalog: [CodexMCPServerStatus] = []
+    var mcpServerListCount = 0
+    var oauthURL = URL(string: "https://example.test/oauth")!
+    var oauthCalls: [(serverName: String, threadID: String?)] = []
+    var interactionResponses: [(requestID: CodexRequestID, response: CodexInteractionResponse)] = []
+    var interactionResponseFailures: [MockClientError] = []
+    var interactionResponseDelayMilliseconds = 0
+    var interruptCalls: [(threadID: String, turnID: String)] = []
+    var interruptFailures: [MockClientError] = []
     private var modelsByThreadID: [String: String] = [:]
 
     init(projectPath: String) {
@@ -1145,6 +2754,33 @@ private final class MockCodexTaskClient: CodexTaskClient {
             )]
         )]
     }
+    func listSkills(cwds: [String], forceReload: Bool) async throws -> [String: [CodexSkillMetadata]] {
+        skillsCatalog
+    }
+    func listApps(forceRefresh: Bool) async throws -> [CodexApp] {
+        appsCatalog
+    }
+    func listApps(forceRefresh: Bool, threadID: String?) async throws -> [CodexApp] {
+        appListThreadIDs.append(threadID)
+        return appsCatalog
+    }
+    func listMCPServers(threadID: String?) async throws -> [CodexMCPServerStatus] {
+        mcpServerListCount += 1
+        return mcpServerCatalog
+    }
+    func beginMCPOAuth(serverName: String, threadID: String?) async throws -> URL {
+        oauthCalls.append((serverName, threadID))
+        return oauthURL
+    }
+    func respond(to requestID: CodexRequestID, with response: CodexInteractionResponse) async throws {
+        if interactionResponseDelayMilliseconds > 0 {
+            try await Task.sleep(for: .milliseconds(interactionResponseDelayMilliseconds))
+        }
+        if !interactionResponseFailures.isEmpty {
+            throw interactionResponseFailures.removeFirst()
+        }
+        interactionResponses.append((requestID, response))
+    }
     func listThreads(cursor: String?, archived: Bool) async throws -> CodexThreadPage {
         CodexThreadPage(
             threads: [CodexThreadSummary(
@@ -1167,11 +2803,17 @@ private final class MockCodexTaskClient: CodexTaskClient {
         serviceTier: String
     ) async throws -> CodexStartedThread {
         threadStartCount += 1
+        if threadStartDelayMilliseconds > 0 {
+            try await Task.sleep(for: .milliseconds(threadStartDelayMilliseconds))
+        }
         threadStartCalls.append(MockThreadStartCall(
             cwd: cwd,
             model: model,
             serviceTier: serviceTier
         ))
+        if !threadStartFailures.isEmpty {
+            throw threadStartFailures.removeFirst()
+        }
         let threadID = "thread-\(threadStartCount)"
         let resolvedModel = model ?? "gpt-test"
         modelsByThreadID[threadID] = resolvedModel
@@ -1209,6 +2851,12 @@ private final class MockCodexTaskClient: CodexTaskClient {
             serviceTier: serviceTier,
             allowNetwork: nil
         ))
+        if planningTurnDelayMilliseconds > 0 {
+            try await Task.sleep(for: .milliseconds(planningTurnDelayMilliseconds))
+        }
+        if !planningFailures.isEmpty {
+            throw planningFailures.removeFirst()
+        }
         return CodexStartedTurn(turnID: "plan-\(planningTurnCount)", status: "inProgress")
     }
     func startExecutionTurn(
@@ -1232,7 +2880,12 @@ private final class MockCodexTaskClient: CodexTaskClient {
         ))
         return CodexStartedTurn(turnID: "execute-\(executionTurnCount)", status: "inProgress")
     }
-    func interrupt(threadID: String, turnID: String) async throws {}
+    func interrupt(threadID: String, turnID: String) async throws {
+        interruptCalls.append((threadID, turnID))
+        if !interruptFailures.isEmpty {
+            throw interruptFailures.removeFirst()
+        }
+    }
 }
 
 @MainActor

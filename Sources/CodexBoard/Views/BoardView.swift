@@ -12,6 +12,7 @@ struct BoardView: View {
     var body: some View {
         let selectedProject = store.selectedProject
         let tasksByStage = groupedTasks
+        let attentionTaskIDs = Set(store.attentionNotices.map(\.taskID))
 
         VStack(spacing: 0) {
             boardHeader(project: selectedProject)
@@ -19,28 +20,43 @@ struct BoardView: View {
             if selectedProject == nil {
                 emptyProjectState
             } else {
-                ScrollView(.horizontal) {
-                    HStack(alignment: .top, spacing: 14) {
-                        ForEach(columns) { stage in
-                            BoardColumn(
-                                stage: stage,
-                                tasks: tasksByStage[stage, default: []],
-                                selectTask: { store.selectedTaskID = $0 },
-                                moveTask: { store.moveTask(taskID: $0, to: $1) },
-                                confirmPlan: { store.confirmPlan(taskID: $0) },
-                                cancelTask: { taskID in
-                                    Task { await store.cancel(taskID: taskID) }
-                                },
-                                continueExecution: { store.continueExecution(taskID: $0) },
-                                acceptReview: { store.acceptReview(taskID: $0) },
-                                deleteTask: { store.deleteTask(taskID: $0) }
-                            )
+                ScrollViewReader { stageProxy in
+                    ScrollView(.horizontal) {
+                        HStack(alignment: .top, spacing: 14) {
+                            ForEach(columns) { stage in
+                                BoardColumn(
+                                    stage: stage,
+                                    tasks: tasksByStage[stage, default: []],
+                                    selectedTaskID: store.selectedTaskID,
+                                    attentionTaskIDs: attentionTaskIDs,
+                                    focusRequest: store.taskFocusRequest,
+                                    selectTask: { store.selectedTaskID = $0 },
+                                    moveTask: { store.moveTask(taskID: $0, to: $1) },
+                                    startPlanning: { taskID in
+                                        Task { await store.startPlanning(taskID: taskID) }
+                                    },
+                                    confirmPlan: { store.confirmPlan(taskID: $0) },
+                                    cancelTask: { taskID in
+                                        Task { await store.cancel(taskID: taskID) }
+                                    },
+                                    continueExecution: { store.continueExecution(taskID: $0) },
+                                    acceptReview: { store.acceptReview(taskID: $0) },
+                                    deleteTask: { store.deleteTask(taskID: $0) }
+                                )
                                 .frame(width: 274)
+                                .id(stage)
+                            }
+                        }
+                        .padding(18)
+                    }
+                    .scrollIndicators(.visible)
+                    .onChange(of: store.taskFocusRequest, initial: true) { _, request in
+                        guard let request, columns.contains(request.stage) else { return }
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            stageProxy.scrollTo(request.stage, anchor: .center)
                         }
                     }
-                    .padding(18)
                 }
-                .scrollIndicators(.visible)
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -57,7 +73,7 @@ struct BoardView: View {
     private func boardHeader(project: ProjectRecord?) -> some View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(project?.name ?? "项目看板")
+                Text(project?.name ?? L10n.text("项目看板", fallback: "项目看板"))
                     .font(.title2.weight(.semibold))
                 if let project {
                     Text(BoardFormatters.displayPath(project.path))
@@ -81,7 +97,7 @@ struct BoardView: View {
                 set: { value in store.updatePreferences { $0.defaultAutoRun = value } }
             ))
             .toggleStyle(.switch)
-            .help("新任务完成规划后自动进入执行队列")
+            .help("新任务会立即开始规划，并在方案完成后自动进入执行队列")
 
             Button("新建任务") { showingComposer = true }
                 .buttonStyle(.borderedProminent)
@@ -105,8 +121,12 @@ struct BoardView: View {
 private struct BoardColumn: View {
     let stage: TaskStage
     let tasks: [BoardTaskCard]
+    let selectedTaskID: UUID?
+    let attentionTaskIDs: Set<UUID>
+    let focusRequest: TaskFocusRequest?
     let selectTask: (UUID) -> Void
     let moveTask: (UUID, TaskStage) -> Bool
+    let startPlanning: (UUID) -> Void
     let confirmPlan: (UUID) -> Void
     let cancelTask: (UUID) -> Void
     let continueExecution: (UUID) -> Void
@@ -130,23 +150,38 @@ private struct BoardColumn: View {
                 Spacer()
             }
 
-            ScrollView {
-                LazyVStack(spacing: 10) {
-                    ForEach(tasks) { task in
-                        TaskCard(
-                            task: task,
-                            selectTask: { selectTask(task.id) },
-                            confirmPlan: { confirmPlan(task.id) },
-                            cancelTask: { cancelTask(task.id) },
-                            continueExecution: { continueExecution(task.id) },
-                            acceptReview: { acceptReview(task.id) },
-                            deleteTask: { deleteTask(task.id) }
-                        )
+            ScrollViewReader { taskProxy in
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        ForEach(tasks) { task in
+                            TaskCard(
+                                task: task,
+                                isSelected: selectedTaskID == task.id,
+                                needsAttention: attentionTaskIDs.contains(task.id),
+                                selectTask: { selectTask(task.id) },
+                                startPlanning: { startPlanning(task.id) },
+                                confirmPlan: { confirmPlan(task.id) },
+                                cancelTask: { cancelTask(task.id) },
+                                continueExecution: { continueExecution(task.id) },
+                                acceptReview: { acceptReview(task.id) },
+                                deleteTask: { deleteTask(task.id) }
+                            )
                             .draggable(task.id.uuidString)
+                            .id(task.id)
+                        }
+                    }
+                }
+                .scrollIndicators(.hidden)
+                .onChange(of: focusRequest, initial: true) { _, request in
+                    guard let request,
+                          request.stage == stage,
+                          tasks.contains(where: { $0.id == request.taskID })
+                    else { return }
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        taskProxy.scrollTo(request.taskID, anchor: .top)
                     }
                 }
             }
-            .scrollIndicators(.hidden)
         }
         .padding(12)
         .frame(maxHeight: .infinity, alignment: .top)
@@ -167,7 +202,10 @@ private struct BoardColumn: View {
 
 private struct TaskCard: View {
     let task: BoardTaskCard
+    let isSelected: Bool
+    let needsAttention: Bool
     let selectTask: () -> Void
+    let startPlanning: () -> Void
     let confirmPlan: () -> Void
     let cancelTask: () -> Void
     let continueExecution: () -> Void
@@ -184,6 +222,16 @@ private struct TaskCard: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Spacer()
+                    if needsAttention {
+                        Label("待响应", systemImage: "bell.badge.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(BoardTheme.approval)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(BoardTheme.approval.opacity(0.14), in: Capsule())
+                            .fixedSize()
+                            .help("此任务需要人工响应")
+                    }
                     if task.autoRun {
                         Image(systemName: "bolt.fill")
                             .font(.caption)
@@ -204,13 +252,35 @@ private struct TaskCard: View {
                         .foregroundStyle(.secondary)
                 }
 
+                if task.workspaceKind == .worktree || task.dependencyCount > 0 || task.circuitOpen {
+                    HStack(spacing: 10) {
+                        if task.workspaceKind == .worktree {
+                            Label("Worktree", systemImage: "arrow.triangle.branch")
+                        }
+                        if task.dependencyCount > 0 {
+                            Label(
+                                task.blockingDependencyCount > 0
+                                    ? "等待 \(task.blockingDependencyCount)"
+                                    : "依赖已满足",
+                                systemImage: "point.3.connected.trianglepath.dotted"
+                            )
+                        }
+                        if task.circuitOpen {
+                            Label("已熔断", systemImage: "bolt.slash")
+                                .foregroundStyle(BoardTheme.danger)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
                 if task.executionAttemptCount > 0 || task.hasDeliveryEvidence {
                     HStack(spacing: 10) {
                         if task.executionAttemptCount > 0 {
                             Label("执行 #\(task.executionAttemptCount)", systemImage: "arrow.triangle.2.circlepath")
                         }
                         if task.hasDeliveryEvidence {
-                            Label("交付证据", systemImage: "checkmark.seal")
+                            Label("交付物", systemImage: "shippingbox")
                         }
                     }
                     .font(.caption)
@@ -218,7 +288,7 @@ private struct TaskCard: View {
                 }
 
                 if !task.liveMessage.isEmpty {
-                    Text(task.liveMessage)
+                    Text(L10n.localizedRuntimeText(task.liveMessage))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.leading)
@@ -248,9 +318,21 @@ private struct TaskCard: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(Color(nsColor: .textBackgroundColor))
-                    .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
+                    .fill(
+                        isSelected
+                            ? BoardTheme.accent.opacity(0.10)
+                            : Color(nsColor: .textBackgroundColor)
+                    )
+                    .shadow(
+                        color: isSelected ? BoardTheme.accent.opacity(0.18) : .black.opacity(0.06),
+                        radius: isSelected ? 6 : 4,
+                        y: 2
+                    )
             )
+            .overlay {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .stroke(isSelected ? BoardTheme.accent : Color.clear, lineWidth: 2)
+            }
             .overlay(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 2)
                     .fill(BoardTheme.color(for: task.stage))
@@ -259,7 +341,12 @@ private struct TaskCard: View {
             }
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
         .contextMenu {
+            if task.stage == .inbox {
+                Button("开始规划", action: startPlanning)
+                    .disabled(task.blockingDependencyCount > 0)
+            }
             if task.stage == .awaitingApproval, !task.executionApproved {
                 Button("确认并执行", action: confirmPlan)
             }

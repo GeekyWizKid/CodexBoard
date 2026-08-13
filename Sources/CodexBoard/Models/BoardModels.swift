@@ -9,7 +9,7 @@ enum TaskSourceKind: String, Codable, CaseIterable, Identifiable, Sendable {
     var title: String {
         switch self {
         case .issue: "Issue"
-        case .developmentPlan: "开发计划"
+        case .developmentPlan: L10n.text("task.source.development_plan", fallback: "Development Plan")
         }
     }
 
@@ -34,13 +34,13 @@ enum TaskStage: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .inbox: "待办"
-        case .planning: "规划中"
-        case .awaitingApproval: "待确认"
-        case .executing: "执行中"
-        case .review: "待验收"
-        case .completed: "已完成"
-        case .needsAttention: "需要处理"
+        case .inbox: L10n.text("task.stage.inbox", fallback: "Inbox")
+        case .planning: L10n.text("task.stage.planning", fallback: "Planning")
+        case .awaitingApproval: L10n.text("task.stage.awaiting_approval", fallback: "Approval")
+        case .executing: L10n.text("task.stage.executing", fallback: "Executing")
+        case .review: L10n.text("task.stage.review", fallback: "Review")
+        case .completed: L10n.text("task.stage.completed", fallback: "Completed")
+        case .needsAttention: L10n.text("task.stage.needs_attention", fallback: "Needs Attention")
         }
     }
 
@@ -115,8 +115,8 @@ struct TaskAttachment: Codable, Hashable, Identifiable, Sendable {
 
         var title: String {
             switch self {
-            case .image: "图片"
-            case .file: "文件"
+            case .image: L10n.text("attachment.kind.image", fallback: "Image")
+            case .file: L10n.text("attachment.kind.file", fallback: "File")
             }
         }
 
@@ -219,6 +219,50 @@ struct CodexPlanStep: Codable, Hashable, Identifiable, Sendable {
     var status: Status
 }
 
+struct TaskSkillSelection: Codable, Hashable, Identifiable, Sendable {
+    var id: String { path }
+
+    let name: String
+    let description: String
+    let path: String
+    let scope: String
+}
+
+struct TaskAppSelection: Codable, Hashable, Identifiable, Sendable {
+    let id: String
+    let name: String
+    let invocationName: String
+    let description: String
+    let requiresApproval: Bool
+
+    init(
+        id: String,
+        name: String,
+        invocationName: String,
+        description: String,
+        requiresApproval: Bool = false
+    ) {
+        self.id = id
+        self.name = name
+        self.invocationName = invocationName
+        self.description = description
+        self.requiresApproval = requiresApproval
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, invocationName, description, requiresApproval
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        invocationName = try container.decode(String.self, forKey: .invocationName)
+        description = try container.decode(String.self, forKey: .description)
+        requiresApproval = try container.decodeIfPresent(Bool.self, forKey: .requiresApproval) ?? false
+    }
+}
+
 struct BoardTask: Codable, Hashable, Identifiable, Sendable {
     let id: UUID
     var projectID: String
@@ -226,6 +270,8 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
     var sourceKind: TaskSourceKind
     var sourceText: String
     var attachments: [TaskAttachment]
+    var selectedSkills: [TaskSkillSelection]
+    var selectedApps: [TaskAppSelection]
     var stage: TaskStage
     var autoRun: Bool
     var executionApproved: Bool
@@ -252,6 +298,8 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
     var runs: [TaskRun]
     var reviewFeedback: String?
     var workspace: TaskWorkspaceConfiguration
+    var dependencyIDs: [UUID]
+    var failureState: TaskFailureState?
 
     init(
         id: UUID = UUID(),
@@ -260,6 +308,8 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         sourceKind: TaskSourceKind,
         sourceText: String,
         attachments: [TaskAttachment] = [],
+        selectedSkills: [TaskSkillSelection] = [],
+        selectedApps: [TaskAppSelection] = [],
         stage: TaskStage = .inbox,
         autoRun: Bool,
         executionApproved: Bool = false,
@@ -282,7 +332,9 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         logs: [TaskLogEntry] = [],
         runs: [TaskRun] = [],
         reviewFeedback: String? = nil,
-        workspace: TaskWorkspaceConfiguration = .project
+        workspace: TaskWorkspaceConfiguration = .project,
+        dependencyIDs: [UUID] = [],
+        failureState: TaskFailureState? = nil
     ) {
         self.id = id
         self.projectID = projectID
@@ -290,6 +342,8 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         self.sourceKind = sourceKind
         self.sourceText = sourceText
         self.attachments = attachments
+        self.selectedSkills = selectedSkills
+        self.selectedApps = selectedApps
         self.stage = stage
         self.autoRun = autoRun
         self.executionApproved = executionApproved
@@ -314,14 +368,17 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         self.runs = runs
         self.reviewFeedback = reviewFeedback
         self.workspace = workspace
+        self.dependencyIDs = dependencyIDs
+        self.failureState = failureState
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, projectID, title, sourceKind, sourceText, attachments, stage, autoRun
+        case id, projectID, title, sourceKind, sourceText, attachments, selectedSkills, selectedApps
+        case stage, autoRun
         case executionApproved, createdAt, updatedAt, planText, hasFinalPlan, structuredPlan
         case resultText, liveMessage, threadID, sessionID, planningTurnID, executionTurnID
         case requestedModel, reasoningEffort, fastMode, actualModel, lastError, logs
-        case runs, reviewFeedback, workspace
+        case runs, reviewFeedback, workspace, dependencyIDs, failureState
     }
 
     private enum LegacyCodingKeys: String, CodingKey {
@@ -336,6 +393,8 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         sourceKind = try container.decode(TaskSourceKind.self, forKey: .sourceKind)
         sourceText = try container.decode(String.self, forKey: .sourceText)
         attachments = try container.decodeIfPresent([TaskAttachment].self, forKey: .attachments) ?? []
+        selectedSkills = try container.decodeIfPresent([TaskSkillSelection].self, forKey: .selectedSkills) ?? []
+        selectedApps = try container.decodeIfPresent([TaskAppSelection].self, forKey: .selectedApps) ?? []
         stage = try container.decode(TaskStage.self, forKey: .stage)
         autoRun = try container.decode(Bool.self, forKey: .autoRun)
         executionApproved = try container.decode(Bool.self, forKey: .executionApproved)
@@ -364,6 +423,8 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         runs = try container.decodeIfPresent([TaskRun].self, forKey: .runs) ?? []
         reviewFeedback = try container.decodeIfPresent(String.self, forKey: .reviewFeedback)
         workspace = try container.decodeIfPresent(TaskWorkspaceConfiguration.self, forKey: .workspace) ?? .project
+        dependencyIDs = try container.decodeIfPresent([UUID].self, forKey: .dependencyIDs) ?? []
+        failureState = try container.decodeIfPresent(TaskFailureState.self, forKey: .failureState)
     }
 }
 
@@ -385,8 +446,13 @@ struct BoardTaskCard: Hashable, Identifiable, Sendable {
     let canContinueExecution: Bool
     let executionAttemptCount: Int
     let hasDeliveryEvidence: Bool
+    let workspaceKind: TaskWorkspaceKind
+    let dependencyCount: Int
+    let blockingDependencyCount: Int
+    let failureKind: TaskFailureKind?
+    let circuitOpen: Bool
 
-    init(task: BoardTask) {
+    init(task: BoardTask, blockingDependencyCount: Int = 0) {
         id = task.id
         projectID = task.projectID
         title = task.title
@@ -402,7 +468,12 @@ struct BoardTaskCard: Hashable, Identifiable, Sendable {
             && task.hasFinalPlan
             && !task.planText.isEmpty
         executionAttemptCount = task.executionAttemptCount
-        hasDeliveryEvidence = task.latestDeliveryEvidence?.hasStructuredDetails == true
+        hasDeliveryEvidence = task.hasDeliverables
+        workspaceKind = task.workspace.kind
+        dependencyCount = task.dependencyIDs.count
+        self.blockingDependencyCount = blockingDependencyCount
+        failureKind = task.failureState?.kind
+        circuitOpen = task.failureState?.circuitOpen == true
     }
 }
 
@@ -436,11 +507,11 @@ struct ReasoningEffort: RawRepresentable, Codable, Hashable, Identifiable, Senda
 
     var title: String {
         switch rawValue {
-        case Self.low.rawValue: "低"
-        case Self.medium.rawValue: "中"
-        case Self.high.rawValue: "高"
-        case Self.xhigh.rawValue: "超高"
-        case Self.max.rawValue: "最大"
+        case Self.low.rawValue: L10n.text("effort.low", fallback: "Low")
+        case Self.medium.rawValue: L10n.text("effort.medium", fallback: "Medium")
+        case Self.high.rawValue: L10n.text("effort.high", fallback: "High")
+        case Self.xhigh.rawValue: L10n.text("effort.xhigh", fallback: "Extra High")
+        case Self.max.rawValue: L10n.text("effort.max", fallback: "Max")
         case Self.ultra.rawValue: "Ultra"
         default: rawValue
         }
@@ -455,12 +526,32 @@ struct BoardPreferences: Codable, Equatable, Sendable {
     // selected effort for both planning and execution.
     var executionEffort: ReasoningEffort = .high
     var maxConcurrentExecutions = 2
+    var maxAutomaticRetries = 2
     var allowNetworkAccess = true
     var showMissingProjects = false
+
+    private enum CodingKeys: String, CodingKey {
+        case defaultAutoRun, modelOverride, planningEffort, executionEffort
+        case maxConcurrentExecutions, maxAutomaticRetries, allowNetworkAccess, showMissingProjects
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        defaultAutoRun = try container.decodeIfPresent(Bool.self, forKey: .defaultAutoRun) ?? false
+        modelOverride = try container.decodeIfPresent(String.self, forKey: .modelOverride) ?? ""
+        planningEffort = try container.decodeIfPresent(ReasoningEffort.self, forKey: .planningEffort) ?? .medium
+        executionEffort = try container.decodeIfPresent(ReasoningEffort.self, forKey: .executionEffort) ?? .high
+        maxConcurrentExecutions = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentExecutions) ?? 2
+        maxAutomaticRetries = try container.decodeIfPresent(Int.self, forKey: .maxAutomaticRetries) ?? 2
+        allowNetworkAccess = try container.decodeIfPresent(Bool.self, forKey: .allowNetworkAccess) ?? true
+        showMissingProjects = try container.decodeIfPresent(Bool.self, forKey: .showMissingProjects) ?? false
+    }
 }
 
 struct BoardSnapshot: Codable, Sendable {
-    static let currentVersion = 4
+    static let currentVersion = 7
 
     var version: Int
     var tasks: [BoardTask]

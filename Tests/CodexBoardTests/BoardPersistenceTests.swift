@@ -30,6 +30,19 @@ final class BoardPersistenceTests: XCTestCase {
                 byteCount: 128,
                 isManaged: true
             )],
+            selectedSkills: [TaskSkillSelection(
+                name: "test-skill",
+                description: "Test workflow",
+                path: "/tmp/project/.agents/skills/test-skill/SKILL.md",
+                scope: "repo"
+            )],
+            selectedApps: [TaskAppSelection(
+                id: "connector_readonly",
+                name: "Read-only Connector",
+                invocationName: "readonly",
+                description: "Reads external context",
+                requiresApproval: true
+            )],
             stage: .awaitingApproval,
             autoRun: true,
             createdAt: Date(timeIntervalSinceReferenceDate: 123_456),
@@ -72,9 +85,17 @@ final class BoardPersistenceTests: XCTestCase {
                 evidence: TaskDeliveryEvidence(
                     summary: "Implemented persistence",
                     changedFiles: ["Sources/Persistence.swift"],
+                    artifacts: [TaskDeliveryArtifact(
+                        title: "Migration report",
+                        path: "reports/migration.pdf",
+                        kind: "document"
+                    )],
                     verificationCommands: ["swift test"],
                     testSummary: "All tests passed",
                     residualRisks: ["Manual UI review pending"]
+                ),
+                codeDelivery: TaskCodeDelivery(
+                    unifiedDiff: "diff --git a/a.swift b/a.swift\n-old\n+new"
                 )
             )],
             reviewFeedback: "Add one migration test",
@@ -104,9 +125,57 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertEqual(actual.tasks.first?.reasoningEffort, .max)
         XCTAssertEqual(actual.tasks.first?.fastMode, true)
         XCTAssertEqual(actual.tasks.first?.actualModel, "gpt-actual")
+        XCTAssertEqual(actual.tasks.first?.selectedSkills, task.selectedSkills)
+        XCTAssertEqual(actual.tasks.first?.selectedApps, task.selectedApps)
+        XCTAssertEqual(actual.tasks.first?.selectedApps.first?.requiresApproval, true)
         XCTAssertEqual(actual.tasks.first?.runs, task.runs)
         XCTAssertEqual(actual.tasks.first?.reviewFeedback, "Add one migration test")
         XCTAssertEqual(actual.tasks.first?.workspace, task.workspace)
+    }
+
+    func testLegacyTaskAppSelectionDefaultsRequiresApprovalToFalse() throws {
+        let data = Data("""
+        {
+          "id": "connector_legacy",
+          "name": "Legacy Connector",
+          "invocationName": "legacy",
+          "description": "Saved before approval semantics"
+        }
+        """.utf8)
+
+        let selection = try JSONDecoder().decode(TaskAppSelection.self, from: data)
+
+        XCTAssertFalse(selection.requiresApproval)
+    }
+
+    func testLegacyTaskRunWithoutCodeDeliveryDecodesAsNil() throws {
+        let data = Data("""
+        {
+          "id": "14455CE6-3C0A-47BB-A2A7-B5A7D71853C9",
+          "phase": "execution",
+          "attempt": 1,
+          "startedAt": 0,
+          "outcome": "completed",
+          "reasoningEffort": "high",
+          "fastMode": false,
+          "summary": "Legacy run"
+        }
+        """.utf8)
+
+        let run = try JSONDecoder().decode(TaskRun.self, from: data)
+
+        XCTAssertNil(run.codeDelivery)
+        XCTAssertNil(run.evidence)
+    }
+
+    func testCodeDeliveryDefaultsMissingTruncationFlag() throws {
+        let delivery = try JSONDecoder().decode(
+            TaskCodeDelivery.self,
+            from: Data("{\"unifiedDiff\":\"patch\"}".utf8)
+        )
+
+        XCTAssertEqual(delivery.unifiedDiff, "patch")
+        XCTAssertFalse(delivery.isTruncated)
     }
 
     func testSaveUsesPrivateDirectoryAndFilePermissions() async throws {
@@ -172,6 +241,8 @@ final class BoardPersistenceTests: XCTestCase {
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         var tasks = try XCTUnwrap(object["tasks"] as? [[String: Any]])
         tasks[0].removeValue(forKey: "attachments")
+        tasks[0].removeValue(forKey: "selectedSkills")
+        tasks[0].removeValue(forKey: "selectedApps")
         tasks[0].removeValue(forKey: "requestedModel")
         tasks[0].removeValue(forKey: "reasoningEffort")
         tasks[0].removeValue(forKey: "fastMode")
@@ -192,6 +263,8 @@ final class BoardPersistenceTests: XCTestCase {
 
         XCTAssertEqual(loaded.version, 1)
         XCTAssertEqual(loaded.tasks.first?.attachments, [])
+        XCTAssertEqual(loaded.tasks.first?.selectedSkills, [])
+        XCTAssertEqual(loaded.tasks.first?.selectedApps, [])
         XCTAssertEqual(loaded.tasks.first?.requestedModel, "gpt-legacy")
         XCTAssertEqual(loaded.tasks.first?.reasoningEffort, .medium)
         XCTAssertEqual(loaded.tasks.first?.fastMode, false)
