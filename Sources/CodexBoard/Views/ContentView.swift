@@ -1,8 +1,8 @@
 import SwiftUI
 
 struct ContentView: View {
-    @ObservedObject var store: BoardStore
-    @State private var showingComposer = false
+    let store: BoardStore
+    @Bindable var mainWindowState: MainWindowState
     @State private var showingInspector = true
 
     var body: some View {
@@ -10,7 +10,7 @@ struct ContentView: View {
             ProjectSidebar(store: store)
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
         } detail: {
-            BoardView(store: store, showingComposer: $showingComposer)
+            BoardView(store: store, showingComposer: $mainWindowState.isComposerPresented)
                 .inspector(isPresented: $showingInspector) {
                     TaskInspector(store: store)
                         .inspectorColumnWidth(min: 300, ideal: 360, max: 480)
@@ -18,7 +18,7 @@ struct ContentView: View {
                 .toolbar {
                     ToolbarItemGroup(placement: .primaryAction) {
                         Button {
-                            showingComposer = true
+                            mainWindowState.requestComposer()
                         } label: {
                             Label("新建任务", systemImage: "plus")
                         }
@@ -39,12 +39,8 @@ struct ContentView: View {
                 }
         }
         .navigationTitle(store.selectedProject?.name ?? "CodexBoard")
-        .background(MainWindowMarker())
-        .sheet(isPresented: $showingComposer) {
-            TaskComposer(store: store, isPresented: $showingComposer)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .codexBoardNewTask)) { _ in
-            showingComposer = true
+        .sheet(isPresented: $mainWindowState.isComposerPresented) {
+            TaskComposer(store: store, isPresented: $mainWindowState.isComposerPresented)
         }
     }
 }

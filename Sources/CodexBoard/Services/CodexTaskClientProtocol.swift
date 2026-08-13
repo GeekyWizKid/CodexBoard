@@ -7,23 +7,26 @@ protocol CodexTaskClient: AnyObject {
 
     func connect() async throws
     func verifyAccount() async throws -> Bool
+    func listModels() async throws -> [CodexModel]
     func listThreads(cursor: String?, archived: Bool) async throws -> CodexThreadPage
-    func startThread(cwd: String, model: String?) async throws -> CodexStartedThread
+    func startThread(cwd: String, model: String?, serviceTier: String) async throws -> CodexStartedThread
     func resumeThread(threadID: String, cwd: String) async throws -> CodexStartedThread
     func setThreadName(threadID: String, name: String) async throws
     func startPlanningTurn(
         threadID: String,
         cwd: String,
-        prompt: String,
+        input: [CodexTurnInput],
         model: String,
-        effort: ReasoningEffort
+        effort: ReasoningEffort,
+        serviceTier: String
     ) async throws -> CodexStartedTurn
     func startExecutionTurn(
         threadID: String,
         cwd: String,
-        prompt: String,
+        input: [CodexTurnInput],
         model: String,
         effort: ReasoningEffort,
+        serviceTier: String,
         allowNetwork: Bool
     ) async throws -> CodexStartedTurn
     func interrupt(threadID: String, turnID: String) async throws

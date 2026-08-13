@@ -22,6 +22,14 @@ final class BoardPersistenceTests: XCTestCase {
             title: "持久化测试",
             sourceKind: .developmentPlan,
             sourceText: "保存并重新加载",
+            attachments: [TaskAttachment(
+                id: UUID(uuidString: "CE85D72C-5346-48C8-BEED-99586AD6DE53")!,
+                kind: .image,
+                displayName: "screen.png",
+                path: "/tmp/screen.png",
+                byteCount: 128,
+                isManaged: true
+            )],
             stage: .awaitingApproval,
             autoRun: true,
             createdAt: Date(timeIntervalSinceReferenceDate: 123_456),
@@ -34,7 +42,10 @@ final class BoardPersistenceTests: XCTestCase {
             sessionID: "session-1",
             planningTurnID: "planning-turn",
             executionTurnID: "execution-turn",
-            model: "gpt-test",
+            requestedModel: "gpt-selected",
+            reasoningEffort: .max,
+            fastMode: true,
+            actualModel: "gpt-actual",
             lastError: nil,
             logs: [
                 TaskLogEntry(
@@ -43,12 +54,41 @@ final class BoardPersistenceTests: XCTestCase {
                     level: .success,
                     message: "已保存"
                 )
-            ]
+            ],
+            runs: [TaskRun(
+                id: UUID(uuidString: "14455CE6-3C0A-47BB-A2A7-B5A7D71853C9")!,
+                phase: .execution,
+                attempt: 1,
+                startedAt: Date(timeIntervalSinceReferenceDate: 123_700),
+                endedAt: Date(timeIntervalSinceReferenceDate: 123_780),
+                outcome: .awaitingReview,
+                threadID: "thread-1",
+                sessionID: "session-1",
+                turnID: "execution-turn",
+                model: "gpt-actual",
+                reasoningEffort: .max,
+                fastMode: true,
+                summary: "Implemented persistence",
+                evidence: TaskDeliveryEvidence(
+                    summary: "Implemented persistence",
+                    changedFiles: ["Sources/Persistence.swift"],
+                    verificationCommands: ["swift test"],
+                    testSummary: "All tests passed",
+                    residualRisks: ["Manual UI review pending"]
+                )
+            )],
+            reviewFeedback: "Add one migration test",
+            workspace: TaskWorkspaceConfiguration(
+                kind: .worktree,
+                path: "/tmp/worktree",
+                branch: "codex/persistence",
+                baseBranch: "main"
+            )
         )
         let expected = BoardSnapshot(
             version: 7,
             tasks: [task],
-            manualProjectPaths: ["/tmp/示例项目"],
+            manualProjectPaths: ["/tmp/最新项目", "/tmp/示例项目"],
             preferences: preferences
         )
 
@@ -60,6 +100,13 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertEqual(actual.tasks, expected.tasks)
         XCTAssertEqual(actual.manualProjectPaths, expected.manualProjectPaths)
         XCTAssertEqual(actual.preferences, expected.preferences)
+        XCTAssertEqual(actual.tasks.first?.requestedModel, "gpt-selected")
+        XCTAssertEqual(actual.tasks.first?.reasoningEffort, .max)
+        XCTAssertEqual(actual.tasks.first?.fastMode, true)
+        XCTAssertEqual(actual.tasks.first?.actualModel, "gpt-actual")
+        XCTAssertEqual(actual.tasks.first?.runs, task.runs)
+        XCTAssertEqual(actual.tasks.first?.reviewFeedback, "Add one migration test")
+        XCTAssertEqual(actual.tasks.first?.workspace, task.workspace)
     }
 
     func testSaveUsesPrivateDirectoryAndFilePermissions() async throws {
@@ -103,6 +150,100 @@ final class BoardPersistenceTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("未覆盖"))
         }
         XCTAssertEqual(try Data(contentsOf: fixture.fileURL), corruptData)
+    }
+
+    func testLegacyTaskDefaultsNewConfigurationAndMapsOldModel() async throws {
+        let fixture = try TemporaryBoardFixture()
+        defer { fixture.remove() }
+        let task = BoardTask(
+            projectID: "/tmp/project",
+            title: "Legacy task",
+            sourceKind: .issue,
+            sourceText: "Old board data",
+            autoRun: false
+        )
+        let snapshot = BoardSnapshot(
+            version: 1,
+            tasks: [task],
+            manualProjectPaths: [],
+            preferences: BoardPreferences()
+        )
+        let encoded = try JSONEncoder().encode(snapshot)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var tasks = try XCTUnwrap(object["tasks"] as? [[String: Any]])
+        tasks[0].removeValue(forKey: "attachments")
+        tasks[0].removeValue(forKey: "requestedModel")
+        tasks[0].removeValue(forKey: "reasoningEffort")
+        tasks[0].removeValue(forKey: "fastMode")
+        tasks[0].removeValue(forKey: "actualModel")
+        tasks[0].removeValue(forKey: "runs")
+        tasks[0].removeValue(forKey: "reviewFeedback")
+        tasks[0].removeValue(forKey: "workspace")
+        tasks[0]["model"] = "gpt-legacy"
+        object["tasks"] = tasks
+        try FileManager.default.createDirectory(
+            at: fixture.storageDirectory,
+            withIntermediateDirectories: true
+        )
+        try JSONSerialization.data(withJSONObject: object).write(to: fixture.fileURL)
+
+        let persistence = BoardPersistence(fileURL: fixture.fileURL)
+        var loaded = try await persistence.load()
+
+        XCTAssertEqual(loaded.version, 1)
+        XCTAssertEqual(loaded.tasks.first?.attachments, [])
+        XCTAssertEqual(loaded.tasks.first?.requestedModel, "gpt-legacy")
+        XCTAssertEqual(loaded.tasks.first?.reasoningEffort, .medium)
+        XCTAssertEqual(loaded.tasks.first?.fastMode, false)
+        XCTAssertEqual(loaded.tasks.first?.actualModel, "gpt-legacy")
+        XCTAssertEqual(loaded.tasks.first?.runs, [])
+        XCTAssertNil(loaded.tasks.first?.reviewFeedback)
+        XCTAssertEqual(loaded.tasks.first?.workspace, .project)
+        loaded.version = BoardSnapshot.currentVersion
+        try await persistence.save(loaded)
+        let reloaded = try await persistence.load()
+        XCTAssertEqual(reloaded.version, BoardSnapshot.currentVersion)
+    }
+
+    func testLegacyApprovedTaskPreservesExecutionEffort() async throws {
+        let fixture = try TemporaryBoardFixture()
+        defer { fixture.remove() }
+
+        var preferences = BoardPreferences()
+        preferences.planningEffort = .low
+        preferences.executionEffort = .xhigh
+        let task = BoardTask(
+            projectID: "/tmp/project",
+            title: "Legacy approved task",
+            sourceKind: .developmentPlan,
+            sourceText: "Execute the existing plan",
+            stage: .awaitingApproval,
+            autoRun: false,
+            planText: "1. Execute",
+            hasFinalPlan: true
+        )
+        let snapshot = BoardSnapshot(
+            version: 2,
+            tasks: [task],
+            manualProjectPaths: [],
+            preferences: preferences
+        )
+        let encoded = try JSONEncoder().encode(snapshot)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var tasks = try XCTUnwrap(object["tasks"] as? [[String: Any]])
+        tasks[0].removeValue(forKey: "reasoningEffort")
+        tasks[0].removeValue(forKey: "fastMode")
+        object["tasks"] = tasks
+        try FileManager.default.createDirectory(
+            at: fixture.storageDirectory,
+            withIntermediateDirectories: true
+        )
+        try JSONSerialization.data(withJSONObject: object).write(to: fixture.fileURL)
+
+        let loaded = try await BoardPersistence(fileURL: fixture.fileURL).load()
+
+        XCTAssertEqual(loaded.tasks.first?.reasoningEffort, .xhigh)
+        XCTAssertEqual(loaded.tasks.first?.fastMode, false)
     }
 
     private func permissions(at url: URL) throws -> Int {

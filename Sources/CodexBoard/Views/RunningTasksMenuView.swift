@@ -2,15 +2,19 @@ import AppKit
 import SwiftUI
 
 struct RunningTasksMenuView: View {
-    @ObservedObject var store: BoardStore
+    let store: BoardStore
+    let mainWindowState: MainWindowState
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        let runningTasks = store.runningTasks
+        let projectNames = Dictionary(uniqueKeysWithValues: store.projects.map { ($0.id, $0.name) })
+
         VStack(spacing: 0) {
-            header
+            header(runningTaskCount: runningTasks.count)
             Divider()
 
-            if store.runningTasks.isEmpty {
+            if runningTasks.isEmpty {
                 ContentUnavailableView(
                     "暂无进行中的任务",
                     systemImage: "checkmark.circle",
@@ -20,10 +24,11 @@ struct RunningTasksMenuView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 8) {
-                        ForEach(store.runningTasks) { task in
+                        ForEach(runningTasks) { task in
                             RunningTaskRow(
                                 task: task,
-                                projectName: store.projectName(for: task),
+                                projectName: projectNames[task.projectID]
+                                    ?? URL(fileURLWithPath: task.projectID).lastPathComponent,
                                 openTask: { showBoard(taskID: task.id) },
                                 stopTask: {
                                     Task { await store.cancel(taskID: task.id) }
@@ -43,19 +48,19 @@ struct RunningTasksMenuView: View {
         .task { store.start() }
     }
 
-    private var header: some View {
+    private func header(runningTaskCount: Int) -> some View {
         HStack(spacing: 9) {
-            Image(systemName: store.runningTasks.isEmpty
+            Image(systemName: runningTaskCount == 0
                   ? "rectangle.3.group"
                   : "bolt.circle.fill")
                 .font(.title3)
-                .foregroundStyle(store.runningTasks.isEmpty ? Color.secondary : BoardTheme.executing)
+                .foregroundStyle(runningTaskCount == 0 ? Color.secondary : BoardTheme.executing)
             VStack(alignment: .leading, spacing: 1) {
                 Text("CodexBoard")
                     .font(.headline)
-                Text(store.runningTasks.isEmpty
+                Text(runningTaskCount == 0
                      ? "所有任务均处于空闲状态"
-                     : "\(store.runningTaskCount) 个任务进行中")
+                     : "\(runningTaskCount) 个任务进行中")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -99,27 +104,14 @@ struct RunningTasksMenuView: View {
 
     private func showBoard(taskID: UUID? = nil, createTask: Bool = false) {
         if let taskID { store.focusTask(taskID) }
-
-        if MainWindowBridge.revealExistingWindow() {
-            if createTask {
-                NotificationCenter.default.post(name: .codexBoardNewTask, object: nil)
-            }
-            return
-        }
-
+        if createTask { mainWindowState.requestComposer() }
         openWindow(id: "main")
         NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.async {
-            _ = MainWindowBridge.revealExistingWindow()
-            if createTask {
-                NotificationCenter.default.post(name: .codexBoardNewTask, object: nil)
-            }
-        }
     }
 }
 
 private struct RunningTaskRow: View {
-    let task: BoardTask
+    let task: BoardTaskCard
     let projectName: String
     let openTask: () -> Void
     let stopTask: () -> Void

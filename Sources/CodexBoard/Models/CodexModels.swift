@@ -139,6 +139,37 @@ struct CodexThreadPage: Equatable, Sendable {
     let nextCursor: String?
 }
 
+struct CodexReasoningEffortOption: Equatable, Sendable {
+    let effort: ReasoningEffort
+    let description: String
+}
+
+enum CodexServiceTier {
+    static let standard = "default"
+    static let fast = "priority"
+}
+
+struct CodexModelServiceTier: Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+    let description: String
+}
+
+struct CodexModel: Identifiable, Equatable, Sendable {
+    let id: String
+    let model: String
+    let displayName: String
+    let description: String
+    let isDefault: Bool
+    let defaultReasoningEffort: ReasoningEffort
+    let supportedReasoningEfforts: [CodexReasoningEffortOption]
+    let serviceTiers: [CodexModelServiceTier]
+
+    var supportsFast: Bool {
+        serviceTiers.contains { $0.id == CodexServiceTier.fast }
+    }
+}
+
 struct CodexStartedThread: Equatable, Sendable {
     let threadID: String
     let sessionID: String
@@ -151,6 +182,26 @@ struct CodexStartedTurn: Equatable, Sendable {
     let status: String
 }
 
+enum CodexTurnInput: Equatable, Sendable {
+    case text(String)
+    case localImage(path: String)
+
+    var wireValue: JSONValue {
+        switch self {
+        case let .text(text):
+            .object([
+                "type": .string("text"),
+                "text": .string(text)
+            ])
+        case let .localImage(path):
+            .object([
+                "type": .string("localImage"),
+                "path": .string(path)
+            ])
+        }
+    }
+}
+
 enum CodexEvent: Sendable {
     case agentDelta(threadID: String, turnID: String, delta: String)
     case agentFinal(threadID: String, turnID: String, text: String)
@@ -158,6 +209,7 @@ enum CodexEvent: Sendable {
     case planUpdated(threadID: String, turnID: String, explanation: String?, steps: [CodexPlanStep])
     case turnCompleted(threadID: String, turnID: String, status: String, error: String?)
     case activity(threadID: String, turnID: String, message: String)
+    case configurationWarning(threadID: String?, turnID: String?, message: String)
     case warning(threadID: String?, turnID: String?, message: String)
     case threadStatus(threadID: String, status: String)
     case connectionLost(message: String)

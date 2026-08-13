@@ -2,24 +2,39 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct BoardView: View {
-    @ObservedObject var store: BoardStore
+    let store: BoardStore
     @Binding var showingComposer: Bool
 
     private let columns: [TaskStage] = [
-        .inbox, .planning, .awaitingApproval, .executing, .completed, .needsAttention
+        .inbox, .planning, .awaitingApproval, .executing, .review, .completed, .needsAttention
     ]
 
     var body: some View {
+        let selectedProject = store.selectedProject
+        let tasksByStage = groupedTasks
+
         VStack(spacing: 0) {
-            boardHeader
+            boardHeader(project: selectedProject)
             Divider()
-            if store.selectedProject == nil {
+            if selectedProject == nil {
                 emptyProjectState
             } else {
                 ScrollView(.horizontal) {
                     HStack(alignment: .top, spacing: 14) {
                         ForEach(columns) { stage in
-                            BoardColumn(store: store, stage: stage)
+                            BoardColumn(
+                                stage: stage,
+                                tasks: tasksByStage[stage, default: []],
+                                selectTask: { store.selectedTaskID = $0 },
+                                moveTask: { store.moveTask(taskID: $0, to: $1) },
+                                confirmPlan: { store.confirmPlan(taskID: $0) },
+                                cancelTask: { taskID in
+                                    Task { await store.cancel(taskID: taskID) }
+                                },
+                                continueExecution: { store.continueExecution(taskID: $0) },
+                                acceptReview: { store.acceptReview(taskID: $0) },
+                                deleteTask: { store.deleteTask(taskID: $0) }
+                            )
                                 .frame(width: 274)
                         }
                     }
@@ -31,12 +46,20 @@ struct BoardView: View {
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    private var boardHeader: some View {
+    private var groupedTasks: [TaskStage: [BoardTaskCard]] {
+        var result = Dictionary(uniqueKeysWithValues: columns.map { ($0, [BoardTaskCard]()) })
+        for task in store.filteredTaskCards.sorted(by: { $0.updatedAt > $1.updatedAt }) {
+            result[task.stage, default: []].append(task)
+        }
+        return result
+    }
+
+    private func boardHeader(project: ProjectRecord?) -> some View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(store.selectedProject?.name ?? "项目看板")
+                Text(project?.name ?? "项目看板")
                     .font(.title2.weight(.semibold))
-                if let project = store.selectedProject {
+                if let project {
                     Text(BoardFormatters.displayPath(project.path))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -80,11 +103,16 @@ struct BoardView: View {
 }
 
 private struct BoardColumn: View {
-    @ObservedObject var store: BoardStore
     let stage: TaskStage
+    let tasks: [BoardTaskCard]
+    let selectTask: (UUID) -> Void
+    let moveTask: (UUID, TaskStage) -> Bool
+    let confirmPlan: (UUID) -> Void
+    let cancelTask: (UUID) -> Void
+    let continueExecution: (UUID) -> Void
+    let acceptReview: (UUID) -> Void
+    let deleteTask: (UUID) -> Void
     @State private var isTargeted = false
-
-    private var tasks: [BoardTask] { store.tasks(in: stage) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -105,7 +133,15 @@ private struct BoardColumn: View {
             ScrollView {
                 LazyVStack(spacing: 10) {
                     ForEach(tasks) { task in
-                        TaskCard(store: store, task: task)
+                        TaskCard(
+                            task: task,
+                            selectTask: { selectTask(task.id) },
+                            confirmPlan: { confirmPlan(task.id) },
+                            cancelTask: { cancelTask(task.id) },
+                            continueExecution: { continueExecution(task.id) },
+                            acceptReview: { acceptReview(task.id) },
+                            deleteTask: { deleteTask(task.id) }
+                        )
                             .draggable(task.id.uuidString)
                     }
                 }
@@ -124,19 +160,22 @@ private struct BoardColumn: View {
                   let raw = values.first,
                   let id = UUID(uuidString: raw)
             else { return false }
-            return store.moveTask(taskID: id, to: stage)
+            return moveTask(id, stage)
         } isTargeted: { isTargeted = $0 }
     }
 }
 
 private struct TaskCard: View {
-    @ObservedObject var store: BoardStore
-    let task: BoardTask
+    let task: BoardTaskCard
+    let selectTask: () -> Void
+    let confirmPlan: () -> Void
+    let cancelTask: () -> Void
+    let continueExecution: () -> Void
+    let acceptReview: () -> Void
+    let deleteTask: () -> Void
 
     var body: some View {
-        Button {
-            store.selectedTaskID = task.id
-        } label: {
+        Button(action: selectTask) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 7) {
                     Image(systemName: task.sourceKind.symbol)
@@ -159,6 +198,25 @@ private struct TaskCard: View {
                     .multilineTextAlignment(.leading)
                     .lineLimit(3)
 
+                if task.attachmentCount > 0 {
+                    Label("\(task.attachmentCount) 个附件", systemImage: "paperclip")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if task.executionAttemptCount > 0 || task.hasDeliveryEvidence {
+                    HStack(spacing: 10) {
+                        if task.executionAttemptCount > 0 {
+                            Label("执行 #\(task.executionAttemptCount)", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        if task.hasDeliveryEvidence {
+                            Label("交付证据", systemImage: "checkmark.seal")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
                 if !task.liveMessage.isEmpty {
                     Text(task.liveMessage)
                         .font(.caption)
@@ -171,10 +229,6 @@ private struct TaskCard: View {
                     ProgressView()
                         .progressViewStyle(.linear)
                         .tint(BoardTheme.color(for: task.stage))
-                } else if !task.structuredPlan.isEmpty && task.stage == .executing {
-                    let completed = task.structuredPlan.count(where: { $0.status == .completed })
-                    ProgressView(value: Double(completed), total: Double(task.structuredPlan.count))
-                        .tint(BoardTheme.executing)
                 }
 
                 HStack {
@@ -206,18 +260,19 @@ private struct TaskCard: View {
         }
         .buttonStyle(.plain)
         .contextMenu {
-            if task.stage == .awaitingApproval {
-                Button("确认并执行") { store.confirmPlan(taskID: task.id) }
+            if task.stage == .awaitingApproval, !task.executionApproved {
+                Button("确认并执行", action: confirmPlan)
+            }
+            if task.stage == .review {
+                Button("验收完成", action: acceptReview)
             }
             if task.stage.isActive {
-                Button("停止", role: .destructive) {
-                    Task { await store.cancel(taskID: task.id) }
-                }
+                Button("停止", role: .destructive, action: cancelTask)
             }
-            if task.stage == .needsAttention, task.hasFinalPlan, !task.planText.isEmpty {
-                Button("从当前状态继续") { store.continueExecution(taskID: task.id) }
+            if task.canContinueExecution {
+                Button("从当前状态继续", action: continueExecution)
             }
-            Button("删除卡片", role: .destructive) { store.deleteTask(taskID: task.id) }
+            Button("删除卡片", role: .destructive, action: deleteTask)
                 .disabled(task.stage.isActive)
         }
     }

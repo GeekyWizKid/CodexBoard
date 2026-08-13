@@ -43,6 +43,7 @@ struct ProjectDiscoveryService: Sendable {
         var isGitRepository = false
         var existsOnDisk = false
         var isManual = false
+        var manualPriority: Int?
 
         mutating func add(thread: CodexThreadSummary, probe: PathProbe) {
             threadCount += 1
@@ -62,8 +63,9 @@ struct ProjectDiscoveryService: Sendable {
             mergeMetadata(from: probe)
         }
 
-        mutating func addManualPath(probe: PathProbe) {
+        mutating func addManualPath(probe: PathProbe, priority: Int) {
             isManual = true
+            manualPriority = min(manualPriority ?? priority, priority)
             mergeMetadata(from: probe)
         }
 
@@ -94,7 +96,8 @@ struct ProjectDiscoveryService: Sendable {
                 activeThreadCount: activeThreadCount,
                 isGitRepository: isGitRepository,
                 existsOnDisk: existsOnDisk,
-                isManual: isManual
+                isManual: isManual,
+                manualPriority: manualPriority
             )
         }
     }
@@ -136,11 +139,11 @@ struct ProjectDiscoveryService: Sendable {
             projects[probe.projectPath] = accumulator
         }
 
-        for inputPath in normalizedManualInputs {
+        for (priority, inputPath) in normalizedManualInputs.enumerated() {
             guard let probe = probes[inputPath] else { continue }
             var accumulator = projects[probe.projectPath]
                 ?? ProjectAccumulator(path: probe.projectPath)
-            accumulator.addManualPath(probe: probe)
+            accumulator.addManualPath(probe: probe, priority: priority)
             projects[probe.projectPath] = accumulator
         }
 
@@ -316,6 +319,16 @@ struct ProjectDiscoveryService: Sendable {
     }
 
     private static func projectSortOrder(_ lhs: ProjectRecord, _ rhs: ProjectRecord) -> Bool {
+        switch (lhs.manualPriority, rhs.manualPriority) {
+        case let (lhsPriority?, rhsPriority?) where lhsPriority != rhsPriority:
+            return lhsPriority < rhsPriority
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            break
+        }
         switch (lhs.latestActivityAt, rhs.latestActivityAt) {
         case let (lhsDate?, rhsDate?) where lhsDate != rhsDate:
             return lhsDate > rhsDate

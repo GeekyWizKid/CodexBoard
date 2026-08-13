@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct SettingsView: View {
-    @ObservedObject var store: BoardStore
+    let store: BoardStore
 
     var body: some View {
         TabView {
@@ -19,14 +19,9 @@ struct SettingsView: View {
             .tabItem { Label("通用", systemImage: "gearshape") }
 
             Form {
-                TextField("模型覆盖（留空使用本机默认）", text: binding(\.modelOverride))
-                Picker("规划推理强度", selection: binding(\.planningEffort)) {
-                    ForEach(ReasoningEffort.allCases) { effort in
-                        Text(effort.title).tag(effort)
-                    }
-                }
-                Picker("执行推理强度", selection: binding(\.executionEffort)) {
-                    ForEach(ReasoningEffort.allCases) { effort in
+                TextField("新任务默认模型（留空使用本机默认）", text: binding(\.modelOverride))
+                Picker("新任务默认推理强度", selection: binding(\.planningEffort)) {
+                    ForEach(ReasoningEffort.standardCases) { effort in
                         Text(effort.title).tag(effort)
                     }
                 }

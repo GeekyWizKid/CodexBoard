@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct ProjectSidebar: View {
-    @ObservedObject var store: BoardStore
+    @Bindable var store: BoardStore
     @State private var searchText = ""
 
     private var filteredProjects: [ProjectRecord] {

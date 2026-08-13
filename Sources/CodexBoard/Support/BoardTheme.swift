@@ -5,6 +5,7 @@ enum BoardTheme {
     static let planning = Color(red: 0.52, green: 0.37, blue: 0.95)
     static let approval = Color(red: 0.93, green: 0.58, blue: 0.16)
     static let executing = Color(red: 0.10, green: 0.63, blue: 0.71)
+    static let review = Color(red: 0.22, green: 0.48, blue: 0.91)
     static let completed = Color(red: 0.18, green: 0.68, blue: 0.43)
     static let danger = Color(red: 0.88, green: 0.28, blue: 0.32)
 
@@ -14,8 +15,19 @@ enum BoardTheme {
         case .planning: planning
         case .awaitingApproval: approval
         case .executing: executing
+        case .review: review
         case .completed: completed
         case .needsAttention: danger
+        }
+    }
+
+    static func color(for outcome: TaskRunOutcome) -> Color {
+        switch outcome {
+        case .running: executing
+        case .completed, .accepted: completed
+        case .awaitingReview: review
+        case .changesRequested: approval
+        case .failed, .interrupted: danger
         }
     }
 }

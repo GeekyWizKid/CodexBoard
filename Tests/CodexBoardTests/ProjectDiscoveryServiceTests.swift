@@ -97,9 +97,9 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
         XCTAssertEqual(
             projects.map(\.path),
             [
+                ordinaryDirectory.resolvingSymlinksInPath().path,
                 recentDirectory.resolvingSymlinksInPath().path,
-                missingDirectory.standardizedFileURL.path,
-                ordinaryDirectory.resolvingSymlinksInPath().path
+                missingDirectory.standardizedFileURL.path
             ]
         )
 
@@ -216,6 +216,38 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
         XCTAssertEqual(project.path, repository.path)
         XCTAssertTrue(project.existsOnDisk)
         XCTAssertFalse(project.isGitRepository)
+    }
+
+    func testManualProjectsLeadInSuppliedOrderAndKeepGitRootPriority() async throws {
+        let temporaryDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let automatic = temporaryDirectory.appendingPathComponent("Automatic", isDirectory: true)
+        let first = temporaryDirectory.appendingPathComponent("First", isDirectory: true)
+        let repository = temporaryDirectory.appendingPathComponent("Repository", isDirectory: true)
+        let repositoryChild = repository.appendingPathComponent("Sources", isDirectory: true)
+        for directory in [automatic, first, repositoryChild] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        try runGit(["init", "--quiet"], in: repository)
+
+        let projects = await ProjectDiscoveryService().discover(
+            threads: [
+                makeThread(
+                    id: "recent",
+                    cwd: automatic.path,
+                    updatedAt: Date(timeIntervalSince1970: 1_000),
+                    status: "active"
+                )
+            ],
+            manualPaths: [repositoryChild.path, first.path]
+        )
+
+        XCTAssertEqual(
+            projects.map(\.path),
+            [repository.resolvingSymlinksInPath().path, first.path, automatic.path]
+        )
+        XCTAssertEqual(projects.map(\.manualPriority), [0, 1, nil])
     }
 
     private func makeTemporaryDirectory() throws -> URL {

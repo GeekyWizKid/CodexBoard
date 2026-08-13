@@ -27,7 +27,12 @@ enum BoardPersistenceError: LocalizedError, Sendable {
     }
 }
 
-actor BoardPersistence {
+protocol BoardPersisting: Sendable {
+    func load() async throws -> BoardSnapshot
+    func save(_ snapshot: BoardSnapshot) async throws
+}
+
+actor BoardPersistence: BoardPersisting {
     private let fileURL: URL
     private let fileManager: FileManager
 

@@ -95,6 +95,32 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         return true
     }
 
+    func listModels() async throws -> [CodexModel] {
+        try await ensureConnected()
+        var models: [CodexModel] = []
+        var cursor: String?
+        var seenCursors: Set<String> = []
+
+        repeat {
+            var params: [String: JSONValue] = [
+                "limit": .integer(100),
+                "includeHidden": .bool(false)
+            ]
+            if let cursor { params["cursor"] = .string(cursor) }
+            let value = try await request(method: "model/list", params: .object(params))
+            guard let data = value["data"]?.arrayValue else {
+                throw CodexClientError.invalidResponse("model/list 缺少 data")
+            }
+            models.append(contentsOf: data.compactMap(Self.parseModel))
+            cursor = value["nextCursor"]?.stringValue
+            if let cursor, !seenCursors.insert(cursor).inserted {
+                throw CodexClientError.invalidResponse("model/list 返回了重复 cursor")
+            }
+        } while cursor != nil
+
+        return models
+    }
+
     func listThreads(cursor: String?, archived: Bool) async throws -> CodexThreadPage {
         try await ensureConnected()
         var params: [String: JSONValue] = [
@@ -117,19 +143,10 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         return CodexThreadPage(threads: threads, nextCursor: nextCursor)
     }
 
-    func startThread(cwd: String, model: String?) async throws -> CodexStartedThread {
+    func startThread(cwd: String, model: String?, serviceTier: String) async throws -> CodexStartedThread {
         try await ensureConnected()
-        var params: [String: JSONValue] = [
-            "cwd": .string(cwd),
-            "approvalPolicy": .string("never"),
-            "sandbox": .string("read-only"),
-            "personality": .string("pragmatic"),
-            "serviceName": .string("codex_board"),
-            "ephemeral": .bool(false),
-            "runtimeWorkspaceRoots": .array([.string(cwd)])
-        ]
-        if let model, !model.isEmpty { params["model"] = .string(model) }
-        let value = try await request(method: "thread/start", params: .object(params))
+        let params = Self.makeThreadStartParams(cwd: cwd, model: model, serviceTier: serviceTier)
+        let value = try await request(method: "thread/start", params: params)
         guard let thread = value["thread"],
               let threadID = thread["id"]?.stringValue,
               let sessionID = thread["sessionId"]?.stringValue,
@@ -169,16 +186,18 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     func startPlanningTurn(
         threadID: String,
         cwd: String,
-        prompt: String,
+        input: [CodexTurnInput],
         model: String,
-        effort: ReasoningEffort
+        effort: ReasoningEffort,
+        serviceTier: String
     ) async throws -> CodexStartedTurn {
         try await startTurn(
             threadID: threadID,
             cwd: cwd,
-            prompt: prompt,
+            input: input,
             model: model,
             effort: effort,
+            serviceTier: serviceTier,
             mode: "plan",
             sandboxPolicy: .object([
                 "type": .string("readOnly"),
@@ -191,17 +210,19 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     func startExecutionTurn(
         threadID: String,
         cwd: String,
-        prompt: String,
+        input: [CodexTurnInput],
         model: String,
         effort: ReasoningEffort,
+        serviceTier: String,
         allowNetwork: Bool
     ) async throws -> CodexStartedTurn {
         try await startTurn(
             threadID: threadID,
             cwd: cwd,
-            prompt: prompt,
+            input: input,
             model: model,
             effort: effort,
+            serviceTier: serviceTier,
             mode: "default",
             sandboxPolicy: .object([
                 "type": .string("workspaceWrite"),
@@ -224,19 +245,64 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     private func startTurn(
         threadID: String,
         cwd: String,
-        prompt: String,
+        input: [CodexTurnInput],
         model: String,
         effort: ReasoningEffort,
+        serviceTier: String,
         mode: String,
         sandboxPolicy: JSONValue,
         approvalPolicy: String
     ) async throws -> CodexStartedTurn {
+        let params = Self.makeTurnStartParams(
+            threadID: threadID,
+            cwd: cwd,
+            input: input,
+            model: model,
+            effort: effort,
+            serviceTier: serviceTier,
+            mode: mode,
+            sandboxPolicy: sandboxPolicy,
+            approvalPolicy: approvalPolicy
+        )
+        let value = try await request(method: "turn/start", params: params)
+        guard let turn = value["turn"],
+              let turnID = turn["id"]?.stringValue,
+              let status = turn["status"]?.stringValue
+        else {
+            throw CodexClientError.invalidResponse("turn/start 缺少 turn id/status")
+        }
+        return CodexStartedTurn(turnID: turnID, status: status)
+    }
+
+    static func makeThreadStartParams(cwd: String, model: String?, serviceTier: String?) -> JSONValue {
+        var params: [String: JSONValue] = [
+            "cwd": .string(cwd),
+            "approvalPolicy": .string("never"),
+            "sandbox": .string("read-only"),
+            "personality": .string("pragmatic"),
+            "serviceName": .string("codex_board"),
+            "ephemeral": .bool(false),
+            "runtimeWorkspaceRoots": .array([.string(cwd)])
+        ]
+        if let model, !model.isEmpty { params["model"] = .string(model) }
+        if let serviceTier, !serviceTier.isEmpty { params["serviceTier"] = .string(serviceTier) }
+        return .object(params)
+    }
+
+    static func makeTurnStartParams(
+        threadID: String,
+        cwd: String,
+        input: [CodexTurnInput],
+        model: String,
+        effort: ReasoningEffort,
+        serviceTier: String?,
+        mode: String,
+        sandboxPolicy: JSONValue,
+        approvalPolicy: String
+    ) -> JSONValue {
         var params: [String: JSONValue] = [
             "threadId": .string(threadID),
-            "input": .array([.object([
-                "type": .string("text"),
-                "text": .string(prompt)
-            ])]),
+            "input": .array(input.map(\.wireValue)),
             "cwd": .string(cwd),
             "effort": .string(effort.rawValue),
             "summary": .string("concise"),
@@ -257,14 +323,8 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             ])
         ]
         if !model.isEmpty { params["model"] = .string(model) }
-        let value = try await request(method: "turn/start", params: .object(params))
-        guard let turn = value["turn"],
-              let turnID = turn["id"]?.stringValue,
-              let status = turn["status"]?.stringValue
-        else {
-            throw CodexClientError.invalidResponse("turn/start 缺少 turn id/status")
-        }
-        return CodexStartedTurn(turnID: turnID, status: status)
+        if let serviceTier, !serviceTier.isEmpty { params["serviceTier"] = .string(serviceTier) }
+        return .object(params)
     }
 
     private func ensureConnected() async throws {
@@ -399,6 +459,10 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         guard let params else { return }
         let threadID = params["threadId"]?.stringValue
         let turnID = params["turnId"]?.stringValue
+        if let event = Self.warningEvent(method: method, params: params) {
+            eventContinuation?.yield(event)
+            return
+        }
         switch method {
         case "item/agentMessage/delta":
             guard let threadID, let turnID, let delta = params["delta"]?.stringValue else { return }
@@ -435,14 +499,25 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         case "thread/status/changed":
             guard let threadID, let status = params["status"]?["type"]?.stringValue else { return }
             eventContinuation?.yield(.threadStatus(threadID: threadID, status: status))
-        case "warning", "guardianWarning", "configWarning":
-            let message = params["message"]?.stringValue ?? method
-            eventContinuation?.yield(.warning(threadID: threadID, turnID: turnID, message: message))
         case "error":
             let message = Self.turnErrorDescription(params["error"]) ?? "Codex 执行错误"
             eventContinuation?.yield(.warning(threadID: threadID, turnID: turnID, message: message))
         default:
             break
+        }
+    }
+
+    static func warningEvent(method: String, params: JSONValue) -> CodexEvent? {
+        let threadID = params["threadId"]?.stringValue
+        let turnID = params["turnId"]?.stringValue
+        let message = params["message"]?.stringValue ?? method
+        switch method {
+        case "configWarning":
+            return .configurationWarning(threadID: threadID, turnID: turnID, message: message)
+        case "warning", "guardianWarning":
+            return .warning(threadID: threadID, turnID: turnID, message: message)
+        default:
+            return nil
         }
     }
 
@@ -452,6 +527,53 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             turnID: params?["turnId"]?.stringValue,
             message: message
         ))
+    }
+
+    static func parseModel(_ value: JSONValue) -> CodexModel? {
+        guard let id = value["id"]?.stringValue,
+              let model = value["model"]?.stringValue,
+              let displayName = value["displayName"]?.stringValue,
+              let description = value["description"]?.stringValue,
+              let isDefault = value["isDefault"]?.boolValue,
+              let defaultEffort = value["defaultReasoningEffort"]?.stringValue
+        else { return nil }
+
+        let supportedReasoningEfforts: [CodexReasoningEffortOption] = value["supportedReasoningEfforts"]?.arrayValue?.compactMap { option in
+            guard let effort = option["reasoningEffort"]?.stringValue,
+                  let description = option["description"]?.stringValue
+            else { return nil }
+            return CodexReasoningEffortOption(
+                effort: ReasoningEffort(rawValue: effort),
+                description: description
+            )
+        } ?? []
+        var serviceTiers: [CodexModelServiceTier] = value["serviceTiers"]?.arrayValue?.compactMap { tier in
+            guard let id = tier["id"]?.stringValue,
+                  let name = tier["name"]?.stringValue,
+                  let description = tier["description"]?.stringValue
+            else { return nil }
+            return CodexModelServiceTier(id: id, name: name, description: description)
+        } ?? []
+        let legacySpeedTiers = value["additionalSpeedTiers"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        if legacySpeedTiers.contains("fast"),
+           !serviceTiers.contains(where: { $0.id == CodexServiceTier.fast }) {
+            serviceTiers.append(CodexModelServiceTier(
+                id: CodexServiceTier.fast,
+                name: "Fast",
+                description: "Faster responses"
+            ))
+        }
+
+        return CodexModel(
+            id: id,
+            model: model,
+            displayName: displayName,
+            description: description,
+            isDefault: isDefault,
+            defaultReasoningEffort: ReasoningEffort(rawValue: defaultEffort),
+            supportedReasoningEfforts: supportedReasoningEfforts,
+            serviceTiers: serviceTiers
+        )
     }
 
     private static func parseThread(_ value: JSONValue) -> CodexThreadSummary? {
