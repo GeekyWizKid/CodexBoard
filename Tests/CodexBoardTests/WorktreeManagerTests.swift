@@ -63,6 +63,61 @@ final class WorktreeManagerTests: XCTestCase {
         )
     }
 
+    func testPrepareRecoversRegisteredWorktreeWhenPersistedPathWasLost() async throws {
+        let fixture = try GitFixture()
+        defer { fixture.cleanup() }
+        let manager = WorktreeManager(managedRoot: fixture.worktreeRoot)
+        let taskID = UUID()
+
+        let prepared = try await manager.prepare(
+            taskID: taskID,
+            projectPath: fixture.repository.path,
+            configuration: TaskWorkspaceConfiguration(kind: .worktree)
+        )
+        let recovered = try await manager.prepare(
+            taskID: taskID,
+            projectPath: fixture.repository.path,
+            configuration: TaskWorkspaceConfiguration(kind: .worktree)
+        )
+
+        XCTAssertEqual(recovered, prepared)
+    }
+
+    func testPrepareStillRejectsUnregisteredOccupiedDestination() async throws {
+        let fixture = try GitFixture()
+        defer { fixture.cleanup() }
+        let manager = WorktreeManager(managedRoot: fixture.worktreeRoot)
+        let taskID = UUID()
+
+        let prepared = try await manager.prepare(
+            taskID: taskID,
+            projectPath: fixture.repository.path,
+            configuration: TaskWorkspaceConfiguration(kind: .worktree)
+        )
+        let path = try XCTUnwrap(prepared.path)
+        _ = try await manager.cleanup(
+            projectPath: fixture.repository.path,
+            configuration: prepared
+        )
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: path, isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        do {
+            _ = try await manager.prepare(
+                taskID: taskID,
+                projectPath: fixture.repository.path,
+                configuration: TaskWorkspaceConfiguration(kind: .worktree)
+            )
+            XCTFail("Expected an unregistered occupied path to be rejected")
+        } catch let error as WorktreeManagerError {
+            guard case .pathOccupied = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
     func testCleanupRefusesDirtyWorktree() async throws {
         let fixture = try GitFixture()
         defer { fixture.cleanup() }

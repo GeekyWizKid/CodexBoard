@@ -109,7 +109,22 @@ actor WorktreeManager: WorktreeManaging {
         let destination = destinationURL(repository: repository, taskID: taskID)
 
         if fileManager.fileExists(atPath: destination.path) {
-            throw WorktreeManagerError.pathOccupied(destination.path)
+            let recoveredURL = destination.standardizedFileURL.resolvingSymlinksInPath()
+            guard isDescendant(recoveredURL, of: resolvedManagedRoot),
+                  registeredWorktreePaths(repository: repository).contains(recoveredURL.path)
+            else {
+                throw WorktreeManagerError.pathOccupied(destination.path)
+            }
+            let actualBranch = try currentBranch(at: recoveredURL.path)
+            guard actualBranch == branch else {
+                throw WorktreeManagerError.branchMismatch(expected: branch, actual: actualBranch)
+            }
+            return TaskWorkspaceConfiguration(
+                kind: .worktree,
+                path: recoveredURL.path,
+                branch: actualBranch,
+                baseBranch: baseBranch
+            )
         }
         try fileManager.createDirectory(
             at: destination.deletingLastPathComponent(),
