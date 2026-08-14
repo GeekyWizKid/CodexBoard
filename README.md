@@ -151,4 +151,4 @@ CodexBoard 的源代码、文档与原创美术采用 [Apache License 2.0](LICEN
 品牌使用边界见 [TRADEMARKS.md](TRADEMARKS.md)。CodexBoard 是独立项目，与 OpenAI 没有关联，
 也未获其背书。
 
-欢迎来找我 [Linux DO](https://linux.do/u/das)
+欢迎来找我 [Linux DO](https://linux.do/u/das) [V2EX](https://www.v2ex.com/member/LDa)
