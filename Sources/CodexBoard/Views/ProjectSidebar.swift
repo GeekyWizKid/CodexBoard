@@ -4,6 +4,7 @@ import SwiftUI
 struct ProjectSidebar: View {
     @Bindable var store: BoardStore
     @State private var searchText = ""
+    @State private var projectPendingRemoval: ProjectRecord?
 
     private var filteredProjects: [ProjectRecord] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -29,10 +30,9 @@ struct ProjectSidebar: View {
                             .contextMenu {
                                 Button("在 Finder 中显示") { store.revealProject(project) }
                                     .disabled(!project.existsOnDisk)
-                                if project.isManual {
-                                    Button("从手动项目中移除", role: .destructive) {
-                                        store.removeManualProject(project)
-                                    }
+                                Divider()
+                                Button("从列表移除…", role: .destructive) {
+                                    projectPendingRemoval = project
                                 }
                             }
                     }
@@ -40,8 +40,21 @@ struct ProjectSidebar: View {
             }
             .listStyle(.sidebar)
             .overlay {
-                if filteredProjects.isEmpty, !searchText.isEmpty {
-                    ContentUnavailableView.search(text: searchText)
+                if filteredProjects.isEmpty {
+                    if !searchText.isEmpty {
+                        ContentUnavailableView.search(text: searchText)
+                    } else {
+                        ContentUnavailableView {
+                            Label("没有可用项目", systemImage: "folder.badge.questionmark")
+                        } description: {
+                            Text("刷新 Codex 项目，或从下方添加一个项目文件夹。")
+                        } actions: {
+                            Button("刷新项目") {
+                                Task { await store.refreshProjects() }
+                            }
+                            .disabled(store.isRefreshingProjects)
+                        }
+                    }
                 }
             }
 
@@ -54,6 +67,25 @@ struct ProjectSidebar: View {
             }
             .buttonStyle(.plain)
             .padding(12)
+        }
+        .confirmationDialog(
+            "从项目列表移除？",
+            isPresented: Binding(
+                get: { projectPendingRemoval != nil },
+                set: { if !$0 { projectPendingRemoval = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: projectPendingRemoval
+        ) { project in
+            Button("从列表移除", role: .destructive) {
+                store.removeProjectFromSidebar(project)
+                projectPendingRemoval = nil
+            }
+            Button("取消", role: .cancel) {
+                projectPendingRemoval = nil
+            }
+        } message: { project in
+            Text(removalConfirmationMessage(for: project))
         }
     }
 
@@ -75,6 +107,20 @@ struct ProjectSidebar: View {
                     .lineLimit(1)
             }
             Spacer()
+            if store.isRefreshingProjects {
+                ProgressView()
+                    .controlSize(.small)
+                    .help("正在刷新项目")
+            } else {
+                Button {
+                    Task { await store.refreshProjects() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .help("刷新项目")
+                .accessibilityLabel("刷新项目")
+            }
             Circle()
                 .fill(store.accountReady ? BoardTheme.completed : BoardTheme.danger)
                 .frame(width: 8, height: 8)
@@ -122,5 +168,15 @@ struct ProjectSidebar: View {
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         store.addManualProject(path: url.path)
+    }
+
+    private func removalConfirmationMessage(for project: ProjectRecord) -> String {
+        let taskCount = store.tasks.count { $0.projectID == project.id }
+        return L10n.format(
+            "project.remove.confirmation",
+            fallback: "只会将“%@”从 CodexBoard 左侧列表隐藏；其 %lld 个任务、Codex 会话和磁盘目录都不会删除。",
+            project.name,
+            Int64(taskCount)
+        )
     }
 }

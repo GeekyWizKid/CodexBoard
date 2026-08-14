@@ -551,27 +551,30 @@ struct BoardPreferences: Codable, Equatable, Sendable {
 }
 
 struct BoardSnapshot: Codable, Sendable {
-    static let currentVersion = 7
+    static let currentVersion = 8
 
     var version: Int
     var tasks: [BoardTask]
     var manualProjectPaths: [String]
     var preferences: BoardPreferences
+    var hiddenProjectPaths: [String]
 
     init(
         version: Int,
         tasks: [BoardTask],
         manualProjectPaths: [String],
-        preferences: BoardPreferences
+        preferences: BoardPreferences,
+        hiddenProjectPaths: [String] = []
     ) {
         self.version = version
         self.tasks = tasks
         self.manualProjectPaths = manualProjectPaths
         self.preferences = preferences
+        self.hiddenProjectPaths = hiddenProjectPaths
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, tasks, manualProjectPaths, preferences
+        case version, tasks, manualProjectPaths, preferences, hiddenProjectPaths
     }
 
     init(from decoder: Decoder) throws {
@@ -580,6 +583,10 @@ struct BoardSnapshot: Codable, Sendable {
         tasks = try container.decode([BoardTask].self, forKey: .tasks)
         manualProjectPaths = try container.decode([String].self, forKey: .manualProjectPaths)
         preferences = try container.decode(BoardPreferences.self, forKey: .preferences)
+        hiddenProjectPaths = try container.decodeIfPresent(
+            [String].self,
+            forKey: .hiddenProjectPaths
+        ) ?? []
 
         for index in tasks.indices where !tasks[index].runtimeConfigurationWasPersisted {
             let task = tasks[index]

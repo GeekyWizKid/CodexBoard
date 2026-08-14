@@ -24,13 +24,6 @@ struct ContentView: View {
                         }
 
                         Button {
-                            Task { await store.refreshProjects() }
-                        } label: {
-                            Label("刷新项目", systemImage: "arrow.clockwise")
-                        }
-                        .disabled(store.isRefreshingProjects)
-
-                        Button {
                             showingInspector.toggle()
                         } label: {
                             Label("任务详情", systemImage: "sidebar.right")

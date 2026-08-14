@@ -15,12 +15,14 @@ struct ProjectDiscoveryService: Sendable {
 
     func discover(
         threads: [CodexThreadSummary],
-        manualPaths: [String]
+        manualPaths: [String],
+        ignoredPaths: [String] = []
     ) async -> [ProjectRecord] {
         await Task.detached(priority: .utility) {
             Self.discoverSynchronously(
                 threads: threads,
                 manualPaths: manualPaths,
+                ignoredPaths: ignoredPaths,
                 gitExecutableURL: gitExecutableURL,
                 gitProbeTimeout: gitProbeTimeout
             )
@@ -32,6 +34,7 @@ struct ProjectDiscoveryService: Sendable {
         let projectPath: String
         let existsOnDisk: Bool
         let isGitRepository: Bool
+        let isAutomaticProjectCandidate: Bool
     }
 
     private struct ProjectAccumulator {
@@ -105,6 +108,7 @@ struct ProjectDiscoveryService: Sendable {
     private static func discoverSynchronously(
         threads: [CodexThreadSummary],
         manualPaths: [String],
+        ignoredPaths: [String],
         gitExecutableURL: URL,
         gitProbeTimeout: TimeInterval
     ) -> [ProjectRecord] {
@@ -113,6 +117,7 @@ struct ProjectDiscoveryService: Sendable {
             return (thread, path)
         }
         let normalizedManualInputs = manualPaths.compactMap(normalizedPath)
+        let normalizedIgnoredPaths = ignoredPaths.compactMap(normalizedPath)
         let inputPaths = Set(
             normalizedThreadInputs.map(\.1) + normalizedManualInputs
         )
@@ -131,19 +136,26 @@ struct ProjectDiscoveryService: Sendable {
         }
 
         var projects: [String: ProjectAccumulator] = [:]
-        for (thread, inputPath) in normalizedThreadInputs {
-            guard let probe = probes[inputPath] else { continue }
-            var accumulator = projects[probe.projectPath]
-                ?? ProjectAccumulator(path: probe.projectPath)
-            accumulator.add(thread: thread, probe: probe)
-            projects[probe.projectPath] = accumulator
-        }
-
         for (priority, inputPath) in normalizedManualInputs.enumerated() {
             guard let probe = probes[inputPath] else { continue }
             var accumulator = projects[probe.projectPath]
                 ?? ProjectAccumulator(path: probe.projectPath)
             accumulator.addManualPath(probe: probe, priority: priority)
+            projects[probe.projectPath] = accumulator
+        }
+
+        for (thread, inputPath) in normalizedThreadInputs {
+            guard let probe = probes[inputPath] else { continue }
+            let isManualProject = projects[probe.projectPath]?.isManual == true
+            let isIgnored = normalizedIgnoredPaths.contains(where: { ignoredPath in
+                isSameOrDescendant(inputPath, of: ignoredPath)
+            })
+            guard isManualProject || (probe.isAutomaticProjectCandidate && !isIgnored) else {
+                continue
+            }
+            var accumulator = projects[probe.projectPath]
+                ?? ProjectAccumulator(path: probe.projectPath)
+            accumulator.add(thread: thread, probe: probe)
             projects[probe.projectPath] = accumulator
         }
 
@@ -186,13 +198,30 @@ struct ProjectDiscoveryService: Sendable {
             isDirectory: &isDirectory
         ) && isDirectory.boolValue
 
-        // Most historical Codex working directories are plain folders. Looking
-        // for a nearby .git marker first avoids launching Git for every record
-        // and, importantly, avoids an unbounded getcwd() on stale File Provider
-        // paths. The subprocess still validates real repositories/worktrees.
-        guard isUsableDirectory,
-              hasGitMarker(inOrAbove: path),
-              let gitRoot = gitTopLevel(
+        guard isUsableDirectory else {
+            return PathProbe(
+                canonicalWorkingDirectory: path,
+                projectPath: path,
+                existsOnDisk: false,
+                isGitRepository: false,
+                isAutomaticProjectCandidate: false
+            )
+        }
+
+        // Automatic entries must be identifiable Git projects. A nearby marker
+        // prevents ordinary conversation folders from becoming sidebar projects
+        // and also provides a stable fallback if the bounded Git probe times out.
+        guard let markerRoot = nearestGitMarkerRoot(from: path) else {
+            return PathProbe(
+                canonicalWorkingDirectory: path,
+                projectPath: path,
+                existsOnDisk: true,
+                isGitRepository: false,
+                isAutomaticProjectCandidate: false
+            )
+        }
+
+        guard let gitRoot = gitTopLevel(
                 for: path,
                 executableURL: gitExecutableURL,
                 timeout: gitProbeTimeout
@@ -201,9 +230,10 @@ struct ProjectDiscoveryService: Sendable {
         else {
             return PathProbe(
                 canonicalWorkingDirectory: path,
-                projectPath: path,
-                existsOnDisk: isUsableDirectory,
-                isGitRepository: false
+                projectPath: markerRoot,
+                existsOnDisk: true,
+                isGitRepository: false,
+                isAutomaticProjectCandidate: true
             )
         }
 
@@ -211,20 +241,24 @@ struct ProjectDiscoveryService: Sendable {
             canonicalWorkingDirectory: path,
             projectPath: gitRoot,
             existsOnDisk: true,
-            isGitRepository: true
+            isGitRepository: true,
+            isAutomaticProjectCandidate: true
         )
     }
 
-    private static func hasGitMarker(inOrAbove path: String) -> Bool {
+    private static func nearestGitMarkerRoot(from path: String) -> String? {
         var candidate = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
         while true {
             if FileManager.default.fileExists(
                 atPath: candidate.appendingPathComponent(".git").path
             ) {
-                return true
+                return candidate
+                    .resolvingSymlinksInPath()
+                    .standardizedFileURL
+                    .path
             }
             let parent = candidate.deletingLastPathComponent().standardizedFileURL
-            guard parent.path != candidate.path else { return false }
+            guard parent.path != candidate.path else { return nil }
             candidate = parent
         }
     }

@@ -111,6 +111,8 @@ final class BoardStore {
     @ObservationIgnored
     private var manualProjectPaths: [String] = []
     @ObservationIgnored
+    private var hiddenProjectPaths = Set<String>()
+    @ObservationIgnored
     private var eventTask: Task<Void, Never>?
     @ObservationIgnored
     private var saveTask: Task<Void, Never>?
@@ -180,7 +182,10 @@ final class BoardStore {
     }
 
     var visibleProjects: [ProjectRecord] {
-        projects.filter { preferences.showMissingProjects || $0.existsOnDisk }
+        projects.filter { project in
+            (project.isManual || !hiddenProjectPaths.contains(project.id))
+                && (preferences.showMissingProjects || project.existsOnDisk)
+        }
     }
 
     var filteredTaskCards: [BoardTaskCard] {
@@ -361,15 +366,25 @@ final class BoardStore {
                     cursor = page.nextCursor
                 } while cursor != nil
             }
-            projects = await discovery.discover(threads: threads, manualPaths: manualProjectPaths)
+            projects = await discovery.discover(
+                threads: threads,
+                manualPaths: manualProjectPaths,
+                ignoredPaths: managedWorktreePaths
+            )
+            reconcileManualProjectVisibility()
             selectInitialProjectIfNeeded()
-            statusMessage = "已载入 \(projects.count) 个项目"
+            statusMessage = "已载入 \(visibleProjects.count) 个项目"
             lastError = nil
         } catch {
             accountReady = false
             lastError = error.localizedDescription
             statusMessage = "项目扫描失败"
-            projects = await discovery.discover(threads: [], manualPaths: manualProjectPaths)
+            projects = await discovery.discover(
+                threads: [],
+                manualPaths: manualProjectPaths,
+                ignoredPaths: managedWorktreePaths
+            )
+            reconcileManualProjectVisibility()
             selectInitialProjectIfNeeded()
         }
         if let selectedProjectID {
@@ -507,20 +522,24 @@ final class BoardStore {
             .path
         manualProjectPaths.removeAll { $0 == normalized }
         manualProjectPaths.insert(normalized, at: 0)
+        hiddenProjectPaths.remove(normalized)
         scheduleSave()
         Task { @MainActor [weak self] in await self?.refreshProjects() }
     }
 
-    func removeManualProject(_ project: ProjectRecord) {
-        guard project.isManual else { return }
+    func removeProjectFromSidebar(_ project: ProjectRecord) {
+        hiddenProjectPaths.insert(project.id)
         manualProjectPaths.removeAll { manualPath in
-            let components = URL(fileURLWithPath: manualPath).standardizedFileURL.pathComponents
-            let projectComponents = URL(fileURLWithPath: project.path).standardizedFileURL.pathComponents
-            return components.count >= projectComponents.count
-                && components.prefix(projectComponents.count).elementsEqual(projectComponents)
+            Self.isSameOrDescendant(manualPath, of: project.path)
+        }
+        if let index = projects.firstIndex(where: { $0.id == project.id }) {
+            projects[index].isManual = false
+            projects[index].manualPriority = nil
+        }
+        if selectedProjectID == project.id {
+            selectedProjectID = visibleProjects.first?.id
         }
         scheduleSave()
-        Task { @MainActor [weak self] in await self?.refreshProjects() }
     }
 
     @discardableResult
@@ -1037,6 +1056,7 @@ final class BoardStore {
             let snapshot = try await persistence.load()
             tasks = snapshot.tasks
             manualProjectPaths = snapshot.manualProjectPaths
+            hiddenProjectPaths = Set(snapshot.hiddenProjectPaths)
             preferences = snapshot.preferences
             normalizeInterruptedTasks()
         } catch {
@@ -1095,16 +1115,11 @@ final class BoardStore {
 
     private func scheduleExecutionQueue() {
         let available = max(0, preferences.maxConcurrentExecutions - activeExecutionCount)
-        guard available > 0 else { return }
-        var activeProjectWorkspaceProjects = Set(
+        var activeDirectWorkspaceProjects = Set(
             tasks.lazy
                 .filter { $0.stage == .executing && $0.workspace.kind == .project }
                 .map(\.projectID)
         )
-        var activeExecutionCountsByProject = Dictionary(
-            grouping: tasks.filter { $0.stage == .executing },
-            by: \.projectID
-        ).mapValues(\.count)
         var queued: [Int] = []
         let candidates = tasks.indices
             .filter {
@@ -1117,16 +1132,20 @@ final class BoardStore {
             .sorted { tasks[$0].updatedAt < tasks[$1].updatedAt }
         for index in candidates {
             let task = tasks[index]
-            let activeCount = activeExecutionCountsByProject[task.projectID, default: 0]
             if task.workspace.kind == .project {
-                guard activeCount == 0 else { continue }
-                activeProjectWorkspaceProjects.insert(task.projectID)
-            } else {
-                guard !activeProjectWorkspaceProjects.contains(task.projectID) else { continue }
+                guard !activeDirectWorkspaceProjects.contains(task.projectID) else {
+                    tasks[index].liveMessage = "等待同项目的主目录任务结束"
+                    continue
+                }
             }
-            activeExecutionCountsByProject[task.projectID, default: 0] += 1
+            guard queued.count < available else {
+                tasks[index].liveMessage = "等待可用执行槽位"
+                continue
+            }
+            if task.workspace.kind == .project {
+                activeDirectWorkspaceProjects.insert(task.projectID)
+            }
             queued.append(index)
-            if queued.count == available { break }
         }
         for index in queued {
             let taskID = tasks[index].id
@@ -1871,10 +1890,43 @@ final class BoardStore {
     }
 
     private func selectInitialProjectIfNeeded() {
-        if let selectedProjectID, projects.contains(where: { $0.id == selectedProjectID }) { return }
-        selectedProjectID = projects.first(where: { project in
+        let visibleProjects = visibleProjects
+        if let selectedProjectID,
+           visibleProjects.contains(where: { $0.id == selectedProjectID }) {
+            return
+        }
+        selectedProjectID = visibleProjects.first(where: { project in
             tasks.contains(where: { $0.projectID == project.id })
         })?.id ?? visibleProjects.first?.id
+    }
+
+    private var managedWorktreePaths: [String] {
+        tasks.compactMap { task in
+            guard task.workspace.kind == .worktree else { return nil }
+            return task.workspace.path
+        }
+    }
+
+    private func reconcileManualProjectVisibility() {
+        let manualProjectIDs = Set(projects.lazy.filter(\.isManual).map(\.id))
+        let previouslyHiddenCount = hiddenProjectPaths.count
+        hiddenProjectPaths.subtract(manualProjectIDs)
+        if hiddenProjectPaths.count != previouslyHiddenCount {
+            scheduleSave()
+        }
+    }
+
+    private static func isSameOrDescendant(_ path: String, of ancestor: String) -> Bool {
+        let pathComponents = URL(fileURLWithPath: path, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .pathComponents
+        let ancestorComponents = URL(fileURLWithPath: ancestor, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .pathComponents
+        guard ancestorComponents.count <= pathComponents.count else { return false }
+        return pathComponents.prefix(ancestorComponents.count).elementsEqual(ancestorComponents)
     }
 
     @discardableResult
@@ -2055,7 +2107,8 @@ final class BoardStore {
             version: BoardSnapshot.currentVersion,
             tasks: tasks,
             manualProjectPaths: manualProjectPaths,
-            preferences: preferences
+            preferences: preferences,
+            hiddenProjectPaths: hiddenProjectPaths.sorted()
         )
         let deletedTasks = pendingAttachmentDeletions
         var succeeded = false

@@ -145,6 +145,12 @@
 "%lld 个会话 · %@" = "%lld sessions · %@";
 "目录已不存在" = "Folder no longer exists";
 "从手动项目中移除" = "Remove from Manual Projects";
+"从列表移除…" = "Remove from List…";
+"从列表移除" = "Remove from List";
+"从项目列表移除？" = "Remove from Project List?";
+"正在刷新项目" = "Refreshing Projects";
+"刷新 Codex 项目，或从下方添加一个项目文件夹。" = "Refresh Codex projects, or add a project folder below.";
+"project.remove.confirmation" = "This only hides \"%@\" from the CodexBoard sidebar; its %lld tasks, Codex threads, and folder on disk will not be deleted.";
 "本机 Codex 已连接" = "Local Codex Connected";
 "本机 Codex 未连接" = "Local Codex Disconnected";
 "Codex 未连接" = "Codex Disconnected";
@@ -278,7 +284,7 @@
 "该项目还没有可作为前置条件的任务。" = "This project has no tasks available as dependencies.";
 "执行前自动创建 codex/task-* 分支和隔离目录；规划仍在原项目只读进行。" = "Create a codex/task-* branch and isolated folder before execution; planning remains read-only in the original project.";
 "所选项目不是 Git 仓库，无法使用独立 Worktree。" = "The selected project is not a Git repository and cannot use an isolated Worktree.";
-"直接在当前项目目录执行；同一项目一次只运行一个写入任务。" = "Execute in the current project folder; only one write task runs per project.";
+"直接在当前项目目录执行；主目录任务彼此串行，独立 Worktree 仍可并行。" = "Execute in the current project folder; direct-workspace tasks remain serial while isolated Worktrees can run concurrently.";
 
 /* Interactions */
 "正在发送…" = "Sending…";

@@ -37,6 +37,7 @@
 "menu.board" = "看板";
 "action.new_task" = "新建任务";
 "action.refresh_projects" = "刷新项目";
+"project.remove.confirmation" = "只会将“%@”从 CodexBoard 左侧列表隐藏；其 %lld 个任务、Codex 会话和磁盘目录都不会删除。";
 "accessibility.tasks.running" = "CodexBoard，%lld 个任务进行中";
 "accessibility.tasks.idle" = "CodexBoard，没有进行中的任务";
 "notification.attention.title" = "CodexBoard 需要你的操作";

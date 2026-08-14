@@ -56,7 +56,7 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
         XCTAssertTrue(project.isManual)
     }
 
-    func testKeepsMissingPathsAndDoesNotDiscoverNestedRepositories() async throws {
+    func testFiltersNonGitConversationFoldersButKeepsExplicitManualPaths() async throws {
         let temporaryDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
 
@@ -91,14 +91,13 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
 
         let projects = await ProjectDiscoveryService().discover(
             threads: threads,
-            manualPaths: [ordinaryAlias.path, "  ", ordinaryDirectory.path]
+            manualPaths: [ordinaryAlias.path, "  ", ordinaryDirectory.path, missingDirectory.path]
         )
 
         XCTAssertEqual(
             projects.map(\.path),
             [
                 ordinaryDirectory.resolvingSymlinksInPath().path,
-                recentDirectory.resolvingSymlinksInPath().path,
                 missingDirectory.standardizedFileURL.path
             ]
         )
@@ -109,6 +108,7 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
         XCTAssertFalse(missingProject.existsOnDisk)
         XCTAssertFalse(missingProject.isGitRepository)
         XCTAssertEqual(missingProject.threadCount, 1)
+        XCTAssertTrue(missingProject.isManual)
 
         let ordinaryProject = try XCTUnwrap(
             projects.first { $0.path == ordinaryDirectory.resolvingSymlinksInPath().path }
@@ -118,6 +118,7 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
         XCTAssertTrue(ordinaryProject.isManual)
         XCTAssertEqual(ordinaryProject.threadCount, 0)
         XCTAssertEqual(ordinaryProject.observedWorkingDirectories, [])
+        XCTAssertNil(projects.first { $0.path == recentDirectory.resolvingSymlinksInPath().path })
         XCTAssertNil(
             projects.first { $0.path == nestedRepository.resolvingSymlinksInPath().path },
             "The service must not scan children looking for repositories"
@@ -218,6 +219,42 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
         XCTAssertFalse(project.isGitRepository)
     }
 
+    func testIgnoresManagedWorktreeConversationUnlessExplicitlyAdded() async throws {
+        let temporaryDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let repository = temporaryDirectory.appendingPathComponent("Repository", isDirectory: true)
+        let managedWorktree = temporaryDirectory.appendingPathComponent("Managed", isDirectory: true)
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: managedWorktree, withIntermediateDirectories: true)
+        try runGit(["init", "--quiet"], in: repository)
+        try runGit(["init", "--quiet"], in: managedWorktree)
+
+        let service = ProjectDiscoveryService()
+        let filtered = await service.discover(
+            threads: [
+                makeThread(id: "repository", cwd: repository.path, updatedAt: Date(), status: "active"),
+                makeThread(id: "managed", cwd: managedWorktree.path, updatedAt: Date(), status: "active")
+            ],
+            manualPaths: [],
+            ignoredPaths: [managedWorktree.path]
+        )
+
+        XCTAssertEqual(filtered.map(\.path), [repository.resolvingSymlinksInPath().path])
+
+        let explicitlyAdded = await service.discover(
+            threads: [
+                makeThread(id: "managed", cwd: managedWorktree.path, updatedAt: Date(), status: "active")
+            ],
+            manualPaths: [managedWorktree.path],
+            ignoredPaths: [managedWorktree.path]
+        )
+
+        XCTAssertEqual(explicitlyAdded.map(\.path), [managedWorktree.resolvingSymlinksInPath().path])
+        XCTAssertTrue(explicitlyAdded[0].isManual)
+        XCTAssertEqual(explicitlyAdded[0].threadCount, 1)
+    }
+
     func testManualProjectsLeadInSuppliedOrderAndKeepGitRootPriority() async throws {
         let temporaryDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
@@ -230,6 +267,7 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         }
         try runGit(["init", "--quiet"], in: repository)
+        try runGit(["init", "--quiet"], in: automatic)
 
         let projects = await ProjectDiscoveryService().discover(
             threads: [

@@ -107,10 +107,11 @@ final class BoardPersistenceTests: XCTestCase {
             )
         )
         let expected = BoardSnapshot(
-            version: 7,
+            version: 8,
             tasks: [task],
             manualProjectPaths: ["/tmp/最新项目", "/tmp/示例项目"],
-            preferences: preferences
+            preferences: preferences,
+            hiddenProjectPaths: ["/tmp/已隐藏项目"]
         )
 
         let persistence = BoardPersistence(fileURL: fixture.fileURL)
@@ -120,6 +121,7 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertEqual(actual.version, expected.version)
         XCTAssertEqual(actual.tasks, expected.tasks)
         XCTAssertEqual(actual.manualProjectPaths, expected.manualProjectPaths)
+        XCTAssertEqual(actual.hiddenProjectPaths, expected.hiddenProjectPaths)
         XCTAssertEqual(actual.preferences, expected.preferences)
         XCTAssertEqual(actual.tasks.first?.requestedModel, "gpt-selected")
         XCTAssertEqual(actual.tasks.first?.reasoningEffort, .max)
@@ -239,6 +241,7 @@ final class BoardPersistenceTests: XCTestCase {
         )
         let encoded = try JSONEncoder().encode(snapshot)
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "hiddenProjectPaths")
         var tasks = try XCTUnwrap(object["tasks"] as? [[String: Any]])
         tasks[0].removeValue(forKey: "attachments")
         tasks[0].removeValue(forKey: "selectedSkills")
@@ -272,6 +275,7 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertEqual(loaded.tasks.first?.runs, [])
         XCTAssertNil(loaded.tasks.first?.reviewFeedback)
         XCTAssertEqual(loaded.tasks.first?.workspace, .project)
+        XCTAssertEqual(loaded.hiddenProjectPaths, [])
         loaded.version = BoardSnapshot.currentVersion
         try await persistence.save(loaded)
         let reloaded = try await persistence.load()

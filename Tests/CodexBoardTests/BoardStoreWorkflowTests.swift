@@ -1318,6 +1318,10 @@ final class BoardStoreWorkflowTests: XCTestCase {
         try await eventually { fixture.client.executionTurnCount == 1 }
         XCTAssertEqual(fixture.store.tasks.first(where: { $0.id == firstID })?.stage, .executing)
         XCTAssertEqual(fixture.store.tasks.first(where: { $0.id == secondID })?.stage, .awaitingApproval)
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == secondID })?.liveMessage,
+            "等待同项目的主目录任务结束"
+        )
 
         fixture.client.send(.turnCompleted(
             threadID: "thread-1",
@@ -1327,6 +1331,81 @@ final class BoardStoreWorkflowTests: XCTestCase {
         ))
         try await eventually { fixture.client.executionTurnCount == 2 }
         XCTAssertEqual(fixture.store.tasks.first(where: { $0.id == secondID })?.stage, .executing)
+    }
+
+    func testWorktreeExecutionStartsAlongsideActiveDirectWorkspaceTask() async throws {
+        let worktreeRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexboard-worktree-test-\(UUID().uuidString)", isDirectory: true)
+        let fixture = try Fixture(
+            autoRunDefault: true,
+            isGitRepository: true,
+            worktreeManager: StubWorktreeManager(root: worktreeRoot)
+        )
+        defer { fixture.cleanup() }
+        fixture.store.updatePreferences { $0.maxConcurrentExecutions = 4 }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+
+        let directTaskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Direct workspace",
+            sourceKind: .issue,
+            sourceText: "Change the main checkout",
+            autoRun: true,
+            workspaceKind: .project
+        )
+        try await eventually { fixture.client.planningTurnCount == 1 }
+
+        let worktreeTaskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Isolated workspace",
+            sourceKind: .issue,
+            sourceText: "Change an isolated checkout",
+            autoRun: true,
+            workspaceKind: .worktree
+        )
+        try await eventually { fixture.client.planningTurnCount == 2 }
+
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Direct plan"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.client.executionTurnCount == 1
+                && fixture.store.tasks.first(where: { $0.id == directTaskID })?.stage == .executing
+        }
+
+        fixture.client.send(.planFinal(
+            threadID: "thread-2",
+            turnID: "plan-2",
+            text: "Worktree plan"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-2",
+            turnID: "plan-2",
+            status: "completed",
+            error: nil
+        ))
+
+        try await eventually {
+            fixture.client.executionTurnCount == 2
+                && fixture.store.tasks.first(where: { $0.id == worktreeTaskID })?.stage == .executing
+        }
+        XCTAssertEqual(fixture.store.activeExecutionCount, 2)
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == worktreeTaskID })?.workspace.kind,
+            .worktree
+        )
+        XCTAssertEqual(fixture.client.executionCalls.map(\.cwd).first, fixture.projectPath)
+        XCTAssertTrue(fixture.client.executionCalls.map(\.cwd).contains(where: {
+            $0.hasPrefix(worktreeRoot.path)
+        }))
     }
 
     func testChangingProjectClearsTaskSelectionFromPreviousProject() async throws {
@@ -1898,11 +1977,92 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(fixture.store.selectedProjectID, fixture.projectPath)
     }
 
+    func testRefreshAddsNewGitProjectAndRemovedProjectStaysHiddenAfterReload() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let firstProject = directory.appendingPathComponent("FirstRepository", isDirectory: true)
+        let secondProject = directory.appendingPathComponent("SecondRepository", isDirectory: true)
+        for project in [firstProject, secondProject] {
+            try FileManager.default.createDirectory(
+                at: project.appendingPathComponent(".git", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        let persistenceURL = directory.appendingPathComponent("board.json")
+        let client = MockCodexTaskClient(projectPath: firstProject.path)
+        let store = BoardStore(
+            client: client,
+            persistence: BoardPersistence(fileURL: persistenceURL),
+            attachmentStorage: AttachmentStorage(
+                rootDirectory: directory.appendingPathComponent("attachments")
+            )
+        )
+        store.start()
+        try await eventually { store.selectedProjectID == firstProject.path }
+
+        client.historicalProjectPaths.append(secondProject.path)
+        await store.refreshProjects()
+        XCTAssertTrue(store.visibleProjects.contains(where: { $0.id == secondProject.path }))
+
+        let taskID = try await store.createTask(
+            projectID: firstProject.path,
+            title: "Keep after hiding",
+            sourceKind: .issue,
+            sourceText: "This task must remain persisted",
+            autoRun: false
+        )
+        store.selectedProjectID = firstProject.path
+        let project = try XCTUnwrap(
+            store.projects.first(where: { $0.id == firstProject.path })
+        )
+        store.removeProjectFromSidebar(project)
+
+        XCTAssertFalse(store.visibleProjects.contains(where: { $0.id == firstProject.path }))
+        XCTAssertEqual(store.selectedProjectID, secondProject.path)
+        XCTAssertTrue(store.tasks.contains(where: { $0.id == taskID }))
+
+        await store.refreshProjects()
+        XCTAssertFalse(store.visibleProjects.contains(where: { $0.id == firstProject.path }))
+
+        try await Task.sleep(for: .milliseconds(1_100))
+        let snapshot = try await BoardPersistence(fileURL: persistenceURL).load()
+        XCTAssertTrue(snapshot.hiddenProjectPaths.contains(firstProject.path))
+        XCTAssertTrue(snapshot.tasks.contains(where: { $0.id == taskID }))
+
+        let restoredClient = MockCodexTaskClient(projectPath: firstProject.path)
+        restoredClient.historicalProjectPaths.append(secondProject.path)
+        let restoredStore = BoardStore(
+            client: restoredClient,
+            persistence: BoardPersistence(fileURL: persistenceURL),
+            attachmentStorage: AttachmentStorage(
+                rootDirectory: directory.appendingPathComponent("restored-attachments")
+            )
+        )
+        restoredStore.start()
+        try await eventually {
+            restoredStore.visibleProjects.contains(where: { $0.id == secondProject.path })
+                && !restoredStore.visibleProjects.contains(where: { $0.id == firstProject.path })
+        }
+
+        restoredStore.addManualProject(path: firstProject.path)
+        try await eventually {
+            restoredStore.visibleProjects.contains(where: {
+                $0.id == firstProject.path && $0.isManual
+            })
+        }
+        XCTAssertTrue(restoredStore.tasks.contains(where: { $0.id == taskID }))
+    }
+
     func testBurstStreamingUpdatesAreCoalescedAndPersistedAtMostTwicePerSecond() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let client = MockCodexTaskClient(projectPath: directory.path)
-        let persistence = RecordingBoardPersistence()
+        let persistence = RecordingBoardPersistence(initialSnapshot: BoardSnapshot(
+            version: BoardSnapshot.currentVersion,
+            tasks: [],
+            manualProjectPaths: [directory.path],
+            preferences: BoardPreferences()
+        ))
         let store = BoardStore(
             client: client,
             persistence: persistence,
@@ -2561,6 +2721,10 @@ final class BoardStoreWorkflowTests: XCTestCase {
     func testMCPOAuthStateOpensOnlyFromUserActionAndRefreshesAfterCompletion() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(
+            at: directory.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
         let client = MockCodexTaskClient(projectPath: directory.path)
         client.mcpServerCatalog = [CodexMCPServerStatus(
             name: "example",
@@ -2703,12 +2867,46 @@ private enum MockClientError: LocalizedError {
     }
 }
 
+private actor StubWorktreeManager: WorktreeManaging {
+    let root: URL
+
+    init(root: URL) {
+        self.root = root
+    }
+
+    func prepare(
+        taskID: UUID,
+        projectPath: String,
+        configuration: TaskWorkspaceConfiguration
+    ) async throws -> TaskWorkspaceConfiguration {
+        guard configuration.kind == .worktree else { return .project }
+        return TaskWorkspaceConfiguration(
+            kind: .worktree,
+            path: root.appendingPathComponent(taskID.uuidString, isDirectory: true).path,
+            branch: "codex/task-\(taskID.uuidString.prefix(8).lowercased())",
+            baseBranch: "main"
+        )
+    }
+
+    func status(configuration: TaskWorkspaceConfiguration) async throws -> WorktreeStatus {
+        WorktreeStatus(isClean: true, changes: [])
+    }
+
+    func cleanup(
+        projectPath: String,
+        configuration: TaskWorkspaceConfiguration
+    ) async throws -> TaskWorkspaceConfiguration {
+        TaskWorkspaceConfiguration(kind: configuration.kind)
+    }
+}
+
 @MainActor
 private final class MockCodexTaskClient: CodexTaskClient {
     var connectionState: CodexConnectionState = .connected
     private let continuation: AsyncStream<CodexEvent>.Continuation
     let events: AsyncStream<CodexEvent>
     let projectPath: String
+    var historicalProjectPaths: [String]
     var planningTurnCount = 0
     var executionTurnCount = 0
     var threadStartCount = 0
@@ -2737,6 +2935,7 @@ private final class MockCodexTaskClient: CodexTaskClient {
 
     init(projectPath: String) {
         self.projectPath = projectPath
+        historicalProjectPaths = [projectPath]
         var captured: AsyncStream<CodexEvent>.Continuation!
         events = AsyncStream { captured = $0 }
         continuation = captured
@@ -2792,17 +2991,19 @@ private final class MockCodexTaskClient: CodexTaskClient {
     }
     func listThreads(cursor: String?, archived: Bool) async throws -> CodexThreadPage {
         CodexThreadPage(
-            threads: [CodexThreadSummary(
-                id: "history",
-                sessionID: "history-session",
-                cwd: projectPath,
-                name: "Fixture",
-                createdAt: Date(),
-                updatedAt: Date(),
-                isPinned: false,
-                statusType: "idle",
-                sourceKind: "appServer"
-            )],
+            threads: historicalProjectPaths.enumerated().map { index, path in
+                CodexThreadSummary(
+                    id: "history-\(index)",
+                    sessionID: "history-session-\(index)",
+                    cwd: path,
+                    name: "Fixture",
+                    createdAt: Date(),
+                    updatedAt: Date(),
+                    isPinned: false,
+                    statusType: "idle",
+                    sourceKind: "appServer"
+                )
+            },
             nextCursor: nil
         )
     }
@@ -2904,19 +3105,43 @@ private struct Fixture {
     let client: MockCodexTaskClient
     let store: BoardStore
 
-    init(autoRunDefault: Bool) throws {
+    init(
+        autoRunDefault: Bool,
+        isGitRepository: Bool = false,
+        worktreeManager: any WorktreeManaging = WorktreeManager()
+    ) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if isGitRepository {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = ["-C", directory.path, "init", "-b", "main"]
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
         projectPath = directory.path
         client = MockCodexTaskClient(projectPath: projectPath)
-        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        var preferences = BoardPreferences()
+        preferences.defaultAutoRun = autoRunDefault
+        let snapshot = BoardSnapshot(
+            version: BoardSnapshot.currentVersion,
+            tasks: [],
+            manualProjectPaths: [projectPath],
+            preferences: preferences
+        )
+        let persistenceURL = directory.appendingPathComponent("board.json")
+        try JSONEncoder().encode(snapshot).write(to: persistenceURL)
+        let persistence = BoardPersistence(fileURL: persistenceURL)
         store = BoardStore(
             client: client,
             persistence: persistence,
-            attachmentStorage: AttachmentStorage(rootDirectory: directory.appendingPathComponent("attachments"))
+            attachmentStorage: AttachmentStorage(rootDirectory: directory.appendingPathComponent("attachments")),
+            worktreeManager: worktreeManager
         )
         store.start()
-        store.updatePreferences { $0.defaultAutoRun = autoRunDefault }
     }
 
     func cleanup() { try? FileManager.default.removeItem(at: directory) }

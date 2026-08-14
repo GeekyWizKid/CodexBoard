@@ -31,6 +31,8 @@ CodexBoard turns disconnected Codex sessions into a visible, governed delivery w
 ## Highlights
 
 - Multi-project kanban for Inbox, Planning, Approval, Execution, Review, Completed, and Needs Attention.
+- Git-root project discovery with a sidebar refresh action; non-Git folders remain available through explicit manual addition.
+- Persistently remove projects from the sidebar without deleting folders, Codex threads, tasks, or attachments; add the folder again to restore it.
 - Task-scoped model, reasoning effort, and Fast configuration that stays fixed across planning and execution.
 - Structured local Skills and read-only Apps discovered through Codex app-server.
 - Human-in-the-loop command, file, permission, user-input, MCP form, URL, and OAuth flows.
@@ -75,7 +77,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history and [docs/RELEASING.md](doc
 swift test
 ```
 
-The SwiftUI interface is coordinated by `BoardStore`; `CodexAppServerClient` speaks the local app-server protocol; `WorktreeManager`, `BoardPersistence`, and `AttachmentStorage` keep execution, snapshots, and imported images bounded and recoverable.
+The SwiftUI interface is coordinated by `BoardStore`; `CodexAppServerClient` speaks the local app-server protocol; `ProjectDiscoveryService` groups conversations by Git root while filtering ordinary session folders and CodexBoard-managed worktrees; `WorktreeManager`, `BoardPersistence`, and `AttachmentStorage` keep execution, snapshots, and imported images bounded and recoverable.
 
 ## Security boundaries
 

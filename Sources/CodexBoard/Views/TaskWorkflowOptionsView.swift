@@ -99,8 +99,8 @@ struct TaskWorkflowOptionsView: View {
             )
         }
         return L10n.text(
-            "直接在当前项目目录执行；同一项目一次只运行一个写入任务。",
-            fallback: "直接在当前项目目录执行；同一项目一次只运行一个写入任务。"
+            "直接在当前项目目录执行；主目录任务彼此串行，独立 Worktree 仍可并行。",
+            fallback: "直接在当前项目目录执行；主目录任务彼此串行，独立 Worktree 仍可并行。"
         )
     }
 
