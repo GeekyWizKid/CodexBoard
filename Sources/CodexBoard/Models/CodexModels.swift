@@ -276,11 +276,40 @@ enum CodexRequestID: Hashable, Sendable {
     }
 }
 
-enum CodexApprovalDecision: String, CaseIterable, Hashable, Sendable {
+enum CodexApprovalDecision: Equatable, Hashable, Sendable {
     case accept
     case acceptForSession
+    case acceptWithExecpolicyAmendment([String])
+    case applyNetworkPolicyAmendment(CodexNetworkPolicyAmendment)
     case decline
     case cancel
+
+    var isSimple: Bool {
+        switch self {
+        case .accept, .acceptForSession, .decline, .cancel: true
+        case .acceptWithExecpolicyAmendment, .applyNetworkPolicyAmendment: false
+        }
+    }
+
+    var isApproval: Bool {
+        switch self {
+        case .accept, .acceptForSession, .acceptWithExecpolicyAmendment: true
+        case let .applyNetworkPolicyAmendment(amendment): amendment.action == .allow
+        case .decline, .cancel: false
+        }
+    }
+
+    var isRejection: Bool { !isApproval }
+}
+
+struct CodexNetworkPolicyAmendment: Equatable, Hashable, Sendable {
+    enum Action: String, Equatable, Hashable, Sendable {
+        case allow
+        case deny
+    }
+
+    let host: String
+    let action: Action
 }
 
 struct CodexCommandApproval: Equatable, Sendable {
@@ -289,6 +318,9 @@ struct CodexCommandApproval: Equatable, Sendable {
     let reason: String?
     let commandActions: JSONValue?
     let requestedPermissions: JSONValue?
+    let networkApprovalContext: JSONValue?
+    let proposedExecpolicyAmendment: [String]?
+    let proposedNetworkPolicyAmendments: [CodexNetworkPolicyAmendment]
     let availableDecisions: [CodexApprovalDecision]?
 }
 
@@ -362,7 +394,7 @@ enum CodexPermissionScope: String, Hashable, Sendable {
 
 enum CodexPermissionDecision: Equatable, Sendable {
     case deny(scope: CodexPermissionScope)
-    case grant(permissions: JSONValue, scope: CodexPermissionScope)
+    case grant(permissions: JSONValue, scope: CodexPermissionScope, strictAutoReview: Bool = false)
 }
 
 enum CodexMCPElicitationResponse: Equatable, Sendable {

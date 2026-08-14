@@ -840,10 +840,18 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
                   itemID != nil,
                   case .integer? = params["startedAtMs"]
             else { return nil }
+            let proposedExecpolicyAmendment = params["proposedExecpolicyAmendment"]?.arrayValue?
+                .compactMap(\.stringValue)
+            let proposedNetworkPolicyAmendments = params["proposedNetworkPolicyAmendments"]?.arrayValue?
+                .compactMap(Self.parseNetworkPolicyAmendment) ?? []
             let availableDecisions: [CodexApprovalDecision]?
             if let values = params["availableDecisions"]?.arrayValue {
                 availableDecisions = values.compactMap { value in
-                    value.stringValue.flatMap { CodexApprovalDecision(rawValue: $0) }
+                    Self.parseApprovalDecision(
+                        value,
+                        proposedExecpolicyAmendment: proposedExecpolicyAmendment,
+                        proposedNetworkPolicyAmendments: proposedNetworkPolicyAmendments
+                    )
                 }
             } else {
                 availableDecisions = nil
@@ -854,6 +862,9 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
                 reason: params["reason"]?.stringValue,
                 commandActions: params["commandActions"],
                 requestedPermissions: params["additionalPermissions"],
+                networkApprovalContext: params["networkApprovalContext"],
+                proposedExecpolicyAmendment: proposedExecpolicyAmendment,
+                proposedNetworkPolicyAmendments: proposedNetworkPolicyAmendments,
                 availableDecisions: availableDecisions
             ))
         case "item/fileChange/requestApproval":
@@ -934,6 +945,75 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         )
     }
 
+    static func parseApprovalDecision(
+        _ value: JSONValue,
+        proposedExecpolicyAmendment: [String]?,
+        proposedNetworkPolicyAmendments: [CodexNetworkPolicyAmendment]
+    ) -> CodexApprovalDecision? {
+        if let rawValue = value.stringValue {
+            switch rawValue {
+            case "accept": return .accept
+            case "acceptForSession": return .acceptForSession
+            case "decline": return .decline
+            case "cancel": return .cancel
+            case "acceptWithExecpolicyAmendment":
+                guard let amendment = proposedExecpolicyAmendment, !amendment.isEmpty else { return nil }
+                return .acceptWithExecpolicyAmendment(amendment)
+            case "applyNetworkPolicyAmendment":
+                guard proposedNetworkPolicyAmendments.count == 1,
+                      let amendment = proposedNetworkPolicyAmendments.first
+                else { return nil }
+                return .applyNetworkPolicyAmendment(amendment)
+            default: return nil
+            }
+        }
+
+        if let amendmentValues = value["acceptWithExecpolicyAmendment"]?["execpolicy_amendment"]?.arrayValue {
+            let amendment = amendmentValues.compactMap(\.stringValue)
+            guard amendment.count == amendmentValues.count, !amendment.isEmpty else { return nil }
+            return .acceptWithExecpolicyAmendment(amendment)
+        }
+        if let amendment = parseNetworkPolicyAmendment(
+            value["applyNetworkPolicyAmendment"]?["network_policy_amendment"]
+        ) {
+            return .applyNetworkPolicyAmendment(amendment)
+        }
+        return nil
+    }
+
+    static func parseNetworkPolicyAmendment(_ value: JSONValue?) -> CodexNetworkPolicyAmendment? {
+        guard let host = value?["host"]?.stringValue,
+              !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let rawAction = value?["action"]?.stringValue,
+              let action = CodexNetworkPolicyAmendment.Action(rawValue: rawAction)
+        else { return nil }
+        return CodexNetworkPolicyAmendment(host: host, action: action)
+    }
+
+    static func wireValue(for decision: CodexApprovalDecision) -> JSONValue {
+        switch decision {
+        case .accept: .string("accept")
+        case .acceptForSession: .string("acceptForSession")
+        case let .acceptWithExecpolicyAmendment(amendment):
+            .object([
+                "acceptWithExecpolicyAmendment": .object([
+                    "execpolicy_amendment": .array(amendment.map(JSONValue.string))
+                ])
+            ])
+        case let .applyNetworkPolicyAmendment(amendment):
+            .object([
+                "applyNetworkPolicyAmendment": .object([
+                    "network_policy_amendment": .object([
+                        "host": .string(amendment.host),
+                        "action": .string(amendment.action.rawValue)
+                    ])
+                ])
+            ])
+        case .decline: .string("decline")
+        case .cancel: .string("cancel")
+        }
+    }
+
     static func parseUserInputQuestion(_ value: JSONValue) -> CodexUserInputQuestion? {
         guard let id = value["id"]?.stringValue,
               let header = value["header"]?.stringValue,
@@ -978,9 +1058,12 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             if let available = approval.availableDecisions, !available.contains(decision) {
                 throw CodexClientError.invalidResponse("命令审批 decision 不在服务端允许范围内")
             }
-            return .object(["decision": .string(decision.rawValue)])
+            return .object(["decision": wireValue(for: decision)])
         case (.fileChangeApproval, let .approval(decision)):
-            return .object(["decision": .string(decision.rawValue)])
+            guard decision.isSimple else {
+                throw CodexClientError.invalidResponse("文件修改审批不支持规则型 decision")
+            }
+            return .object(["decision": wireValue(for: decision)])
         case let (.userInput(input), .userInput(answers)):
             let expectedIDs = Set(input.questions.map(\.id))
             guard Set(answers.keys) == expectedIDs else {
@@ -998,16 +1081,20 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
                     "permissions": .object([:]),
                     "scope": .string(scope.rawValue)
                 ])
-            case let .grant(permissions, scope):
+            case let .grant(permissions, scope, strictAutoReview):
                 guard permissions.objectValue != nil,
                       permissions == approval.permissions
                 else {
                     throw CodexClientError.invalidResponse("permissions grant 必须精确匹配服务端请求")
                 }
-                return .object([
+                var result: [String: JSONValue] = [
                     "permissions": permissions,
                     "scope": .string(scope.rawValue)
-                ])
+                ]
+                if strictAutoReview {
+                    result["strictAutoReview"] = .bool(true)
+                }
+                return .object(result)
             }
         case let (.mcpElicitation(elicitation), .mcpElicitation(elicitationResponse)):
             switch (elicitation.mode, elicitationResponse) {

@@ -2137,6 +2137,9 @@ final class BoardStoreWorkflowTests: XCTestCase {
                 reason: "Inspect repository",
                 commandActions: nil,
                 requestedPermissions: nil,
+                networkApprovalContext: nil,
+                proposedExecpolicyAmendment: nil,
+                proposedNetworkPolicyAmendments: [],
                 availableDecisions: [.accept, .decline]
             )),
             createdAt: Date()
@@ -2203,6 +2206,9 @@ final class BoardStoreWorkflowTests: XCTestCase {
                 reason: "Inspect the pending change",
                 commandActions: nil,
                 requestedPermissions: nil,
+                networkApprovalContext: nil,
+                proposedExecpolicyAmendment: nil,
+                proposedNetworkPolicyAmendments: [],
                 availableDecisions: [.accept, .decline]
             )),
             createdAt: Date()
@@ -2451,6 +2457,9 @@ final class BoardStoreWorkflowTests: XCTestCase {
                 reason: nil,
                 commandActions: nil,
                 requestedPermissions: nil,
+                networkApprovalContext: nil,
+                proposedExecpolicyAmendment: nil,
+                proposedNetworkPolicyAmendments: [],
                 availableDecisions: [.accept, .decline]
             )),
             createdAt: Date()

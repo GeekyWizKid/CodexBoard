@@ -355,6 +355,92 @@ final class CodexAppServerClientTests: XCTestCase {
         ))
     }
 
+    func testCommandApprovalParsesAndEncodesCodexSessionAndPolicyChoices() throws {
+        let execAmendment = ["git", "status"]
+        let networkAmendment = CodexNetworkPolicyAmendment(host: "api.example.com", action: .allow)
+        let request = try XCTUnwrap(CodexAppServerClient.parseInteractionRequest(
+            id: .string("policy-request"),
+            method: "item/commandExecution/requestApproval",
+            params: .object([
+                "threadId": .string("thread-1"),
+                "turnId": .string("turn-1"),
+                "itemId": .string("item-policy"),
+                "startedAtMs": .integer(3_000),
+                "command": .string("git status --short"),
+                "cwd": .string("/project"),
+                "networkApprovalContext": .object([
+                    "host": .string("api.example.com"),
+                    "protocol": .string("https")
+                ]),
+                "proposedExecpolicyAmendment": .array(execAmendment.map(JSONValue.string)),
+                "proposedNetworkPolicyAmendments": .array([
+                    .object([
+                        "host": .string(networkAmendment.host),
+                        "action": .string(networkAmendment.action.rawValue)
+                    ])
+                ]),
+                "availableDecisions": .array([
+                    .string("accept"),
+                    .string("acceptForSession"),
+                    .object([
+                        "acceptWithExecpolicyAmendment": .object([
+                            "execpolicy_amendment": .array(execAmendment.map(JSONValue.string))
+                        ])
+                    ]),
+                    .object([
+                        "applyNetworkPolicyAmendment": .object([
+                            "network_policy_amendment": .object([
+                                "host": .string(networkAmendment.host),
+                                "action": .string(networkAmendment.action.rawValue)
+                            ])
+                        ])
+                    ]),
+                    .string("decline"),
+                    .string("cancel")
+                ])
+            ])
+        ))
+
+        guard case let .commandApproval(approval) = request.kind else {
+            return XCTFail("Expected command approval")
+        }
+        XCTAssertEqual(approval.proposedExecpolicyAmendment, execAmendment)
+        XCTAssertEqual(approval.proposedNetworkPolicyAmendments, [networkAmendment])
+        XCTAssertEqual(approval.availableDecisions, [
+            .accept,
+            .acceptForSession,
+            .acceptWithExecpolicyAmendment(execAmendment),
+            .applyNetworkPolicyAmendment(networkAmendment),
+            .decline,
+            .cancel
+        ])
+        XCTAssertEqual(try CodexAppServerClient.makeInteractionResponse(
+            method: "item/commandExecution/requestApproval",
+            request: request,
+            response: .approval(.acceptWithExecpolicyAmendment(execAmendment))
+        ), .object([
+            "decision": .object([
+                "acceptWithExecpolicyAmendment": .object([
+                    "execpolicy_amendment": .array(execAmendment.map(JSONValue.string))
+                ])
+            ])
+        ]))
+        XCTAssertEqual(try CodexAppServerClient.makeInteractionResponse(
+            method: "item/commandExecution/requestApproval",
+            request: request,
+            response: .approval(.applyNetworkPolicyAmendment(networkAmendment))
+        ), .object([
+            "decision": .object([
+                "applyNetworkPolicyAmendment": .object([
+                    "network_policy_amendment": .object([
+                        "host": .string(networkAmendment.host),
+                        "action": .string(networkAmendment.action.rawValue)
+                    ])
+                ])
+            ])
+        ]))
+    }
+
     func testFileChangeApprovalParsesAndEncodesDecision() throws {
         let request = try XCTUnwrap(CodexAppServerClient.parseInteractionRequest(
             id: .string("file-request"),
@@ -481,6 +567,19 @@ final class CodexAppServerClientTests: XCTestCase {
         ), .object([
             "permissions": permissions,
             "scope": .string("session")
+        ]))
+        XCTAssertEqual(try CodexAppServerClient.makeInteractionResponse(
+            method: "item/permissions/requestApproval",
+            request: request,
+            response: .permissions(.grant(
+                permissions: permissions,
+                scope: .turn,
+                strictAutoReview: true
+            ))
+        ), .object([
+            "permissions": permissions,
+            "scope": .string("turn"),
+            "strictAutoReview": .bool(true)
         ]))
         XCTAssertThrowsError(try CodexAppServerClient.makeInteractionResponse(
             method: "item/permissions/requestApproval",

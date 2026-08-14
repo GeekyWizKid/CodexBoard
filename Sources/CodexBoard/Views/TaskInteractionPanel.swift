@@ -99,7 +99,10 @@ struct TaskInteractionPanel: View {
             if let permissions = approval.requestedPermissions {
                 jsonDisclosure("请求权限", value: permissions)
             }
-            approvalButtons(available: approval.availableDecisions)
+            if let networkContext = approval.networkApprovalContext {
+                jsonDisclosure("网络访问", value: networkContext)
+            }
+            approvalButtons(available: approval.availableDecisions ?? legacyCommandDecisions(approval))
         }
     }
 
@@ -111,7 +114,7 @@ struct TaskInteractionPanel: View {
             if let root = cleaned(approval.grantRoot) {
                 interactionMetadata("授权根目录", root, monospaced: true)
             }
-            approvalButtons(available: nil)
+            approvalButtons(available: [.accept, .acceptForSession, .decline, .cancel])
         }
     }
 
@@ -123,24 +126,41 @@ struct TaskInteractionPanel: View {
             }
             jsonBlock(title: "请求的精确权限", value: approval.permissions)
 
-            HStack {
-                Button("仅本轮授予这些权限") {
-                    submit(.permissions(.grant(permissions: approval.permissions, scope: .turn)))
+            HStack(spacing: 8) {
+                Menu("允许…") {
+                    Button("仅本轮允许") {
+                        submit(.permissions(.grant(
+                            permissions: approval.permissions,
+                            scope: .turn
+                        )))
+                    }
+                    Button("本任务内允许") {
+                        submit(.permissions(.grant(
+                            permissions: approval.permissions,
+                            scope: .session
+                        )))
+                    }
+                    Divider()
+                    Button("本轮允许，但继续严格审核命令") {
+                        submit(.permissions(.grant(
+                            permissions: approval.permissions,
+                            scope: .turn,
+                            strictAutoReview: true
+                        )))
+                    }
                 }
-                .buttonStyle(.bordered)
+                .menuStyle(.borderedButton)
 
                 Spacer()
 
-                Button("拒绝本轮") {
+                Button("拒绝") {
                     submit(.permissions(.deny(scope: .turn)))
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(BoardTheme.approval)
-                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.bordered)
             }
             .disabled(isResponding)
 
-            Text("不会提供会话级永久授权；若授予，仅限当前 Turn 和上方精确权限。")
+            Text("本任务内允许仅作用于当前 Codex 会话；不会修改全局设置。授予范围始终是上方精确权限。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -346,38 +366,34 @@ struct TaskInteractionPanel: View {
 
     private func approvalButtons(available: [CodexApprovalDecision]?) -> some View {
         let decisions = stableDecisions(available)
-        let preferred = decisions.contains(.cancel) ? CodexApprovalDecision.cancel : .decline
         return HStack {
-            ForEach(decisions.filter { $0 == .accept || $0 == .acceptForSession }, id: \.self) { decision in
-                decisionButton(decision, preferred: preferred)
+            let approvals = decisions.filter(\.isApproval)
+            if approvals.count == 1, let decision = approvals.first {
+                decisionButton(decision)
+            } else if !approvals.isEmpty {
+                Menu("允许…") {
+                    ForEach(approvals, id: \.self) { decision in
+                        Button(decisionTitle(decision)) {
+                            submit(.approval(decision))
+                        }
+                    }
+                }
+                .menuStyle(.borderedButton)
+                .disabled(isResponding)
             }
             Spacer()
-            ForEach(decisions.filter { $0 == .decline || $0 == .cancel }, id: \.self) { decision in
-                decisionButton(decision, preferred: preferred)
+            ForEach(decisions.filter(\.isRejection), id: \.self) { decision in
+                decisionButton(decision)
             }
         }
     }
 
-    @ViewBuilder
-    private func decisionButton(
-        _ decision: CodexApprovalDecision,
-        preferred: CodexApprovalDecision
-    ) -> some View {
-        if decision == preferred {
-            Button(decisionTitle(decision)) {
-                submit(.approval(decision))
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(BoardTheme.approval)
-            .keyboardShortcut(.defaultAction)
-            .disabled(isResponding)
-        } else {
-            Button(decisionTitle(decision)) {
-                submit(.approval(decision))
-            }
-            .buttonStyle(.bordered)
-            .disabled(isResponding)
+    private func decisionButton(_ decision: CodexApprovalDecision) -> some View {
+        Button(decisionTitle(decision)) {
+            submit(.approval(decision))
         }
+        .buttonStyle(.bordered)
+        .disabled(isResponding)
     }
 
     private func stableDecisions(_ available: [CodexApprovalDecision]?) -> [CodexApprovalDecision] {
@@ -391,12 +407,57 @@ struct TaskInteractionPanel: View {
         return candidates.filter { seen.insert($0).inserted }
     }
 
+    private func legacyCommandDecisions(_ approval: CodexCommandApproval) -> [CodexApprovalDecision] {
+        if approval.networkApprovalContext != nil {
+            var decisions: [CodexApprovalDecision] = [.accept, .acceptForSession]
+            if let allowRule = approval.proposedNetworkPolicyAmendments.first(where: { $0.action == .allow }) {
+                decisions.append(.applyNetworkPolicyAmendment(allowRule))
+            }
+            decisions.append(.cancel)
+            return decisions
+        }
+        if approval.requestedPermissions != nil {
+            return [.accept, .cancel]
+        }
+        var decisions: [CodexApprovalDecision] = [.accept]
+        if let amendment = approval.proposedExecpolicyAmendment, !amendment.isEmpty {
+            decisions.append(.acceptWithExecpolicyAmendment(amendment))
+        }
+        decisions.append(.cancel)
+        return decisions
+    }
+
     private func decisionTitle(_ decision: CodexApprovalDecision) -> String {
         switch decision {
-        case .accept: L10n.text("允许一次", fallback: "允许一次")
-        case .acceptForSession: L10n.text("本次会话允许", fallback: "本次会话允许")
-        case .decline: L10n.text("拒绝", fallback: "拒绝")
-        case .cancel: L10n.text("取消", fallback: "取消")
+        case .accept:
+            L10n.text("仅本次允许", fallback: "仅本次允许")
+        case .acceptForSession:
+            switch request.kind {
+            case .fileChangeApproval:
+                L10n.text("本任务内允许修改这些文件", fallback: "本任务内允许修改这些文件")
+            case let .commandApproval(approval) where approval.networkApprovalContext != nil:
+                L10n.text("本任务内允许访问该主机", fallback: "本任务内允许访问该主机")
+            case let .commandApproval(approval) where approval.requestedPermissions != nil:
+                L10n.text("本任务内允许这些权限", fallback: "本任务内允许这些权限")
+            default:
+                L10n.text("本任务内不再询问这条命令", fallback: "本任务内不再询问这条命令")
+            }
+        case let .acceptWithExecpolicyAmendment(amendment):
+            L10n.format(
+                "approval.remember_command_prefix",
+                fallback: "以后允许以 %@ 开头的命令",
+                amendment.joined(separator: " ")
+            )
+        case let .applyNetworkPolicyAmendment(amendment):
+            if amendment.action == .allow {
+                L10n.format("approval.allow_host_future", fallback: "以后允许访问 %@", amendment.host)
+            } else {
+                L10n.format("approval.block_host_future", fallback: "以后阻止访问 %@", amendment.host)
+            }
+        case .decline:
+            L10n.text("拒绝并继续任务", fallback: "拒绝并继续任务")
+        case .cancel:
+            L10n.text("拒绝并停止本轮", fallback: "拒绝并停止本轮")
         }
     }
 
