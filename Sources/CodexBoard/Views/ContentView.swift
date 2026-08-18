@@ -4,6 +4,7 @@ struct ContentView: View {
     let store: BoardStore
     @Bindable var mainWindowState: MainWindowState
     @State private var showingInspector = true
+    @State private var liveProject: ProjectRecord?
 
     var body: some View {
         NavigationSplitView {
@@ -17,6 +18,14 @@ struct ContentView: View {
                 }
                 .toolbar {
                     ToolbarItemGroup(placement: .primaryAction) {
+                        Button {
+                            liveProject = store.selectedProject
+                        } label: {
+                            Label("GPT Live", systemImage: "waveform.circle")
+                        }
+                        .disabled(store.selectedProject.map(store.isProjectRunnable) != true)
+                        .help("通过语音或文字澄清需求，确认草稿后创建看板任务")
+
                         Button {
                             mainWindowState.requestComposer()
                         } label: {
@@ -34,6 +43,9 @@ struct ContentView: View {
         .navigationTitle(store.selectedProject?.name ?? "CodexBoard")
         .sheet(isPresented: $mainWindowState.isComposerPresented) {
             TaskComposer(store: store, isPresented: $mainWindowState.isComposerPresented)
+        }
+        .sheet(item: $liveProject) { project in
+            LiveTaskComposer(boardStore: store, project: project)
         }
         .onChange(of: store.taskFocusRequest?.nonce, initial: true) { _, nonce in
             guard nonce != nil else { return }

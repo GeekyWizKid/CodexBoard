@@ -4,6 +4,24 @@ CodexBoard follows [Semantic Versioning](https://semver.org/) for public release
 
 ## [Unreleased]
 
+### Added
+
+- Unified management for the local Mac and multiple headless Codex hosts over
+  system SSH, including per-host projects, connection state, concurrency, and
+  reconnect reconciliation through `thread/read`.
+- A guided three-step SSH host setup flow with discoverable aliases and
+  copyable install, device-auth, and non-interactive verification commands.
+- GPT Live voice/text requirement capture with editable drafts, explicit
+  confirmation before task creation, macOS Keychain storage, and an isolated
+  local Realtime child process.
+
+### Security
+
+- Remote paths are inspected only on their owning host; SSH credentials and
+  Codex auth files are never copied or persisted by CodexBoard.
+- Remote tasks reject Mac-local worktrees and attachments, and ambiguous
+  reconnect state stops for attention instead of starting duplicate work.
+
 ### Planned
 
 - Developer ID signing and Apple notarization for public distribution.

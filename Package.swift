@@ -15,6 +15,7 @@ let package = Package(
             name: "CodexBoard",
             path: "Sources/CodexBoard",
             linkerSettings: [
+                .linkedFramework("AVFoundation"),
                 .linkedFramework("Security"),
                 .linkedFramework("UserNotifications")
             ]

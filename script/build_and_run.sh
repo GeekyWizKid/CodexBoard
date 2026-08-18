@@ -11,6 +11,8 @@ LEGACY_APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 RUNTIME_DIR="/private/tmp/codexboard-runtime-$(id -u)"
 RUNTIME_APP="$RUNTIME_DIR/$APP_NAME.app"
 RUNTIME_BINARY="$RUNTIME_APP/Contents/MacOS/$APP_NAME"
+DATA_PATH_ENV="CODEXBOARD_DATA_PATH"
+VERIFY_DATA_PATH=""
 INFO_PLIST_SOURCE="$ROOT_DIR/Resources/Info.plist"
 FILE_ICONS_SOURCE="$ROOT_DIR/Resources/FileIcons"
 APP_ICON_SOURCE="$ROOT_DIR/Resources/Assets.xcassets/AppIcon.appiconset/icon_512x512@2x.png"
@@ -25,13 +27,21 @@ if [[ ! -x "$DEVELOPER_ROOT/usr/bin/actool" && -x "/Applications/Xcode.app/Conte
 fi
 ACTOOL="$DEVELOPER_ROOT/usr/bin/actool"
 STAGING_DIR=""
+STOP_RUNTIME_ON_EXIT=false
 
 cleanup_staging() {
   if [[ -n "$STAGING_DIR" && "$STAGING_DIR" == /private/tmp/codexboard-stage.* ]]; then
     rm -rf -- "$STAGING_DIR"
   fi
 }
-trap cleanup_staging EXIT
+
+cleanup() {
+  if [[ "$STOP_RUNTIME_ON_EXIT" == true ]]; then
+    stop_exact_binary "$RUNTIME_BINARY" || true
+  fi
+  cleanup_staging
+}
+trap cleanup EXIT
 
 stop_exact_binary() {
   local binary_path="$1"
@@ -166,8 +176,32 @@ prepare_runtime_bundle() {
 }
 
 launch_bundle() {
+  local launch_mode="${1:-normal}"
   prepare_runtime_bundle
-  /usr/bin/open -n "$RUNTIME_APP"
+  case "$launch_mode" in
+    normal)
+      /usr/bin/env -u "$DATA_PATH_ENV" /usr/bin/open -n "$RUNTIME_APP"
+      ;;
+    isolated-verification)
+      local verify_data_directory
+      verify_data_directory="$(mktemp -d "$RUNTIME_DIR/verify-data.XXXXXX")"
+      VERIFY_DATA_PATH="$verify_data_directory/board.json"
+      /usr/bin/open -n --env "$DATA_PATH_ENV=$VERIFY_DATA_PATH" "$RUNTIME_APP"
+      ;;
+    *)
+      echo "Unknown launch mode: $launch_mode" >&2
+      return 2
+      ;;
+  esac
+}
+
+validate_verification_data() {
+  local data_directory="${VERIFY_DATA_PATH%/*}"
+  [[ -s "$VERIFY_DATA_PATH" ]] || return 1
+  /usr/bin/plutil -convert binary1 -o /dev/null -- "$VERIFY_DATA_PATH" \
+    >/dev/null 2>&1 || return 1
+  [[ "$(/usr/bin/stat -f '%Lp' "$data_directory")" == 700 ]] || return 1
+  [[ "$(/usr/bin/stat -f '%Lp' "$VERIFY_DATA_PATH")" == 600 ]] || return 1
 }
 
 case "$MODE" in
@@ -180,14 +214,28 @@ case "$MODE" in
     ;;
   --verify|verify)
     build_bundle
-    launch_bundle
-    for _ in {1..30}; do
-      if pgrep -f "^${RUNTIME_BINARY}$" >/dev/null; then
+    STOP_RUNTIME_ON_EXIT=true
+    launch_bundle isolated-verification
+    for _ in {1..150}; do
+      if pgrep -f "^${RUNTIME_BINARY}$" >/dev/null && validate_verification_data; then
+        echo "Verified $APP_NAME with isolated JSON at $VERIFY_DATA_PATH (directory 0700, file 0600)"
         exit 0
       fi
       sleep 0.2
     done
-    echo "$APP_NAME did not stay running" >&2
+    if pgrep -f "^${RUNTIME_BINARY}$" >/dev/null; then
+      if [[ ! -s "$VERIFY_DATA_PATH" ]]; then
+        echo "$APP_NAME is running but did not create isolated verification data" >&2
+      elif ! /usr/bin/plutil -convert binary1 -o /dev/null -- "$VERIFY_DATA_PATH" \
+        >/dev/null 2>&1; then
+        echo "$APP_NAME created invalid isolated JSON at $VERIFY_DATA_PATH" >&2
+      else
+        verify_data_directory="${VERIFY_DATA_PATH%/*}"
+        echo "$APP_NAME created isolated data with unsafe permissions: directory $(/usr/bin/stat -f '%Lp' "$verify_data_directory"), file $(/usr/bin/stat -f '%Lp' "$VERIFY_DATA_PATH")" >&2
+      fi
+    else
+      echo "$APP_NAME did not stay running" >&2
+    fi
     exit 1
     ;;
   --debug|debug)

@@ -1,5 +1,106 @@
 import Foundation
 
+enum CodexHostKind: String, Codable, CaseIterable, Identifiable, Sendable {
+    case local
+    case ssh
+
+    var id: String { rawValue }
+}
+
+struct CodexHost: Codable, Hashable, Identifiable, Sendable {
+    static let localID = "local"
+    static let local = CodexHost(
+        id: localID,
+        name: "本机",
+        kind: .local,
+        sshAlias: nil,
+        isEnabled: true,
+        maxConcurrentExecutions: 2
+    )
+
+    let id: String
+    var name: String
+    var kind: CodexHostKind
+    var sshAlias: String?
+    var isEnabled: Bool
+    private var storedMaxConcurrentExecutions: Int
+
+    var maxConcurrentExecutions: Int {
+        get { storedMaxConcurrentExecutions }
+        set { storedMaxConcurrentExecutions = max(1, newValue) }
+    }
+
+    init(
+        id: String,
+        name: String,
+        kind: CodexHostKind,
+        sshAlias: String? = nil,
+        isEnabled: Bool = true,
+        maxConcurrentExecutions: Int = 1
+    ) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.sshAlias = sshAlias
+        self.isEnabled = isEnabled
+        storedMaxConcurrentExecutions = max(1, maxConcurrentExecutions)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case kind
+        case sshAlias
+        case isEnabled
+        case maxConcurrentExecutions
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        kind = try container.decode(CodexHostKind.self, forKey: .kind)
+        sshAlias = try container.decodeIfPresent(String.self, forKey: .sshAlias)
+        isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        storedMaxConcurrentExecutions = max(
+            1,
+            try container.decodeIfPresent(Int.self, forKey: .maxConcurrentExecutions) ?? 1
+        )
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(kind, forKey: .kind)
+        try container.encodeIfPresent(sshAlias, forKey: .sshAlias)
+        try container.encode(isEnabled, forKey: .isEnabled)
+        try container.encode(maxConcurrentExecutions, forKey: .maxConcurrentExecutions)
+    }
+}
+
+struct ManualProjectReference: Codable, Hashable, Sendable {
+    var hostID: String
+    var path: String
+
+    init(hostID: String = CodexHost.localID, path: String) {
+        self.hostID = hostID
+        self.path = path
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case hostID
+        case path
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        hostID = try container.decodeIfPresent(String.self, forKey: .hostID)
+            ?? CodexHost.localID
+        path = try container.decode(String.self, forKey: .path)
+    }
+}
+
 enum TaskSourceKind: String, Codable, CaseIterable, Identifiable, Sendable {
     case issue
     case developmentPlan
@@ -69,10 +170,11 @@ enum TaskStage: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 struct ProjectRecord: Codable, Hashable, Identifiable, Sendable {
-    let id: String
+    let hostID: String
     var name: String
     var path: String
     var observedWorkingDirectories: [String]
+    var manualPaths: [String]
     var latestActivityAt: Date?
     var threadCount: Int
     var activeThreadCount: Int
@@ -81,11 +183,16 @@ struct ProjectRecord: Codable, Hashable, Identifiable, Sendable {
     var isManual: Bool
     var manualPriority: Int?
 
+    var id: String {
+        Self.identifier(hostID: hostID, path: path)
+    }
+
     init(
-        id: String,
+        hostID: String = CodexHost.localID,
         name: String,
         path: String,
         observedWorkingDirectories: [String] = [],
+        manualPaths: [String] = [],
         latestActivityAt: Date? = nil,
         threadCount: Int = 0,
         activeThreadCount: Int = 0,
@@ -94,10 +201,11 @@ struct ProjectRecord: Codable, Hashable, Identifiable, Sendable {
         isManual: Bool = false,
         manualPriority: Int? = nil
     ) {
-        self.id = id
+        self.hostID = hostID
         self.name = name
         self.path = path
         self.observedWorkingDirectories = observedWorkingDirectories
+        self.manualPaths = manualPaths
         self.latestActivityAt = latestActivityAt
         self.threadCount = threadCount
         self.activeThreadCount = activeThreadCount
@@ -105,6 +213,94 @@ struct ProjectRecord: Codable, Hashable, Identifiable, Sendable {
         self.existsOnDisk = existsOnDisk
         self.isManual = isManual
         self.manualPriority = manualPriority
+    }
+
+    init(
+        id _: String,
+        name: String,
+        path: String,
+        observedWorkingDirectories: [String] = [],
+        manualPaths: [String] = [],
+        latestActivityAt: Date? = nil,
+        threadCount: Int = 0,
+        activeThreadCount: Int = 0,
+        isGitRepository: Bool = false,
+        existsOnDisk: Bool = true,
+        isManual: Bool = false,
+        manualPriority: Int? = nil
+    ) {
+        self.init(
+            hostID: CodexHost.localID,
+            name: name,
+            path: path,
+            observedWorkingDirectories: observedWorkingDirectories,
+            manualPaths: manualPaths,
+            latestActivityAt: latestActivityAt,
+            threadCount: threadCount,
+            activeThreadCount: activeThreadCount,
+            isGitRepository: isGitRepository,
+            existsOnDisk: existsOnDisk,
+            isManual: isManual,
+            manualPriority: manualPriority
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case hostID
+        case name
+        case path
+        case observedWorkingDirectories
+        case manualPaths
+        case latestActivityAt
+        case threadCount
+        case activeThreadCount
+        case isGitRepository
+        case existsOnDisk
+        case isManual
+        case manualPriority
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        hostID = try container.decodeIfPresent(String.self, forKey: .hostID)
+            ?? CodexHost.localID
+        name = try container.decode(String.self, forKey: .name)
+        path = try container.decode(String.self, forKey: .path)
+        observedWorkingDirectories = try container.decodeIfPresent(
+            [String].self,
+            forKey: .observedWorkingDirectories
+        ) ?? []
+        manualPaths = try container.decodeIfPresent([String].self, forKey: .manualPaths) ?? []
+        latestActivityAt = try container.decodeIfPresent(Date.self, forKey: .latestActivityAt)
+        threadCount = try container.decodeIfPresent(Int.self, forKey: .threadCount) ?? 0
+        activeThreadCount = try container.decodeIfPresent(Int.self, forKey: .activeThreadCount) ?? 0
+        isGitRepository = try container.decodeIfPresent(Bool.self, forKey: .isGitRepository) ?? false
+        existsOnDisk = try container.decodeIfPresent(Bool.self, forKey: .existsOnDisk) ?? true
+        isManual = try container.decodeIfPresent(Bool.self, forKey: .isManual) ?? false
+        manualPriority = try container.decodeIfPresent(Int.self, forKey: .manualPriority)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(hostID, forKey: .hostID)
+        try container.encode(name, forKey: .name)
+        try container.encode(path, forKey: .path)
+        try container.encode(observedWorkingDirectories, forKey: .observedWorkingDirectories)
+        try container.encode(manualPaths, forKey: .manualPaths)
+        try container.encodeIfPresent(latestActivityAt, forKey: .latestActivityAt)
+        try container.encode(threadCount, forKey: .threadCount)
+        try container.encode(activeThreadCount, forKey: .activeThreadCount)
+        try container.encode(isGitRepository, forKey: .isGitRepository)
+        try container.encode(existsOnDisk, forKey: .existsOnDisk)
+        try container.encode(isManual, forKey: .isManual)
+        try container.encodeIfPresent(manualPriority, forKey: .manualPriority)
+    }
+
+    private static func identifier(hostID: String, path: String) -> String {
+        guard hostID != CodexHost.localID else { return path }
+        return "host:\(hostID.utf8.count):\(hostID):\(path)"
     }
 }
 
@@ -266,6 +462,7 @@ struct TaskAppSelection: Codable, Hashable, Identifiable, Sendable {
 struct BoardTask: Codable, Hashable, Identifiable, Sendable {
     let id: UUID
     var projectID: String
+    var hostID: String
     var title: String
     var sourceKind: TaskSourceKind
     var sourceText: String
@@ -304,6 +501,7 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
     init(
         id: UUID = UUID(),
         projectID: String,
+        hostID: String = CodexHost.localID,
         title: String,
         sourceKind: TaskSourceKind,
         sourceText: String,
@@ -338,6 +536,7 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
     ) {
         self.id = id
         self.projectID = projectID
+        self.hostID = hostID
         self.title = title
         self.sourceKind = sourceKind
         self.sourceText = sourceText
@@ -373,7 +572,7 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, projectID, title, sourceKind, sourceText, attachments, selectedSkills, selectedApps
+        case id, projectID, hostID, title, sourceKind, sourceText, attachments, selectedSkills, selectedApps
         case stage, autoRun
         case executionApproved, createdAt, updatedAt, planText, hasFinalPlan, structuredPlan
         case resultText, liveMessage, threadID, sessionID, planningTurnID, executionTurnID
@@ -389,6 +588,8 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
         projectID = try container.decode(String.self, forKey: .projectID)
+        hostID = try container.decodeIfPresent(String.self, forKey: .hostID)
+            ?? CodexHost.localID
         title = try container.decode(String.self, forKey: .title)
         sourceKind = try container.decode(TaskSourceKind.self, forKey: .sourceKind)
         sourceText = try container.decode(String.self, forKey: .sourceText)
@@ -434,6 +635,7 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
 struct BoardTaskCard: Hashable, Identifiable, Sendable {
     let id: UUID
     let projectID: String
+    let hostID: String
     let title: String
     let sourceKind: TaskSourceKind
     let stage: TaskStage
@@ -455,6 +657,7 @@ struct BoardTaskCard: Hashable, Identifiable, Sendable {
     init(task: BoardTask, blockingDependencyCount: Int = 0) {
         id = task.id
         projectID = task.projectID
+        hostID = task.hostID
         title = task.title
         sourceKind = task.sourceKind
         stage = task.stage
@@ -551,13 +754,47 @@ struct BoardPreferences: Codable, Equatable, Sendable {
 }
 
 struct BoardSnapshot: Codable, Sendable {
-    static let currentVersion = 8
+    static let currentVersion = 9
 
     var version: Int
     var tasks: [BoardTask]
-    var manualProjectPaths: [String]
+    var hosts: [CodexHost]
+    var manualProjects: [ManualProjectReference]
     var preferences: BoardPreferences
     var hiddenProjectPaths: [String]
+
+    var manualProjectPaths: [String] {
+        get {
+            manualProjects
+                .filter { $0.hostID == CodexHost.localID }
+                .map(\.path)
+        }
+        set {
+            manualProjects.removeAll { $0.hostID == CodexHost.localID }
+            manualProjects.append(contentsOf: newValue.map {
+                ManualProjectReference(hostID: CodexHost.localID, path: $0)
+            })
+        }
+    }
+
+    init(
+        version: Int = currentVersion,
+        tasks: [BoardTask],
+        hosts: [CodexHost],
+        manualProjects: [ManualProjectReference],
+        preferences: BoardPreferences,
+        hiddenProjectPaths: [String] = []
+    ) {
+        self.version = max(Self.currentVersion, version)
+        self.tasks = tasks
+        self.hosts = Self.normalizedHosts(
+            hosts,
+            fallbackLocalConcurrency: preferences.maxConcurrentExecutions
+        )
+        self.manualProjects = manualProjects
+        self.preferences = preferences
+        self.hiddenProjectPaths = hiddenProjectPaths
+    }
 
     init(
         version: Int,
@@ -566,28 +803,60 @@ struct BoardSnapshot: Codable, Sendable {
         preferences: BoardPreferences,
         hiddenProjectPaths: [String] = []
     ) {
-        self.version = version
-        self.tasks = tasks
-        self.manualProjectPaths = manualProjectPaths
-        self.preferences = preferences
-        self.hiddenProjectPaths = hiddenProjectPaths
+        self.init(
+            version: version,
+            tasks: tasks,
+            hosts: [],
+            manualProjects: manualProjectPaths.map {
+                ManualProjectReference(hostID: CodexHost.localID, path: $0)
+            },
+            preferences: preferences,
+            hiddenProjectPaths: hiddenProjectPaths
+        )
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, tasks, manualProjectPaths, preferences, hiddenProjectPaths
+        case version
+        case tasks
+        case hosts
+        case manualProjects
+        case manualProjectPaths
+        case preferences
+        case hiddenProjectPaths
     }
 
-    init(from decoder: Decoder) throws {
+    init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        version = try container.decode(Int.self, forKey: .version)
+        version = max(
+            Self.currentVersion,
+            try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        )
         tasks = try container.decode([BoardTask].self, forKey: .tasks)
-        manualProjectPaths = try container.decode([String].self, forKey: .manualProjectPaths)
         preferences = try container.decode(BoardPreferences.self, forKey: .preferences)
+        hosts = Self.normalizedHosts(
+            try container.decodeIfPresent([CodexHost].self, forKey: .hosts) ?? [],
+            fallbackLocalConcurrency: preferences.maxConcurrentExecutions
+        )
+        if let references = try container.decodeIfPresent(
+            [ManualProjectReference].self,
+            forKey: .manualProjects
+        ) {
+            manualProjects = references
+        } else {
+            manualProjects = try container.decodeIfPresent(
+                [String].self,
+                forKey: .manualProjectPaths
+            )?.map {
+                ManualProjectReference(hostID: CodexHost.localID, path: $0)
+            } ?? []
+        }
         hiddenProjectPaths = try container.decodeIfPresent(
             [String].self,
             forKey: .hiddenProjectPaths
         ) ?? []
 
+        // Snapshots written before task-scoped runtime configuration must keep
+        // the effective effort that the mainline migration already selected.
         for index in tasks.indices where !tasks[index].runtimeConfigurationWasPersisted {
             let task = tasks[index]
             let shouldPreserveExecutionEffort: Bool
@@ -606,10 +875,53 @@ struct BoardSnapshot: Codable, Sendable {
         }
     }
 
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(max(Self.currentVersion, version), forKey: .version)
+        try container.encode(tasks, forKey: .tasks)
+        try container.encode(
+            Self.normalizedHosts(
+                hosts,
+                fallbackLocalConcurrency: preferences.maxConcurrentExecutions
+            ),
+            forKey: .hosts
+        )
+        try container.encode(manualProjects, forKey: .manualProjects)
+        try container.encode(preferences, forKey: .preferences)
+        try container.encode(hiddenProjectPaths, forKey: .hiddenProjectPaths)
+    }
+
+    private static func normalizedHosts(
+        _ hosts: [CodexHost],
+        fallbackLocalConcurrency: Int
+    ) -> [CodexHost] {
+        let fallbackLocalHost = CodexHost(
+            id: CodexHost.localID,
+            name: CodexHost.local.name,
+            kind: .local,
+            isEnabled: true,
+            maxConcurrentExecutions: max(1, fallbackLocalConcurrency)
+        )
+        var seenIDs: Set<String> = []
+        var normalized: [CodexHost] = []
+        for host in hosts where seenIDs.insert(host.id).inserted {
+            if host.id == CodexHost.localID, host.kind != .local {
+                normalized.append(fallbackLocalHost)
+            } else {
+                normalized.append(host)
+            }
+        }
+        if !seenIDs.contains(CodexHost.localID) {
+            normalized.insert(fallbackLocalHost, at: 0)
+        }
+        return normalized
+    }
+
     static let empty = BoardSnapshot(
         version: currentVersion,
         tasks: [],
-        manualProjectPaths: [],
+        hosts: [.local],
+        manualProjects: [],
         preferences: BoardPreferences()
     )
 }

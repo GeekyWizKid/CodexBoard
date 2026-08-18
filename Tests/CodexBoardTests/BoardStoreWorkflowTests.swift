@@ -1259,6 +1259,97 @@ final class BoardStoreWorkflowTests: XCTestCase {
         }))
     }
 
+    func testTaskRPCFailureDoesNotMarkConnectedHostOffline() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        fixture.client.planningTurnError = CodexClientError.rpc(
+            code: -32_602,
+            message: "model unavailable"
+        )
+
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Task-level failure",
+            sourceKind: .issue,
+            sourceText: "Keep the host healthy",
+            autoRun: false
+        )
+        await fixture.store.startPlanning(taskID: taskID)
+
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+        XCTAssertEqual(
+            fixture.store.hostConnectionState(for: CodexHost.localID),
+            .connected
+        )
+        XCTAssertEqual(fixture.client.connectionState, .connected)
+    }
+
+    func testFilesystemRootCannotBeUsedAsTaskWorkspace() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [],
+            hosts: [.local],
+            manualProjects: [ManualProjectReference(path: "/")],
+            preferences: BoardPreferences()
+        ))
+        let client = MockCodexTaskClient(projectPath: "/")
+        let store = BoardStore(client: client, persistence: persistence)
+        store.start()
+
+        try await eventually { store.projects.contains(where: { $0.path == "/" }) }
+        let rootProject = try XCTUnwrap(store.projects.first(where: { $0.path == "/" }))
+        XCTAssertFalse(store.isProjectRunnable(rootProject))
+        let rootTaskID = try? await store.createTask(
+            projectID: rootProject.id,
+            title: "Unsafe root",
+            sourceKind: .issue,
+            sourceText: "Do not run here",
+            autoRun: false
+        )
+        XCTAssertNil(rootTaskID)
+        XCTAssertEqual(client.threadStartCount, 0)
+    }
+
+    func testPersistenceFailurePreventsStartingRemoteWork() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(
+            at: directory.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let dataURL = directory.appendingPathComponent("board.json")
+        try Data("{corrupt".utf8).write(to: dataURL)
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let store = BoardStore(
+            client: client,
+            persistence: BoardPersistence(fileURL: dataURL)
+        )
+        store.start()
+
+        try await eventually { store.projects.contains(where: { $0.path == directory.path }) }
+        let project = try XCTUnwrap(store.projects.first(where: { $0.path == directory.path }))
+        let taskID = try await store.createTask(
+            projectID: project.id,
+            title: "Do not start",
+            sourceKind: .issue,
+            sourceText: "Persistence is unavailable",
+            autoRun: false
+        )
+        await store.startPlanning(taskID: taskID)
+
+        try await eventually {
+            store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+        XCTAssertEqual(client.threadStartCount, 0)
+        XCTAssertEqual(client.planningTurnCount, 0)
+        XCTAssertEqual(try Data(contentsOf: dataURL), Data("{corrupt".utf8))
+    }
+
     func testInterruptedPersistedTaskBecomesNeedsAttention() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1288,6 +1379,60 @@ final class BoardStoreWorkflowTests: XCTestCase {
         try await eventually { store.tasks.first?.stage == .needsAttention }
         XCTAssertTrue(store.tasks.first?.lastError?.contains("避免重复副作用") == false)
         XCTAssertEqual(client.executionTurnCount, 0)
+    }
+
+    func testStartupReconcilesCompletedPersistedTurnWithoutDuplicateExecution() async throws {
+        let fixture = try await persistedExecutionFixture(
+            status: "completed",
+            finalText: "Recovered after relaunch"
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        fixture.store.start()
+
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == fixture.taskID })?.stage == .review
+        }
+        XCTAssertEqual(fixture.client.readThreadCount, 1)
+        XCTAssertEqual(fixture.client.resumeThreadCount, 0)
+        XCTAssertEqual(fixture.client.executionTurnCount, 0)
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == fixture.taskID })?.resultText,
+            "Recovered after relaunch"
+        )
+    }
+
+    func testStartupReattachesInProgressPersistedTurnWithoutDuplicateExecution() async throws {
+        let fixture = try await persistedExecutionFixture(status: "inProgress")
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        fixture.store.start()
+
+        try await eventually { fixture.client.resumeThreadCount == 1 }
+        let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == fixture.taskID }))
+        XCTAssertEqual(fixture.client.readThreadCount, 1)
+        XCTAssertEqual(fixture.client.executionTurnCount, 0)
+        XCTAssertEqual(task.stage, .executing)
+        XCTAssertEqual(task.executionTurnID, "turn-persisted")
+        XCTAssertNil(task.lastError)
+        XCTAssertTrue(task.liveMessage.contains("恢复"))
+    }
+
+    func testStartupFailsClosedForInterruptedPersistedTurn() async throws {
+        let fixture = try await persistedExecutionFixture(status: "interrupted")
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        fixture.store.start()
+
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == fixture.taskID })?.stage == .needsAttention
+        }
+        let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == fixture.taskID }))
+        XCTAssertEqual(fixture.client.readThreadCount, 1)
+        XCTAssertEqual(fixture.client.resumeThreadCount, 0)
+        XCTAssertEqual(fixture.client.executionTurnCount, 0)
+        XCTAssertEqual(task.executionTurnID, "turn-persisted")
+        XCTAssertTrue(task.lastError?.contains("interrupted") == true)
     }
 
     func testExecutionQueueSerializesWritesToTheSameProject() async throws {
@@ -2777,6 +2922,780 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertFalse(store.oauthServersInProgress.contains("example"))
     }
 
+    func testSamePathOnTwoHostsRoutesTasksToIndependentClients() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let remoteHost = CodexHost(
+            id: "ssh:buildbox",
+            name: "Build Box",
+            kind: .ssh,
+            sshAlias: "buildbox",
+            maxConcurrentExecutions: 1
+        )
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [],
+            hosts: [.local, remoteHost],
+            manualProjects: [
+                ManualProjectReference(path: directory.path),
+                ManualProjectReference(hostID: remoteHost.id, path: directory.path)
+            ],
+            preferences: BoardPreferences()
+        ))
+        let localClient = MockCodexTaskClient(projectPath: directory.path)
+        let remoteClient = MockCodexTaskClient(projectPath: directory.path)
+        let store = BoardStore(
+            client: localClient,
+            persistence: persistence,
+            clientFactory: { host in
+                host.id == remoteHost.id ? remoteClient : localClient
+            }
+        )
+        store.start()
+
+        try await eventually { store.projects.count == 2 && store.connectedHostCount == 2 }
+        let localProject = try XCTUnwrap(store.projects.first { $0.hostID == CodexHost.localID })
+        let remoteProject = try XCTUnwrap(store.projects.first { $0.hostID == remoteHost.id })
+        XCTAssertEqual(localProject.path, remoteProject.path)
+        XCTAssertNotEqual(localProject.id, remoteProject.id)
+
+        do {
+            _ = try await store.createTask(
+                projectID: remoteProject.id,
+                title: "Remote attachment",
+                sourceKind: .issue,
+                sourceText: "Use a local file",
+                attachmentDrafts: [.file(directory.appendingPathComponent("local-only.txt"))],
+                autoRun: false
+            )
+            XCTFail("Remote tasks must reject local attachment drafts")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("上传到远程项目"))
+        }
+        do {
+            _ = try await store.createTask(
+                projectID: remoteProject.id,
+                title: "Remote worktree",
+                sourceKind: .issue,
+                sourceText: "Do not create a local worktree",
+                autoRun: false,
+                workspaceKind: .worktree
+            )
+            XCTFail("Remote tasks must reject local worktree management")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("远程任务暂不支持"))
+        }
+
+        let localSkill = CodexSkillMetadata(
+            name: "Local Skill",
+            description: "Local only",
+            shortDescription: nil,
+            path: "/local/SKILL.md",
+            scope: "user",
+            enabled: true
+        )
+        let remoteSkill = CodexSkillMetadata(
+            name: "Remote Skill",
+            description: "Remote only",
+            shortDescription: nil,
+            path: "/remote/SKILL.md",
+            scope: "user",
+            enabled: true
+        )
+        localClient.skillsCatalog = [directory.path: [localSkill]]
+        remoteClient.skillsCatalog = [directory.path: [remoteSkill]]
+        await store.refreshCapabilities(projectID: remoteProject.id, forceRefresh: true)
+        XCTAssertEqual(store.availableSkills, [remoteSkill])
+        await store.refreshCapabilities(projectID: localProject.id, forceRefresh: true)
+        XCTAssertEqual(store.availableSkills, [localSkill])
+
+        let remoteTaskID = try await store.createTask(
+            projectID: remoteProject.id,
+            title: "Remote only",
+            sourceKind: .issue,
+            sourceText: "Run this on the build box",
+            autoRun: false
+        )
+        await store.startPlanning(taskID: remoteTaskID)
+        try await eventually { remoteClient.planningTurnCount == 1 }
+        XCTAssertEqual(localClient.planningTurnCount, 0)
+        XCTAssertEqual(store.tasks.first(where: { $0.id == remoteTaskID })?.hostID, remoteHost.id)
+    }
+
+    func testSwitchingHostsClearsCatalogsAndDropsDelayedModelResponse() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let remoteHost = CodexHost(
+            id: "ssh:model-worker",
+            name: "Model Worker",
+            kind: .ssh,
+            sshAlias: "model-worker"
+        )
+        let remotePath = "/srv/model-project"
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [],
+            hosts: [.local, remoteHost],
+            manualProjects: [
+                ManualProjectReference(path: directory.path),
+                ManualProjectReference(hostID: remoteHost.id, path: remotePath)
+            ],
+            preferences: BoardPreferences()
+        ))
+        let localClient = MockCodexTaskClient(projectPath: directory.path)
+        let remoteClient = MockCodexTaskClient(projectPath: remotePath)
+        localClient.modelIDs = ["local-model"]
+        remoteClient.modelIDs = ["remote-model"]
+        let localSkill = CodexSkillMetadata(
+            name: "Local Catalog",
+            description: "Local skill",
+            shortDescription: nil,
+            path: "/local/catalog/SKILL.md",
+            scope: "user",
+            enabled: true
+        )
+        let remoteSkill = CodexSkillMetadata(
+            name: "Remote Catalog",
+            description: "Remote skill",
+            shortDescription: nil,
+            path: "/remote/catalog/SKILL.md",
+            scope: "user",
+            enabled: true
+        )
+        let localApp = CodexApp(
+            id: "local-app",
+            name: "Local App",
+            invocationName: "local_app",
+            description: "Local catalog app",
+            isAccessible: true,
+            isEnabled: true,
+            isCallable: true,
+            tools: []
+        )
+        let remoteApp = CodexApp(
+            id: "remote-app",
+            name: "Remote App",
+            invocationName: "remote_app",
+            description: "Remote catalog app",
+            isAccessible: true,
+            isEnabled: true,
+            isCallable: true,
+            tools: []
+        )
+        localClient.skillsCatalog = [directory.path: [localSkill]]
+        remoteClient.skillsCatalog = [remotePath: [remoteSkill]]
+        localClient.appsCatalog = [localApp]
+        remoteClient.appsCatalog = [remoteApp]
+        let store = BoardStore(
+            client: localClient,
+            persistence: persistence,
+            clientFactory: { host in
+                host.id == remoteHost.id ? remoteClient : localClient
+            }
+        )
+        store.start()
+        try await eventually { store.projects.count == 2 }
+        let localProject = try XCTUnwrap(store.projects.first { $0.hostID == CodexHost.localID })
+        let remoteProject = try XCTUnwrap(store.projects.first { $0.hostID == remoteHost.id })
+
+        store.selectedProjectID = localProject.id
+        try await eventually {
+            store.availableModels.map(\.model) == ["local-model"]
+                && store.availableSkills == [localSkill]
+                && store.availableApps == [localApp]
+        }
+
+        let delayedModels = AsyncGate()
+        localClient.listModelsGate = delayedModels
+        let localModelCallCount = localClient.listModelsCallCount
+        let staleRefresh = Task { @MainActor in
+            await store.refreshModels(for: localProject.id)
+        }
+        try await eventually { localClient.listModelsCallCount > localModelCallCount }
+
+        store.selectedProjectID = remoteProject.id
+        XCTAssertTrue(store.availableModels.isEmpty)
+        XCTAssertTrue(store.availableSkills.isEmpty)
+        XCTAssertTrue(store.availableApps.isEmpty)
+        try await eventually {
+            store.availableModels.map(\.model) == ["remote-model"]
+                && store.availableSkills == [remoteSkill]
+                && store.availableApps == [remoteApp]
+        }
+
+        await delayedModels.open()
+        await staleRefresh.value
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(store.availableModels.map(\.model), ["remote-model"])
+        XCTAssertEqual(store.availableSkills, [remoteSkill])
+        XCTAssertEqual(store.availableApps, [remoteApp])
+    }
+
+    func testRemovingRemoteProjectDoesNotResolveControllerSymlinks() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let controllerRealPath = directory.appendingPathComponent("real", isDirectory: true)
+        let controllerLinkPath = directory.appendingPathComponent("link", isDirectory: true)
+        let linkedChildPath = controllerLinkPath.appendingPathComponent("child", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: controllerRealPath.appendingPathComponent("child", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: controllerLinkPath,
+            withDestinationURL: controllerRealPath
+        )
+
+        var localHost = CodexHost.local
+        localHost.isEnabled = false
+        let remoteHost = CodexHost(
+            id: "ssh:path-worker",
+            name: "Path Worker",
+            kind: .ssh,
+            sshAlias: "path-worker"
+        )
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [],
+            hosts: [localHost, remoteHost],
+            manualProjects: [
+                ManualProjectReference(hostID: remoteHost.id, path: controllerRealPath.path),
+                ManualProjectReference(hostID: remoteHost.id, path: linkedChildPath.path)
+            ],
+            preferences: BoardPreferences()
+        ))
+        let localClient = MockCodexTaskClient(projectPath: directory.path)
+        localClient.historicalProjectPaths = []
+        let remoteClient = MockCodexTaskClient(projectPath: controllerRealPath.path)
+        remoteClient.historicalProjectPaths = []
+        let store = BoardStore(
+            client: localClient,
+            persistence: persistence,
+            clientFactory: { host in
+                host.id == remoteHost.id ? remoteClient : localClient
+            }
+        )
+        store.start()
+        try await eventually { store.projects.filter { $0.hostID == remoteHost.id }.count == 2 }
+
+        let realProject = try XCTUnwrap(store.projects.first {
+            $0.hostID == remoteHost.id && $0.path == controllerRealPath.path
+        })
+        store.removeProjectFromSidebar(realProject)
+        await store.refreshProjects()
+
+        XCTAssertTrue(store.visibleProjects.contains(where: {
+            $0.hostID == remoteHost.id && $0.path == linkedChildPath.path && $0.isManual
+        }))
+        XCTAssertFalse(store.visibleProjects.contains(where: { $0.id == realProject.id }))
+    }
+
+    func testSameInteractionRequestIDIsIsolatedAcrossHostsAndDisconnect() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let remoteHost = CodexHost(
+            id: "ssh:interaction-worker",
+            name: "Interaction Worker",
+            kind: .ssh,
+            sshAlias: "interaction-worker"
+        )
+        let remotePath = "/srv/interaction-project"
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [],
+            hosts: [.local, remoteHost],
+            manualProjects: [
+                ManualProjectReference(path: directory.path),
+                ManualProjectReference(hostID: remoteHost.id, path: remotePath)
+            ],
+            preferences: BoardPreferences()
+        ))
+        let localClient = MockCodexTaskClient(projectPath: directory.path)
+        let remoteClient = MockCodexTaskClient(projectPath: remotePath)
+        localClient.interactionResponseDelayMilliseconds = 250
+        remoteClient.interactionResponseDelayMilliseconds = 250
+        let store = BoardStore(
+            client: localClient,
+            persistence: persistence,
+            clientFactory: { host in
+                host.id == remoteHost.id ? remoteClient : localClient
+            }
+        )
+        store.start()
+        try await eventually { store.projects.count == 2 }
+        let localProject = try XCTUnwrap(store.projects.first { $0.hostID == CodexHost.localID })
+        let remoteProject = try XCTUnwrap(store.projects.first { $0.hostID == remoteHost.id })
+        let localTaskID = try await store.createTask(
+            projectID: localProject.id,
+            title: "Local interaction",
+            sourceKind: .issue,
+            sourceText: "Ask locally",
+            autoRun: false
+        )
+        let remoteTaskID = try await store.createTask(
+            projectID: remoteProject.id,
+            title: "Remote interaction",
+            sourceKind: .issue,
+            sourceText: "Ask remotely",
+            autoRun: false
+        )
+        await store.startPlanning(taskID: localTaskID)
+        await store.startPlanning(taskID: remoteTaskID)
+        try await eventually {
+            localClient.planningTurnCount == 1 && remoteClient.planningTurnCount == 1
+        }
+
+        let requestID = CodexRequestID.string("shared-request-id")
+        let request = CodexInteractionRequest(
+            id: requestID,
+            threadID: "thread-1",
+            turnID: "plan-1",
+            itemID: nil,
+            kind: .userInput(CodexUserInputRequest(questions: [], isBlocking: true)),
+            createdAt: Date()
+        )
+        localClient.send(.interactionRequested(request))
+        remoteClient.send(.interactionRequested(request))
+        try await eventually {
+            store.hasPendingInteraction(for: localTaskID)
+                && store.hasPendingInteraction(for: remoteTaskID)
+        }
+
+        let response = CodexInteractionResponse.userInput([:])
+        let localResponse = Task { @MainActor in
+            await store.respondToInteraction(
+                taskID: localTaskID,
+                requestID: requestID,
+                response: response
+            )
+        }
+        try await eventually { store.isResponding(taskID: localTaskID, requestID: requestID) }
+        let remoteResponse = Task { @MainActor in
+            await store.respondToInteraction(
+                taskID: remoteTaskID,
+                requestID: requestID,
+                response: response
+            )
+        }
+        try await eventually {
+            store.isResponding(taskID: localTaskID, requestID: requestID)
+                && store.isResponding(taskID: remoteTaskID, requestID: requestID)
+        }
+
+        localClient.send(.connectionLost(message: "local transport closed"))
+        await localResponse.value
+        await remoteResponse.value
+        XCTAssertEqual(localClient.interactionResponses.map(\.requestID), [requestID])
+        XCTAssertEqual(remoteClient.interactionResponses.map(\.requestID), [requestID])
+        XCTAssertFalse(store.hasPendingInteraction(for: localTaskID))
+        XCTAssertFalse(store.hasPendingInteraction(for: remoteTaskID))
+        XCTAssertEqual(store.tasks.first(where: { $0.id == localTaskID })?.stage, .needsAttention)
+        XCTAssertEqual(store.tasks.first(where: { $0.id == remoteTaskID })?.stage, .planning)
+    }
+
+    func testRemoteConnectionLossDoesNotFailLocalTaskWithSameThreadID() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let remoteHost = CodexHost(
+            id: "ssh:worker",
+            name: "Worker",
+            kind: .ssh,
+            sshAlias: "worker",
+            maxConcurrentExecutions: 1
+        )
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [],
+            hosts: [.local, remoteHost],
+            manualProjects: [
+                ManualProjectReference(path: directory.path),
+                ManualProjectReference(hostID: remoteHost.id, path: directory.path)
+            ],
+            preferences: BoardPreferences()
+        ))
+        let localClient = MockCodexTaskClient(projectPath: directory.path)
+        let remoteClient = MockCodexTaskClient(projectPath: directory.path)
+        let store = BoardStore(
+            client: localClient,
+            persistence: persistence,
+            clientFactory: { host in
+                host.id == remoteHost.id ? remoteClient : localClient
+            }
+        )
+        store.start()
+        try await eventually { store.projects.count == 2 }
+        let localProject = try XCTUnwrap(store.projects.first { $0.hostID == CodexHost.localID })
+        let remoteProject = try XCTUnwrap(store.projects.first { $0.hostID == remoteHost.id })
+
+        let localTaskID = try await store.createTask(
+            projectID: localProject.id,
+            title: "Local",
+            sourceKind: .issue,
+            sourceText: "Stay active",
+            autoRun: false
+        )
+        let remoteTaskID = try await store.createTask(
+            projectID: remoteProject.id,
+            title: "Remote",
+            sourceKind: .issue,
+            sourceText: "Lose this connection",
+            autoRun: false
+        )
+        await store.startPlanning(taskID: localTaskID)
+        await store.startPlanning(taskID: remoteTaskID)
+        try await eventually {
+            localClient.planningTurnCount == 1 && remoteClient.planningTurnCount == 1
+        }
+        XCTAssertEqual(
+            store.tasks.first(where: { $0.id == localTaskID })?.threadID,
+            store.tasks.first(where: { $0.id == remoteTaskID })?.threadID,
+            "Both app-servers intentionally return thread-1 to exercise host namespacing"
+        )
+
+        remoteClient.send(.connectionLost(message: "ssh exited"))
+        try await eventually {
+            store.tasks.first(where: { $0.id == remoteTaskID })?.stage == .needsAttention
+        }
+        XCTAssertEqual(store.tasks.first(where: { $0.id == localTaskID })?.stage, .planning)
+        XCTAssertEqual(store.hostConnectionState(for: remoteHost.id), .failed("ssh exited"))
+        XCTAssertEqual(store.hostConnectionState(for: CodexHost.localID), .connected)
+    }
+
+    func testPerHostConcurrencyCapsDifferentProjectsOnTheSameWorker() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var localHost = CodexHost.local
+        localHost.isEnabled = false
+        let remoteHost = CodexHost(
+            id: "ssh:serial-worker",
+            name: "Serial Worker",
+            kind: .ssh,
+            sshAlias: "serial-worker",
+            maxConcurrentExecutions: 1
+        )
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        var preferences = BoardPreferences()
+        preferences.maxConcurrentExecutions = 4
+        try await persistence.save(BoardSnapshot(
+            tasks: [],
+            hosts: [localHost, remoteHost],
+            manualProjects: [
+                ManualProjectReference(hostID: remoteHost.id, path: "/srv/one"),
+                ManualProjectReference(hostID: remoteHost.id, path: "/srv/two")
+            ],
+            preferences: preferences
+        ))
+        let localClient = MockCodexTaskClient(projectPath: directory.path)
+        let remoteClient = MockCodexTaskClient(projectPath: "/srv/one")
+        let store = BoardStore(
+            client: localClient,
+            persistence: persistence,
+            clientFactory: { host in
+                host.id == remoteHost.id ? remoteClient : localClient
+            }
+        )
+        store.start()
+        try await eventually { store.projects.filter { $0.hostID == remoteHost.id }.count == 2 }
+        let remoteProjects = store.projects
+            .filter { $0.hostID == remoteHost.id }
+            .sorted { $0.path < $1.path }
+
+        let firstID = try await store.createTask(
+            projectID: remoteProjects[0].id,
+            title: "First remote project",
+            sourceKind: .issue,
+            sourceText: "First change",
+            autoRun: true
+        )
+        let secondID = try await store.createTask(
+            projectID: remoteProjects[1].id,
+            title: "Second remote project",
+            sourceKind: .issue,
+            sourceText: "Second change",
+            autoRun: true
+        )
+        try await eventually { remoteClient.planningTurnCount == 2 }
+        remoteClient.send(.planFinal(threadID: "thread-1", turnID: "plan-1", text: "First plan"))
+        remoteClient.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        remoteClient.send(.planFinal(threadID: "thread-2", turnID: "plan-2", text: "Second plan"))
+        remoteClient.send(.turnCompleted(
+            threadID: "thread-2",
+            turnID: "plan-2",
+            status: "completed",
+            error: nil
+        ))
+
+        try await eventually { remoteClient.executionTurnCount == 1 }
+        XCTAssertEqual(store.tasks.count(where: { $0.stage == .executing }), 1)
+        XCTAssertEqual(store.tasks.count(where: { $0.stage == .awaitingApproval }), 1)
+
+        remoteClient.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "execute-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually { remoteClient.executionTurnCount == 2 }
+        XCTAssertEqual(store.tasks.first(where: { $0.id == firstID })?.stage, .review)
+        XCTAssertEqual(store.tasks.first(where: { $0.id == secondID })?.stage, .executing)
+    }
+
+    func testDisablingIdleHostClosesOnlyItsTransport() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let remoteHost = CodexHost(
+            id: "ssh:idle-worker",
+            name: "Idle Worker",
+            kind: .ssh,
+            sshAlias: "idle-worker"
+        )
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [],
+            hosts: [.local, remoteHost],
+            manualProjects: [],
+            preferences: BoardPreferences()
+        ))
+        let localClient = MockCodexTaskClient(projectPath: directory.path)
+        let remoteClient = MockCodexTaskClient(projectPath: "/srv/idle")
+        let store = BoardStore(
+            client: localClient,
+            persistence: persistence,
+            clientFactory: { host in
+                host.id == remoteHost.id ? remoteClient : localClient
+            }
+        )
+        store.start()
+        try await eventually { store.connectedHostCount == 2 }
+
+        store.setHostEnabled(id: remoteHost.id, enabled: false)
+        try await eventually { remoteClient.disconnectCount == 1 }
+        XCTAssertEqual(localClient.disconnectCount, 0)
+        XCTAssertEqual(store.hostConnectionState(for: remoteHost.id), .disconnected)
+        XCTAssertTrue(store.host(for: CodexHost.localID)?.isEnabled == true)
+    }
+
+    func testRemovingHostDuringRefreshDoesNotRestoreGhostProjects() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let remoteHost = CodexHost(
+            id: "ssh:slow-worker",
+            name: "Slow Worker",
+            kind: .ssh,
+            sshAlias: "slow-worker"
+        )
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [],
+            hosts: [.local, remoteHost],
+            manualProjects: [ManualProjectReference(path: directory.path)],
+            preferences: BoardPreferences()
+        ))
+        let localClient = MockCodexTaskClient(projectPath: directory.path)
+        let remoteClient = MockCodexTaskClient(projectPath: "/srv/ghost-project")
+        let remoteListGate = AsyncGate()
+        remoteClient.listThreadsGate = remoteListGate
+        let store = BoardStore(
+            client: localClient,
+            persistence: persistence,
+            clientFactory: { host in
+                host.id == remoteHost.id ? remoteClient : localClient
+            }
+        )
+        store.start()
+        try await eventually { remoteClient.listThreadsCallCount > 0 }
+
+        XCTAssertTrue(store.removeHost(id: remoteHost.id))
+        await remoteListGate.open()
+
+        try await eventually(timeout: 3) {
+            !store.isRefreshingProjects
+                && store.projects.contains(where: { $0.hostID == CodexHost.localID })
+                && !store.projects.contains(where: { $0.hostID == remoteHost.id })
+        }
+        XCTAssertNil(store.host(for: remoteHost.id))
+        XCTAssertEqual(remoteClient.disconnectCount, 1)
+    }
+
+    func testContinueReconcilesCompletedTurnWithoutDuplicateExecution() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Recover completed",
+            sourceKind: .issue,
+            sourceText: "Do not duplicate this change",
+            autoRun: true
+        )
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Safe plan"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually { fixture.client.executionTurnCount == 1 }
+        fixture.client.threadDetails["thread-1"] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            turnID: "execute-1",
+            status: "completed",
+            finalText: "Recovered final result"
+        )
+        fixture.client.send(.connectionLost(message: "temporary disconnect"))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+
+        fixture.store.continueExecution(taskID: taskID)
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .review
+        }
+        XCTAssertEqual(fixture.client.executionTurnCount, 1)
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == taskID })?.resultText,
+            "Recovered final result"
+        )
+    }
+
+    func testContinueReattachesInProgressTurnWithoutDuplicateExecution() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Recover running",
+            sourceKind: .issue,
+            sourceText: "Keep following the existing turn",
+            autoRun: true
+        )
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Safe plan"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually { fixture.client.executionTurnCount == 1 }
+        fixture.client.threadDetails["thread-1"] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            turnID: "execute-1",
+            status: "inProgress"
+        )
+        fixture.client.send(.connectionLost(message: "temporary disconnect"))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+
+        fixture.store.continueExecution(taskID: taskID)
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .executing
+                && fixture.store.tasks.first(where: { $0.id == taskID })?.liveMessage.contains("重新连接") == true
+        }
+        XCTAssertEqual(fixture.client.executionTurnCount, 1)
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == taskID })?.executionTurnID,
+            "execute-1"
+        )
+    }
+
+    private func makeThreadDetail(
+        cwd: String,
+        threadID: String = "thread-1",
+        turnID: String,
+        status: String,
+        finalText: String? = nil
+    ) -> CodexThreadDetail {
+        CodexThreadDetail(
+            summary: CodexThreadSummary(
+                id: threadID,
+                sessionID: "session-1",
+                cwd: cwd,
+                name: "Fixture",
+                createdAt: Date(),
+                updatedAt: Date(),
+                isPinned: false,
+                statusType: "active",
+                sourceKind: "appServer"
+            ),
+            turns: [CodexThreadTurn(
+                id: turnID,
+                status: status,
+                items: finalText.map {
+                    [CodexThreadItem(id: "agent-final", type: "agentMessage", text: $0, status: nil)]
+                } ?? [],
+                error: nil,
+                startedAt: nil,
+                completedAt: nil,
+                durationMilliseconds: nil
+            )]
+        )
+    }
+
+    private func persistedExecutionFixture(
+        status: String,
+        finalText: String? = nil
+    ) async throws -> (
+        directory: URL,
+        taskID: UUID,
+        client: MockCodexTaskClient,
+        store: BoardStore
+    ) {
+        let directory = try temporaryDirectory()
+        let threadID = "thread-persisted"
+        let turnID = "turn-persisted"
+        let task = BoardTask(
+            projectID: directory.path,
+            title: "Persisted execution",
+            sourceKind: .issue,
+            sourceText: "Recover this turn safely",
+            stage: .executing,
+            autoRun: true,
+            executionApproved: true,
+            planText: "Persisted plan",
+            hasFinalPlan: true,
+            threadID: threadID,
+            sessionID: "session-before-relaunch",
+            executionTurnID: turnID
+        )
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [task],
+            hosts: [.local],
+            manualProjects: [ManualProjectReference(path: directory.path)],
+            preferences: BoardPreferences()
+        ))
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        client.threadDetails[threadID] = makeThreadDetail(
+            cwd: directory.path,
+            threadID: threadID,
+            turnID: turnID,
+            status: status,
+            finalText: finalText
+        )
+        return (
+            directory: directory,
+            taskID: task.id,
+            client: client,
+            store: BoardStore(client: client, persistence: persistence)
+        )
+    }
+
     private func eventually(
         timeout: TimeInterval = 2,
         file: StaticString = #filePath,
@@ -2919,6 +3838,9 @@ private final class MockCodexTaskClient: CodexTaskClient {
     var planningCalls: [MockTurnCall] = []
     var executionCalls: [MockTurnCall] = []
     var planningFailures: [MockClientError] = []
+    var modelIDs = ["gpt-test"]
+    var listModelsCallCount = 0
+    var listModelsGate: AsyncGate?
     var skillsCatalog: [String: [CodexSkillMetadata]] = [:]
     var appsCatalog: [CodexApp] = []
     var appListThreadIDs: [String?] = []
@@ -2932,6 +3854,13 @@ private final class MockCodexTaskClient: CodexTaskClient {
     var interruptCalls: [(threadID: String, turnID: String)] = []
     var interruptFailures: [MockClientError] = []
     private var modelsByThreadID: [String: String] = [:]
+    var disconnectCount = 0
+    var listThreadsCallCount = 0
+    var readThreadCount = 0
+    var resumeThreadCount = 0
+    var planningTurnError: Error?
+    var listThreadsGate: AsyncGate?
+    var threadDetails: [String: CodexThreadDetail] = [:]
 
     init(projectPath: String) {
         self.projectPath = projectPath
@@ -2943,24 +3872,34 @@ private final class MockCodexTaskClient: CodexTaskClient {
 
     func send(_ event: CodexEvent) { continuation.yield(event) }
     func connect() async throws {}
+    func disconnect() {
+        disconnectCount += 1
+        connectionState = .disconnected
+    }
     func verifyAccount() async throws -> Bool { true }
     func listModels() async throws -> [CodexModel] {
-        [CodexModel(
-            id: "gpt-test",
-            model: "gpt-test",
-            displayName: "GPT Test",
-            description: "Mock model",
-            isDefault: true,
-            defaultReasoningEffort: .medium,
-            supportedReasoningEfforts: ReasoningEffort.standardCases.map {
-                CodexReasoningEffortOption(effort: $0, description: $0.rawValue)
-            },
-            serviceTiers: [CodexModelServiceTier(
-                id: "priority",
-                name: "Fast",
-                description: "Mock priority tier"
-            )]
-        )]
+        listModelsCallCount += 1
+        if let listModelsGate {
+            await listModelsGate.wait()
+        }
+        return modelIDs.enumerated().map { index, modelID in
+            CodexModel(
+                id: modelID,
+                model: modelID,
+                displayName: modelID,
+                description: "Mock model",
+                isDefault: index == 0,
+                defaultReasoningEffort: .medium,
+                supportedReasoningEfforts: ReasoningEffort.standardCases.map {
+                    CodexReasoningEffortOption(effort: $0, description: $0.rawValue)
+                },
+                serviceTiers: [CodexModelServiceTier(
+                    id: "priority",
+                    name: "Fast",
+                    description: "Mock priority tier"
+                )]
+            )
+        }
     }
     func listSkills(cwds: [String], forceReload: Bool) async throws -> [String: [CodexSkillMetadata]] {
         skillsCatalog
@@ -2990,7 +3929,11 @@ private final class MockCodexTaskClient: CodexTaskClient {
         interactionResponses.append((requestID, response))
     }
     func listThreads(cursor: String?, archived: Bool) async throws -> CodexThreadPage {
-        CodexThreadPage(
+        listThreadsCallCount += 1
+        if let listThreadsGate {
+            await listThreadsGate.wait()
+        }
+        return CodexThreadPage(
             threads: historicalProjectPaths.enumerated().map { index, path in
                 CodexThreadSummary(
                     id: "history-\(index)",
@@ -3006,6 +3949,13 @@ private final class MockCodexTaskClient: CodexTaskClient {
             },
             nextCursor: nil
         )
+    }
+    func readThread(threadID: String, includeTurns: Bool) async throws -> CodexThreadDetail {
+        readThreadCount += 1
+        guard let detail = threadDetails[threadID] else {
+            throw CodexClientError.invalidResponse("Missing mock thread detail")
+        }
+        return detail
     }
     func startThread(
         cwd: String,
@@ -3035,7 +3985,8 @@ private final class MockCodexTaskClient: CodexTaskClient {
         )
     }
     func resumeThread(threadID: String, cwd: String) async throws -> CodexStartedThread {
-        CodexStartedThread(
+        resumeThreadCount += 1
+        return CodexStartedThread(
             threadID: threadID,
             sessionID: "session-1",
             model: modelsByThreadID[threadID] ?? "gpt-test",
@@ -3064,6 +4015,7 @@ private final class MockCodexTaskClient: CodexTaskClient {
         if planningTurnDelayMilliseconds > 0 {
             try await Task.sleep(for: .milliseconds(planningTurnDelayMilliseconds))
         }
+        if let planningTurnError { throw planningTurnError }
         if !planningFailures.isEmpty {
             throw planningFailures.removeFirst()
         }
@@ -3095,6 +4047,26 @@ private final class MockCodexTaskClient: CodexTaskClient {
         if !interruptFailures.isEmpty {
             throw interruptFailures.removeFirst()
         }
+    }
+}
+
+private actor AsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let continuations = waiters
+        waiters.removeAll()
+        continuations.forEach { $0.resume() }
     }
 }
 

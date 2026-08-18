@@ -8,7 +8,7 @@
 
 ![CodexBoard — every task has a state, every change has a gate](docs/assets/codexboard-hero-en.png)
 
-CodexBoard turns disconnected Codex sessions into a visible, governed delivery workflow. It discovers local projects, keeps planning read-only, pauses at deliberate approval gates, runs changes in isolated worktrees, and brings evidence, diffs, and review history back to one task card.
+CodexBoard turns disconnected Codex sessions into a visible, governed delivery workflow. It discovers local projects and projects on headless SSH hosts, keeps planning read-only, pauses at deliberate approval gates, runs changes with explicit workspace boundaries, and brings evidence, diffs, and review history back to one task card.
 
 > CodexBoard is under active development. The current build is local and ad-hoc signed; there is no notarized public release yet.
 
@@ -31,6 +31,7 @@ CodexBoard turns disconnected Codex sessions into a visible, governed delivery w
 ## Highlights
 
 - Multi-project kanban for Inbox, Planning, Approval, Execution, Review, Completed, and Needs Attention.
+- One board for the local Mac and multiple headless SSH hosts, with host-qualified projects, per-host concurrency, isolated failures, and reconnect reconciliation.
 - Git-root project discovery with a sidebar refresh action; non-Git folders remain available through explicit manual addition.
 - Persistently remove projects from the sidebar without deleting folders, Codex threads, tasks, or attachments; add the folder again to restore it.
 - Task-scoped model, reasoning effort, and Fast configuration that stays fixed across planning and execution.
@@ -38,12 +39,15 @@ CodexBoard turns disconnected Codex sessions into a visible, governed delivery w
 - Human-in-the-loop command, file, permission, user-input, MCP form, URL, and OAuth flows.
 - Isolated Git worktrees, safe cleanup, dependency handoffs, controlled concurrency, and retry circuit breakers.
 - English and Simplified Chinese UI, with system-following or explicit language selection in Settings.
+- GPT Live requirement capture by voice or text. It can propose editable drafts, but only an explicit user confirmation creates ordinary board tasks.
 
 ## Requirements
 
 - macOS 14 or later.
 - Swift 6 / a compatible Xcode toolchain for source builds.
 - Codex CLI installed and signed in, or a trusted Codex application that provides a usable Codex executable.
+
+For a remote host, configure a concrete alias in `~/.ssh/config`, install and sign in to Codex on that host, and verify that its non-interactive SSH environment can find `codex`. Settings → Hosts contains a three-step guide with copyable commands. CodexBoard uses the system SSH client and never stores private keys or passwords.
 
 CodexBoard never reads or copies `~/.codex/auth.json`; it launches the local `codex app-server` and naturally reuses its current authentication and configuration.
 
@@ -79,6 +83,12 @@ swift test
 
 The SwiftUI interface is coordinated by `BoardStore`; `CodexAppServerClient` speaks the local app-server protocol; `ProjectDiscoveryService` groups conversations by Git root while filtering ordinary session folders and CodexBoard-managed worktrees; `WorktreeManager`, `BoardPersistence`, and `AttachmentStorage` keep execution, snapshots, and imported images bounded and recoverable.
 
+## Remote hosts and GPT Live
+
+Each project, task, thread, and turn is qualified by its host. Identical paths on different servers remain independent. SSH connections carry app-server stdio without exposing an app-server port; after reconnecting, CodexBoard reads the existing turn before deciding whether to resume, recover a completed result, or stop for attention.
+
+The GPT Live toolbar action starts a dedicated local Realtime session for the selected project. An OpenAI Platform API key may be kept in the macOS Keychain and is injected only into that dedicated local child process. It is never stored in the board snapshot, copied into Codex authentication files, or forwarded to SSH hosts. The Realtime app-server API is experimental.
+
 ## Security boundaries
 
 - Read-only planning with no network access.
@@ -88,6 +98,8 @@ The SwiftUI interface is coordinated by `BoardStore`; `CodexAppServerClient` spe
 - OAuth and MCP URLs open only after a user action and must use HTTP(S).
 - Secret answers and pending interactions are runtime-only and never persisted to `board.json`.
 - Dirty or unmanaged worktrees are never forcibly deleted.
+- Remote tasks cannot use a Mac-local worktree or attachment path. Until file upload is implemented, put required files on the remote host and reference their paths in the task description.
+- `/` is never accepted as a task workspace, and ambiguous reconnect state fails closed to avoid duplicate side effects.
 
 ## Current limitations
 

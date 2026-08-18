@@ -15,7 +15,10 @@ struct TaskInspector: View {
                         ForEach(store.interactions(for: task.id)) { request in
                             TaskInteractionPanel(
                                 request: request,
-                                isResponding: store.respondingRequestIDs.contains(request.id),
+                                isResponding: store.isResponding(
+                                    taskID: task.id,
+                                    requestID: request.id
+                                ),
                                 errorMessage: task.lastError,
                                 respond: { response in
                                     Task {
@@ -77,6 +80,10 @@ struct TaskInspector: View {
                 Label(task.stage.title, systemImage: task.stage.symbol)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(BoardTheme.color(for: task.stage))
+                Label(store.hostName(for: task.hostID), systemImage: "server.rack")
+                    .font(.caption)
+                    .foregroundStyle(store.hostConnectionState(for: task.hostID).hostStatusColor)
+                    .help(store.hostConnectionState(for: task.hostID).hostStatusDetail)
                 Spacer()
                 if task.autoRun {
                     Label("全自动", systemImage: "bolt.fill")
@@ -439,7 +446,9 @@ struct TaskInspector: View {
         inspectorSection("附件", systemImage: "paperclip") {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(task.attachments) { attachment in
-                    let exists = FileManager.default.isReadableFile(atPath: attachment.path)
+                    let isLocalAttachment = store.isLocalHost(task.hostID)
+                    let exists = isLocalAttachment
+                        && FileManager.default.isReadableFile(atPath: attachment.path)
                     HStack(spacing: 8) {
                         Image(systemName: exists ? attachment.kind.symbol : "exclamationmark.triangle")
                             .foregroundStyle(exists ? BoardTheme.accent : BoardTheme.danger)
@@ -453,7 +462,10 @@ struct TaskInspector: View {
                                     Text("·")
                                     Text(ByteCountFormatter.string(fromByteCount: byteCount, countStyle: .file))
                                 }
-                                if !exists {
+                                if !isLocalAttachment {
+                                    Text("· 远程附件不可在本机打开")
+                                        .foregroundStyle(BoardTheme.danger)
+                                } else if !exists {
                                     Text("· 文件缺失或不可读")
                                         .foregroundStyle(BoardTheme.danger)
                                 }
@@ -463,7 +475,7 @@ struct TaskInspector: View {
                         }
                         Spacer()
                         Button {
-                            store.revealAttachment(attachment)
+                            store.revealAttachment(attachment, for: task)
                         } label: {
                             Image(systemName: "folder")
                         }
@@ -511,6 +523,8 @@ struct TaskInspector: View {
     private func sessionSection(_ task: BoardTask) -> some View {
         inspectorSection("Codex 会话", systemImage: "terminal") {
             VStack(alignment: .leading, spacing: 7) {
+                metadata("主机", store.hostName(for: task.hostID))
+                metadata("连接", store.hostConnectionState(for: task.hostID).hostStatusTitle)
                 metadata("请求模型", task.requestedModel.isEmpty ? "由本机 Codex 选择" : task.requestedModel)
                 metadata("实际模型", task.actualModel ?? "尚未启动")
                 metadata("推理强度", "\(task.reasoningEffort.title) · \(task.reasoningEffort.rawValue)")

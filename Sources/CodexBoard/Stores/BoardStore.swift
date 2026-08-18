@@ -7,6 +7,8 @@ enum BoardStoreError: LocalizedError {
     case emptyTask
     case worktreeRequiresGit
     case invalidDependencies
+    case remoteAttachmentsUnsupported
+    case remoteWorktreeUnsupported
 
     var errorDescription: String? {
         switch self {
@@ -14,9 +16,15 @@ enum BoardStoreError: LocalizedError {
         case .emptyTask: "请输入任务内容或至少添加一个附件。"
         case .worktreeRequiresGit: "独立 Worktree 只能用于 Git 项目。"
         case .invalidDependencies: "前置任务必须存在于同一个项目中。"
+        case .remoteAttachmentsUnsupported:
+            "远程任务不能直接使用这台 Mac 上的附件；请先把文件上传到远程项目，再在任务描述中填写远程路径。"
+        case .remoteWorktreeUnsupported:
+            "远程任务暂不支持由 CodexBoard 创建本地 Worktree；请选择项目主目录。"
         }
     }
 }
+
+typealias CodexTaskClientFactory = @MainActor (CodexHost) -> any CodexTaskClient
 
 private enum BoardStoreOAuthError: LocalizedError {
     case cannotOpenBrowser
@@ -37,36 +45,65 @@ private struct PendingStreamUpdate {
 }
 
 private struct InteractionAttentionKey: Hashable {
+    let hostID: String
     let taskID: UUID
     let requestID: CodexRequestID
+}
+
+private struct HostRequestKey: Hashable {
+    let hostID: String
+    let requestID: CodexRequestID
+}
+
+private struct HostServerKey: Hashable {
+    let hostID: String
+    let serverName: String
 }
 
 @MainActor
 @Observable
 final class BoardStore {
+    private struct HostRefreshResult: Sendable {
+        let hostID: String
+        let projects: [ProjectRecord]
+        let connectionState: CodexConnectionState
+        let errorDescription: String?
+    }
+
     private(set) var projects: [ProjectRecord] = []
     private(set) var tasks: [BoardTask] = [] {
         didSet { synchronizeTaskProjections() }
     }
     private(set) var taskCards: [BoardTaskCard] = []
     private(set) var selectedTask: BoardTask?
+    private(set) var hosts: [CodexHost] = [.local]
+    private(set) var hostConnectionStates: [String: CodexConnectionState] = [
+        CodexHost.localID: .disconnected
+    ]
+    private(set) var sshHostSuggestions: [String] = []
     var preferences = BoardPreferences()
     var selectedProjectID: String? {
         didSet {
             guard selectedProjectID != oldValue else { return }
+            capabilityRefreshTask?.cancel()
+            modelRefreshGeneration &+= 1
+            capabilityRefreshGeneration &+= 1
+            modelCatalogHostID = nil
+            modelCatalogProjectID = nil
+            capabilityProjectID = nil
+            availableModels = []
+            availableSkills = []
+            availableApps = []
+            isLoadingModels = false
+            isLoadingCapabilities = false
+            modelCatalogError = nil
+            capabilityCatalogError = nil
             if let selectedTaskID,
                tasks.first(where: { $0.id == selectedTaskID })?.projectID != selectedProjectID {
                 self.selectedTaskID = nil
             }
             if let selectedProjectID {
                 scheduleCapabilityRefresh(projectID: selectedProjectID, forceRefresh: false)
-            } else {
-                capabilityRefreshTask?.cancel()
-                capabilityRefreshGeneration &+= 1
-                capabilityProjectID = nil
-                availableSkills = []
-                isLoadingCapabilities = false
-                capabilityCatalogError = nil
             }
         }
     }
@@ -97,6 +134,8 @@ final class BoardStore {
     private(set) var oauthServersInProgress = Set<String>()
 
     @ObservationIgnored
+    // Kept as the local client for source compatibility with existing tests and
+    // integrations. Remote work is routed through the host-scoped client pool.
     let client: any CodexTaskClient
     @ObservationIgnored
     private let persistence: any BoardPersisting
@@ -109,11 +148,17 @@ final class BoardStore {
     @ObservationIgnored
     private let externalURLOpener: (URL) -> Bool
     @ObservationIgnored
-    private var manualProjectPaths: [String] = []
+    private let sshDiscovery: SSHHostDiscoveryService
+    @ObservationIgnored
+    private let clientFactory: CodexTaskClientFactory
+    @ObservationIgnored
+    private var clients: [String: any CodexTaskClient]
+    @ObservationIgnored
+    private var manualProjects: [ManualProjectReference] = []
     @ObservationIgnored
     private var hiddenProjectPaths = Set<String>()
     @ObservationIgnored
-    private var eventTask: Task<Void, Never>?
+    private var eventTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored
     private var saveTask: Task<Void, Never>?
     @ObservationIgnored
@@ -122,6 +167,12 @@ final class BoardStore {
     private var capabilityRefreshGeneration = 0
     @ObservationIgnored
     private var capabilityProjectID: String?
+    @ObservationIgnored
+    private var modelRefreshGeneration = 0
+    @ObservationIgnored
+    private var modelCatalogHostID: String?
+    @ObservationIgnored
+    private var modelCatalogProjectID: String?
     @ObservationIgnored
     private var mcpRefreshGeneration = 0
     @ObservationIgnored
@@ -151,7 +202,15 @@ final class BoardStore {
     @ObservationIgnored
     private var interactionAttentionIDs: [InteractionAttentionKey: UUID] = [:]
     @ObservationIgnored
+    private var respondingRequests = Set<HostRequestKey>()
+    @ObservationIgnored
+    private var oauthRequestsInProgress = Set<HostServerKey>()
+    @ObservationIgnored
     private var planAttentionIDs: [UUID: UUID] = [:]
+    @ObservationIgnored
+    private var shouldRefreshProjectsAgain = false
+    @ObservationIgnored
+    private var hostConfigurationGeneration = 0
 
     init(
         client: any CodexTaskClient = CodexAppServerClient(),
@@ -159,7 +218,9 @@ final class BoardStore {
         discovery: ProjectDiscoveryService = ProjectDiscoveryService(),
         attachmentStorage: AttachmentStorage = AttachmentStorage(),
         worktreeManager: any WorktreeManaging = WorktreeManager(),
-        externalURLOpener: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) }
+        externalURLOpener: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
+        sshDiscovery: SSHHostDiscoveryService = SSHHostDiscoveryService(),
+        clientFactory: CodexTaskClientFactory? = nil
     ) {
         self.client = client
         self.persistence = persistence
@@ -167,10 +228,22 @@ final class BoardStore {
         self.attachmentStorage = attachmentStorage
         self.worktreeManager = worktreeManager
         self.externalURLOpener = externalURLOpener
+        self.sshDiscovery = sshDiscovery
+        self.clients = [CodexHost.localID: client]
+        self.clientFactory = clientFactory ?? { host in
+            switch host.kind {
+            case .local:
+                return client
+            case .ssh:
+                return CodexAppServerClient(
+                    launchMode: .ssh(hostAlias: host.sshAlias ?? "")
+                )
+            }
+        }
     }
 
     deinit {
-        eventTask?.cancel()
+        eventTasks.values.forEach { $0.cancel() }
         saveTask?.cancel()
         capabilityRefreshTask?.cancel()
         streamFlushTask?.cancel()
@@ -184,8 +257,16 @@ final class BoardStore {
     var visibleProjects: [ProjectRecord] {
         projects.filter { project in
             (project.isManual || !hiddenProjectPaths.contains(project.id))
-                && (preferences.showMissingProjects || project.existsOnDisk)
+                && (preferences.showMissingProjects || !isLocalHost(project.hostID) || project.existsOnDisk)
         }
+    }
+
+    var enabledHosts: [CodexHost] {
+        hosts.filter(\.isEnabled)
+    }
+
+    var connectedHostCount: Int {
+        enabledHosts.count { hostConnectionState(for: $0.id).isConnected }
     }
 
     var filteredTaskCards: [BoardTaskCard] {
@@ -243,6 +324,28 @@ final class BoardStore {
             ?? URL(fileURLWithPath: task.projectID).lastPathComponent
     }
 
+    func host(for hostID: String) -> CodexHost? {
+        hosts.first(where: { $0.id == hostID })
+    }
+
+    func hostName(for hostID: String) -> String {
+        host(for: hostID)?.name ?? hostID
+    }
+
+    func isLocalHost(_ hostID: String) -> Bool {
+        hostID == CodexHost.localID
+    }
+
+    func hostConnectionState(for hostID: String) -> CodexConnectionState {
+        hostConnectionStates[hostID] ?? .disconnected
+    }
+
+    func isProjectRunnable(_ project: ProjectRecord) -> Bool {
+        project.path != "/"
+            && project.existsOnDisk
+            && host(for: project.hostID)?.isEnabled == true
+    }
+
     func dependencyCandidates(for projectID: String) -> [BoardTask] {
         tasks
             .filter { $0.projectID == projectID }
@@ -276,13 +379,17 @@ final class BoardStore {
         !(pendingInteractionsByTaskID[taskID]?.isEmpty ?? true)
     }
 
+    func isResponding(taskID: UUID, requestID: CodexRequestID) -> Bool {
+        guard let hostID = tasks.first(where: { $0.id == taskID })?.hostID else { return false }
+        return respondingRequests.contains(HostRequestKey(hostID: hostID, requestID: requestID))
+    }
+
     func respondToInteraction(
         taskID: UUID,
         requestID: CodexRequestID,
         response: CodexInteractionResponse
     ) async {
-        guard let request = pendingInteractionsByTaskID[taskID]?.first(where: { $0.id == requestID }),
-              !respondingRequestIDs.contains(requestID)
+        guard let request = pendingInteractionsByTaskID[taskID]?.first(where: { $0.id == requestID })
         else { return }
         guard let task = tasks.first(where: { $0.id == taskID }),
               task.threadID == request.threadID
@@ -290,11 +397,16 @@ final class BoardStore {
             removeInteraction(taskID: taskID, requestID: requestID)
             return
         }
+        let responseKey = HostRequestKey(hostID: task.hostID, requestID: requestID)
+        guard !respondingRequests.contains(responseKey) else { return }
 
-        respondingRequestIDs.insert(requestID)
-        defer { respondingRequestIDs.remove(requestID) }
+        setResponding(true, key: responseKey)
+        defer { setResponding(false, key: responseKey) }
         do {
-            try await client.respond(to: requestID, with: response)
+            guard let host = host(for: task.hostID), host.isEnabled else {
+                throw CodexClientError.invalidResponse("任务主机已停用或不再存在")
+            }
+            try await clientForHost(host).respond(to: requestID, with: response)
             removeInteraction(taskID: taskID, requestID: requestID)
             if let index = taskIndex(taskID), tasks[index].stage.isActive {
                 tasks[index].lastError = nil
@@ -336,70 +448,128 @@ final class BoardStore {
     func start() {
         guard !didStart else { return }
         didStart = true
-        eventTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            for await event in self.client.events {
-                guard !Task.isCancelled else { break }
-                self.handle(event)
-            }
-        }
+        subscribeToEvents(hostID: CodexHost.localID, client: client)
         Task { @MainActor [weak self] in
             await self?.loadAndConnect()
         }
     }
 
     func refreshProjects() async {
-        guard !isRefreshingProjects else { return }
-        isRefreshingProjects = true
-        statusMessage = "正在扫描本机 Codex 项目…"
-        defer { isRefreshingProjects = false }
-        do {
-            try await client.connect()
-            accountReady = try await client.verifyAccount()
-            await refreshModels()
-            var threads: [CodexThreadSummary] = []
-            for archived in [false, true] {
-                var cursor: String?
-                repeat {
-                    let page = try await client.listThreads(cursor: cursor, archived: archived)
-                    threads.append(contentsOf: page.threads)
-                    cursor = page.nextCursor
-                } while cursor != nil
-            }
-            projects = await discovery.discover(
-                threads: threads,
-                manualPaths: manualProjectPaths,
-                ignoredPaths: managedWorktreePaths
-            )
-            reconcileManualProjectVisibility()
-            selectInitialProjectIfNeeded()
-            statusMessage = "已载入 \(visibleProjects.count) 个项目"
-            lastError = nil
-        } catch {
-            accountReady = false
-            lastError = error.localizedDescription
-            statusMessage = "项目扫描失败"
-            projects = await discovery.discover(
-                threads: [],
-                manualPaths: manualProjectPaths,
-                ignoredPaths: managedWorktreePaths
-            )
-            reconcileManualProjectVisibility()
-            selectInitialProjectIfNeeded()
+        guard !isRefreshingProjects else {
+            shouldRefreshProjectsAgain = true
+            return
         }
+        isRefreshingProjects = true
+        let refreshGeneration = hostConfigurationGeneration
+        statusMessage = "正在扫描 \(enabledHosts.count) 台 Codex 主机…"
+        defer {
+            isRefreshingProjects = false
+            if shouldRefreshProjectsAgain {
+                shouldRefreshProjectsAgain = false
+                Task { @MainActor [weak self] in await self?.refreshProjects() }
+            }
+        }
+
+        let hostSnapshot = hosts
+        let manualProjectSnapshot = manualProjects
+        for host in hostSnapshot {
+            hostConnectionStates[host.id] = host.isEnabled ? .connecting : .disconnected
+        }
+        let operations = hostSnapshot.map { host in
+            let manualPaths = manualProjectSnapshot
+                .filter { $0.hostID == host.id }
+                .map(\.path)
+            return Task { @MainActor [weak self] in
+                guard let self else {
+                    return HostRefreshResult(
+                        hostID: host.id,
+                        projects: [],
+                        connectionState: .disconnected,
+                        errorDescription: nil
+                    )
+                }
+                return await self.refreshHost(host, manualPaths: manualPaths)
+            }
+        }
+        var results: [HostRefreshResult] = []
+        results.reserveCapacity(operations.count)
+        for operation in operations {
+            results.append(await operation.value)
+        }
+
+        guard refreshGeneration == hostConfigurationGeneration else {
+            shouldRefreshProjectsAgain = true
+            return
+        }
+        var refreshedProjects: [ProjectRecord] = []
+        var errors: [String] = []
+        for result in results {
+            guard let currentHost = host(for: result.hostID) else { continue }
+            hostConnectionStates[result.hostID] = result.connectionState
+            refreshedProjects.append(contentsOf: result.projects)
+            if let errorDescription = result.errorDescription {
+                errors.append("\(currentHost.name)：\(errorDescription)")
+            }
+        }
+        projects = refreshedProjects.sorted(by: projectSortOrder)
+        accountReady = connectedHostCount > 0
+        selectInitialProjectIfNeeded()
+        if errors.isEmpty {
+            lastError = nil
+            statusMessage = "已连接 \(connectedHostCount) 台主机，载入 \(projects.count) 个项目"
+        } else {
+            lastError = errors.joined(separator: "\n")
+            statusMessage = "已连接 \(connectedHostCount)/\(enabledHosts.count) 台主机"
+        }
+        reconcileManualProjectVisibility()
         if let selectedProjectID {
             scheduleCapabilityRefresh(projectID: selectedProjectID, forceRefresh: false)
         }
     }
 
-    func refreshModels() async {
-        guard !isLoadingModels else { return }
+    func refreshModels(for projectID: String? = nil) async {
+        let targetProjectID = projectID ?? selectedProjectID
+        if let targetProjectID, selectedProjectID != targetProjectID {
+            return
+        }
+        let hostID = targetProjectID.flatMap { id in
+            projects.first(where: { $0.id == id })?.hostID
+        } ?? CodexHost.localID
+        modelRefreshGeneration &+= 1
+        let generation = modelRefreshGeneration
+        guard let host = host(for: hostID), host.isEnabled else {
+            availableModels = []
+            modelCatalogHostID = nil
+            modelCatalogProjectID = nil
+            modelCatalogError = "所选项目的主机已停用或不再存在。"
+            return
+        }
         isLoadingModels = true
-        defer { isLoadingModels = false }
+        modelCatalogError = nil
+        defer {
+            if modelRefreshGeneration == generation {
+                isLoadingModels = false
+            }
+        }
         do {
-            availableModels = try await client.listModels()
-            modelCatalogError = availableModels.isEmpty ? "本机 Codex 未返回可用模型。" : nil
+            let hostClient = clientForHost(host)
+            try await hostClient.connect()
+            let models = try await hostClient.listModels()
+            guard !Task.isCancelled,
+                  modelRefreshGeneration == generation,
+                  selectedProjectID == targetProjectID
+            else { return }
+            availableModels = models
+            modelCatalogHostID = hostID
+            modelCatalogProjectID = targetProjectID
+            modelCatalogError = models.isEmpty ? "\(host.name) Codex 未返回可用模型。" : nil
         } catch {
+            guard modelRefreshGeneration == generation,
+                  selectedProjectID == targetProjectID
+            else { return }
+            availableModels = []
+            modelCatalogHostID = nil
+            modelCatalogProjectID = nil
             modelCatalogError = error.localizedDescription
         }
     }
@@ -419,6 +589,7 @@ final class BoardStore {
         capabilityProjectID = projectID
         if projectChanged {
             availableSkills = []
+            availableApps = []
         }
         isLoadingCapabilities = true
         capabilityCatalogError = nil
@@ -428,8 +599,13 @@ final class BoardStore {
             }
         }
 
+        guard let host = host(for: project.hostID), host.isEnabled else {
+            capabilityCatalogError = "所选项目的主机已停用或不再存在。"
+            return
+        }
+        let hostClient = clientForHost(host)
         do {
-            try await client.connect()
+            try await hostClient.connect()
         } catch {
             guard capabilityRefreshGeneration == generation else { return }
             capabilityCatalogError = error.localizedDescription
@@ -440,7 +616,7 @@ final class BoardStore {
         var nextApps: [CodexApp]?
         var errors: [String] = []
         do {
-            let skillsByCWD = try await client.listSkills(
+            let skillsByCWD = try await hostClient.listSkills(
                 cwds: [project.path],
                 forceReload: forceRefresh
             )
@@ -450,7 +626,7 @@ final class BoardStore {
         }
         guard !Task.isCancelled, capabilityRefreshGeneration == generation else { return }
         do {
-            nextApps = try await client.listApps(forceRefresh: forceRefresh)
+            nextApps = try await hostClient.listApps(forceRefresh: forceRefresh)
         } catch {
             errors.append("Apps：\(error.localizedDescription)")
         }
@@ -476,9 +652,14 @@ final class BoardStore {
             }
         }
         do {
-            try await client.connect()
+            let hostID = selectedTask?.hostID ?? selectedProject?.hostID ?? CodexHost.localID
+            guard let host = host(for: hostID), host.isEnabled else {
+                throw CodexClientError.invalidResponse("所选项目的主机已停用或不再存在")
+            }
+            let hostClient = clientForHost(host)
+            try await hostClient.connect()
             let threadID = selectedTask?.threadID
-            let servers = try await client.listMCPServers(threadID: threadID)
+            let servers = try await hostClient.listMCPServers(threadID: threadID)
             guard !Task.isCancelled, mcpRefreshGeneration == generation else { return }
             mcpServers = stableUniqueMCPServers(servers)
         } catch {
@@ -489,12 +670,18 @@ final class BoardStore {
 
     func beginMCPOAuth(serverName: String) async {
         let cleanName = serverName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanName.isEmpty, !oauthServersInProgress.contains(cleanName) else { return }
-        oauthServersInProgress.insert(cleanName)
+        let hostID = selectedTask?.hostID ?? selectedProject?.hostID ?? CodexHost.localID
+        let oauthKey = HostServerKey(hostID: hostID, serverName: cleanName)
+        guard !cleanName.isEmpty, !oauthRequestsInProgress.contains(oauthKey) else { return }
+        setOAuthInProgress(true, key: oauthKey)
         mcpServerError = nil
         do {
-            try await client.connect()
-            let url = try await client.beginMCPOAuth(
+            guard let host = host(for: hostID), host.isEnabled else {
+                throw CodexClientError.invalidResponse("所选项目的主机已停用或不再存在")
+            }
+            let hostClient = clientForHost(host)
+            try await hostClient.connect()
+            let url = try await hostClient.beginMCPOAuth(
                 serverName: cleanName,
                 threadID: selectedTask?.threadID
             )
@@ -502,9 +689,16 @@ final class BoardStore {
                 throw BoardStoreOAuthError.cannotOpenBrowser
             }
         } catch {
-            oauthServersInProgress.remove(cleanName)
+            setOAuthInProgress(false, key: oauthKey)
             mcpServerError = error.localizedDescription
         }
+    }
+
+    func isMCPOAuthInProgress(serverName: String) -> Bool {
+        let hostID = selectedTask?.hostID ?? selectedProject?.hostID ?? CodexHost.localID
+        return oauthRequestsInProgress.contains(
+            HostServerKey(hostID: hostID, serverName: serverName)
+        )
     }
 
     @discardableResult
@@ -515,22 +709,35 @@ final class BoardStore {
         return externalURLOpener(url)
     }
 
-    func addManualProject(path: String) {
-        let normalized = URL(fileURLWithPath: path, isDirectory: true)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-            .path
-        manualProjectPaths.removeAll { $0 == normalized }
-        manualProjectPaths.insert(normalized, at: 0)
+    func addManualProject(path: String, hostID: String = CodexHost.localID) {
+        guard let host = host(for: hostID),
+              let normalized = normalizeProjectPath(path, isRemote: host.kind == .ssh)
+        else {
+            lastError = "远程项目必须使用绝对路径。"
+            return
+        }
+        let reference = ManualProjectReference(hostID: hostID, path: normalized)
+        manualProjects.removeAll { $0 == reference }
+        manualProjects.insert(reference, at: 0)
         hiddenProjectPaths.remove(normalized)
+        if let projectID = projects.first(where: {
+            $0.hostID == hostID && $0.path == normalized
+        })?.id {
+            hiddenProjectPaths.remove(projectID)
+        }
         scheduleSave()
         Task { @MainActor [weak self] in await self?.refreshProjects() }
     }
 
     func removeProjectFromSidebar(_ project: ProjectRecord) {
         hiddenProjectPaths.insert(project.id)
-        manualProjectPaths.removeAll { manualPath in
-            Self.isSameOrDescendant(manualPath, of: project.path)
+        manualProjects.removeAll { reference in
+            reference.hostID == project.hostID
+                && Self.isSameOrDescendant(
+                    reference.path,
+                    of: project.path,
+                    isRemote: !isLocalHost(project.hostID)
+                )
         }
         if let index = projects.firstIndex(where: { $0.id == project.id }) {
             projects[index].isManual = false
@@ -540,6 +747,127 @@ final class BoardStore {
             selectedProjectID = visibleProjects.first?.id
         }
         scheduleSave()
+    }
+
+    func removeManualProject(_ project: ProjectRecord) {
+        guard project.isManual else { return }
+        removeProjectFromSidebar(project)
+    }
+
+    @discardableResult
+    func addSSHHost(alias: String, name: String = "") -> Bool {
+        let normalizedAlias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try AppServerTransport.validateSSHHostAlias(normalizedAlias)
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+        guard !hosts.contains(where: {
+            $0.sshAlias?.localizedCaseInsensitiveCompare(normalizedAlias) == .orderedSame
+        }) else {
+            lastError = "SSH 主机 \(normalizedAlias) 已经存在。"
+            return false
+        }
+
+        let hostID = "ssh:\(normalizedAlias.lowercased())"
+        guard !hosts.contains(where: { $0.id == hostID }) else { return false }
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let host = CodexHost(
+            id: hostID,
+            name: cleanName.isEmpty ? normalizedAlias : cleanName,
+            kind: .ssh,
+            sshAlias: normalizedAlias,
+            isEnabled: true,
+            maxConcurrentExecutions: 1
+        )
+        hosts.append(host)
+        hostConfigurationGeneration += 1
+        hostConnectionStates[host.id] = .disconnected
+        lastError = nil
+        scheduleSave()
+        Task { @MainActor [weak self] in await self?.refreshProjects() }
+        return true
+    }
+
+    @discardableResult
+    func setHostEnabled(id hostID: String, enabled: Bool) -> Bool {
+        guard let index = hosts.firstIndex(where: { $0.id == hostID }) else { return false }
+        if !enabled, tasks.contains(where: { $0.hostID == hostID && $0.stage.isActive }) {
+            lastError = "主机 \(hosts[index].name) 仍有任务运行，不能停用。"
+            return false
+        }
+        hosts[index].isEnabled = enabled
+        hostConfigurationGeneration += 1
+        if !enabled {
+            clients[hostID]?.disconnect()
+            hostConnectionStates[hostID] = .disconnected
+        }
+        scheduleSave()
+        Task { @MainActor [weak self] in await self?.refreshProjects() }
+        return true
+    }
+
+    func setHostConcurrency(id hostID: String, maximum: Int) {
+        guard let index = hosts.firstIndex(where: { $0.id == hostID }) else { return }
+        hosts[index].maxConcurrentExecutions = maximum
+        scheduleSave()
+        scheduleExecutionQueue()
+    }
+
+    @discardableResult
+    func removeHost(id hostID: String) -> Bool {
+        guard hostID != CodexHost.localID,
+              hosts.contains(where: { $0.id == hostID }),
+              !tasks.contains(where: { $0.hostID == hostID }),
+              !manualProjects.contains(where: { $0.hostID == hostID })
+        else { return false }
+
+        hosts.removeAll { $0.id == hostID }
+        hostConfigurationGeneration += 1
+        hostConnectionStates.removeValue(forKey: hostID)
+        eventTasks.removeValue(forKey: hostID)?.cancel()
+        clients[hostID]?.disconnect()
+        clients.removeValue(forKey: hostID)
+        projects.removeAll { $0.hostID == hostID }
+        scheduleSave()
+        return true
+    }
+
+    func testHost(id hostID: String) async {
+        guard let host = host(for: hostID), host.isEnabled else { return }
+        let generation = hostConfigurationGeneration
+        hostConnectionStates[hostID] = .connecting
+        let hostClient = clientForHost(host)
+        do {
+            try await hostClient.connect()
+            guard try await hostClient.verifyAccount() else {
+                throw CodexClientError.invalidResponse("\(host.name) 尚未登录 Codex")
+            }
+            _ = try await hostClient.listThreads(cursor: nil, archived: false)
+            guard generation == hostConfigurationGeneration,
+                  self.host(for: hostID)?.isEnabled == true
+            else { return }
+            hostConnectionStates[hostID] = .connected
+            lastError = nil
+        } catch {
+            guard generation == hostConfigurationGeneration,
+                  self.host(for: hostID)?.isEnabled == true
+            else { return }
+            hostConnectionStates[hostID] = .failed(error.localizedDescription)
+            lastError = "\(host.name)：\(error.localizedDescription)"
+        }
+        accountReady = connectedHostCount > 0
+    }
+
+    func refreshSSHSuggestions() async {
+        let sshDiscovery = sshDiscovery
+        let discovered = await Task.detached(priority: .utility) {
+            sshDiscovery.discoverHosts()
+        }.value
+        sshHostSuggestions = discovered.filter { alias in
+            (try? AppServerTransport.validateSSHHostAlias(alias)) != nil
+        }
     }
 
     @discardableResult
@@ -560,8 +888,21 @@ final class BoardStore {
     ) async throws -> UUID {
         let body = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty || !attachmentDrafts.isEmpty else { throw BoardStoreError.emptyTask }
-        guard let project = projects.first(where: { $0.id == projectID }) else {
+        guard let project = projects.first(where: { $0.id == projectID }),
+              project.path != "/",
+              project.existsOnDisk,
+              let projectHost = host(for: project.hostID),
+              projectHost.isEnabled
+        else {
             throw BoardStoreError.invalidProject
+        }
+        if projectHost.kind == .ssh {
+            guard attachmentDrafts.isEmpty else {
+                throw BoardStoreError.remoteAttachmentsUnsupported
+            }
+            guard workspaceKind != .worktree else {
+                throw BoardStoreError.remoteWorktreeUnsupported
+            }
         }
         guard workspaceKind != .worktree || project.isGitRepository else {
             throw BoardStoreError.worktreeRequiresGit
@@ -585,6 +926,7 @@ final class BoardStore {
         var task = BoardTask(
             id: taskID,
             projectID: projectID,
+            hostID: project.hostID,
             title: cleanTitle.isEmpty ? String(derivedTitle.prefix(80)) : cleanTitle,
             sourceKind: sourceKind,
             sourceText: body,
@@ -611,6 +953,12 @@ final class BoardStore {
             task.logs.append(TaskLogEntry(message: "任务已加入看板，等待手动开始规划。"))
         }
         tasks.append(task)
+        let reference = ManualProjectReference(hostID: project.hostID, path: project.path)
+        if !manualProjects.contains(reference) {
+            // Persist the path alongside the task so it remains visible when a
+            // remote host is temporarily offline on the next launch.
+            manualProjects.append(reference)
+        }
         selectedProjectID = projectID
         selectedTaskID = task.id
         scheduleSave(immediate: true)
@@ -620,9 +968,65 @@ final class BoardStore {
         return task.id
     }
 
+    /// Synchronous convenience used by live-task capture, where there are no
+    /// local attachment drafts to materialize before the card is enqueued.
+    @discardableResult
+    func createLiveTask(
+        projectID: String,
+        title: String,
+        sourceKind: TaskSourceKind,
+        sourceText: String,
+        autoRun: Bool
+    ) -> UUID? {
+        let body = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty,
+              let project = projects.first(where: { $0.id == projectID }),
+              isProjectRunnable(project)
+        else {
+            lastError = BoardStoreError.invalidProject.localizedDescription
+            return nil
+        }
+
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let derivedTitle = body.split(whereSeparator: \.isNewline).first.map(String.init)
+            ?? sourceKind.title
+        var task = BoardTask(
+            projectID: project.id,
+            hostID: project.hostID,
+            title: cleanTitle.isEmpty ? String(derivedTitle.prefix(80)) : cleanTitle,
+            sourceKind: sourceKind,
+            sourceText: body,
+            autoRun: autoRun,
+            requestedModel: resolvedModel(nil),
+            reasoningEffort: preferences.planningEffort,
+            workspace: TaskWorkspaceConfiguration(kind: .project)
+        )
+        task.liveMessage = autoRun ? "准备自动规划" : "等待开始规划"
+        task.logs.append(TaskLogEntry(message: autoRun
+            ? "任务已加入看板，准备自动规划。"
+            : "任务已加入看板，等待手动开始规划。"))
+        tasks.append(task)
+
+        let reference = ManualProjectReference(hostID: project.hostID, path: project.path)
+        if !manualProjects.contains(reference) {
+            manualProjects.append(reference)
+        }
+        selectedProjectID = project.id
+        selectedTaskID = task.id
+        scheduleSave(immediate: true)
+        if autoRun {
+            enqueuePlanning(taskID: task.id)
+        }
+        return task.id
+    }
+
     func startPlanning(taskID: UUID) async {
         guard let initialIndex = taskIndex(taskID), let project = project(forTaskAt: initialIndex) else { return }
         guard tasks[initialIndex].stage == .inbox else { return }
+        guard let host = host(for: tasks[initialIndex].hostID), host.isEnabled else {
+            failTask(at: initialIndex, message: "任务主机已停用或不再存在。")
+            return
+        }
         discardPendingStreamUpdate(for: taskID)
         let blockerCount = blockingDependencyCount(for: tasks[initialIndex])
         guard blockerCount == 0 else {
@@ -636,6 +1040,26 @@ final class BoardStore {
             failTask(at: initialIndex, message: "项目目录不存在：\(project.path)", kind: .workspace)
             return
         }
+        guard project.path != "/" else {
+            failTask(at: initialIndex, message: "拒绝把文件系统根目录作为任务工作区。", kind: .workspace)
+            return
+        }
+        if host.kind == .ssh, !tasks[initialIndex].attachments.isEmpty {
+            failTask(
+                at: initialIndex,
+                message: BoardStoreError.remoteAttachmentsUnsupported.localizedDescription,
+                kind: .workspace
+            )
+            return
+        }
+        if host.kind == .ssh, tasks[initialIndex].workspace.kind == .worktree {
+            failTask(
+                at: initialIndex,
+                message: BoardStoreError.remoteWorktreeUnsupported.localizedDescription,
+                kind: .workspace
+            )
+            return
+        }
         // Claim the task before the first suspension point so a rapid double
         // click cannot create duplicate Codex threads or planning turns.
         tasks[initialIndex].stage = .planning
@@ -645,15 +1069,26 @@ final class BoardStore {
         tasks[initialIndex].structuredPlan = []
         tasks[initialIndex].planningTurnID = nil
         tasks[initialIndex].executionTurnID = nil
-        tasks[initialIndex].liveMessage = "正在连接本机 Codex…"
+        tasks[initialIndex].liveMessage = "正在连接 \(host.name) Codex…"
         tasks[initialIndex].lastError = nil
         tasks[initialIndex].updatedAt = Date()
         appendLog(at: initialIndex, "开始只读规划。")
         let planningRunID = beginRun(at: initialIndex, phase: .planning)
-        scheduleSave()
+        guard await saveImmediately() else {
+            if let failureIndex = taskIndex(taskID) {
+                failTask(
+                    at: failureIndex,
+                    message: "无法持久化任务状态；为避免产生不可恢复的远端工作，未启动规划。"
+                )
+            }
+            return
+        }
 
+        let hostClient = clientForHost(host)
         do {
-            try await attachmentStorage.validate(tasks[initialIndex].attachments)
+            if host.kind == .local {
+                try await attachmentStorage.validate(tasks[initialIndex].attachments)
+            }
         } catch {
             if let failureIndex = taskIndex(taskID) {
                 failTask(at: failureIndex, message: error.localizedDescription, kind: .workspace)
@@ -664,16 +1099,21 @@ final class BoardStore {
         guard let index = taskIndex(taskID), tasks[index].stage == .planning else { return }
 
         do {
+            try await hostClient.connect()
+            hostConnectionStates[host.id] = .connected
             let startedThread: CodexStartedThread
             if let existingThread = tasks[index].threadID {
-                startedThread = try await client.resumeThread(threadID: existingThread, cwd: project.path)
+                startedThread = try await hostClient.resumeThread(
+                    threadID: existingThread,
+                    cwd: project.path
+                )
             } else {
-                startedThread = try await client.startThread(
+                startedThread = try await hostClient.startThread(
                     cwd: project.path,
                     model: tasks[index].requestedModel,
                     serviceTier: tasks[index].fastMode ? CodexServiceTier.fast : CodexServiceTier.standard
                 )
-                try? await client.setThreadName(
+                try? await hostClient.setThreadName(
                     threadID: startedThread.threadID,
                     name: "CodexBoard · \(tasks[index].title)"
                 )
@@ -716,7 +1156,14 @@ final class BoardStore {
                 projectPath: project.path,
                 dependencies: dependencyHandoffs(for: tasks[inputIndex])
             )
-            let turn = try await client.startPlanningTurn(
+            guard await saveImmediately() else {
+                failTask(
+                    at: currentIndex,
+                    message: "Codex thread 已创建，但无法持久化其标识；未启动规划 Turn。"
+                )
+                return
+            }
+            let turn = try await hostClient.startPlanningTurn(
                 threadID: startedThread.threadID,
                 cwd: project.path,
                 input: input,
@@ -728,7 +1175,7 @@ final class BoardStore {
                   tasks[finalIndex].stage == .planning,
                   !cancellationIntentTaskIDs.contains(taskID)
             else {
-                try? await client.interrupt(threadID: startedThread.threadID, turnID: turn.turnID)
+                try? await hostClient.interrupt(threadID: startedThread.threadID, turnID: turn.turnID)
                 if let cancelledIndex = taskIndex(taskID),
                    tasks[cancelledIndex].stage == .planning {
                     failTask(
@@ -745,8 +1192,21 @@ final class BoardStore {
                 run.turnID = turn.turnID
             }
             appendLog(at: finalIndex, "规划会话已启动：\(shortID(turn.turnID))")
-            scheduleSave()
+            guard await saveImmediately() else {
+                try? await hostClient.interrupt(
+                    threadID: startedThread.threadID,
+                    turnID: turn.turnID
+                )
+                if let failureIndex = taskIndex(taskID) {
+                    failTask(
+                        at: failureIndex,
+                        message: "规划 Turn 已启动但无法持久化其标识；已发送停止请求，请检查远端 thread。"
+                    )
+                }
+                return
+            }
         } catch {
+            reflectTransportState(of: hostClient, for: host, fallbackError: error)
             if let failureIndex = taskIndex(taskID) {
                 failTask(
                     at: failureIndex,
@@ -807,6 +1267,12 @@ final class BoardStore {
     }
 
     func continueExecution(taskID: UUID) {
+        Task { @MainActor [weak self] in
+            await self?.reconcileAndContinueExecution(taskID: taskID)
+        }
+    }
+
+    private func reconcileAndContinueExecution(taskID: UUID) async {
         guard let index = taskIndex(taskID),
               !tasks[index].stage.isActive,
               tasks[index].hasFinalPlan,
@@ -815,13 +1281,150 @@ final class BoardStore {
         resolvePlanAttention(taskID: taskID)
         retryTasks[taskID]?.cancel()
         retryTasks[taskID] = nil
+
+        let taskSnapshot = tasks[index]
+        guard let host = host(for: taskSnapshot.hostID), host.isEnabled else {
+            failTask(at: index, message: "任务主机已停用或不再存在。")
+            return
+        }
+
+        if let threadID = taskSnapshot.threadID {
+            do {
+                let hostClient = clientForHost(host)
+                try await hostClient.connect()
+                let detail = try await hostClient.readThread(
+                    threadID: threadID,
+                    includeTurns: true
+                )
+                guard let currentIndex = taskIndex(taskID) else { return }
+                let knownTurnID = taskSnapshot.executionTurnID
+                let candidateTurn = knownTurnID.flatMap { turnID in
+                    detail.turns.first(where: { $0.id == turnID })
+                } ?? detail.turns.last(where: { $0.id != taskSnapshot.planningTurnID })
+
+                if let knownTurnID, candidateTurn?.id != knownTurnID {
+                    failTask(
+                        at: currentIndex,
+                        message: "无法在远端 thread 中确认上次执行 Turn \(shortID(knownTurnID))；为避免重复副作用，未启动新 Turn。"
+                    )
+                    return
+                }
+
+                if let candidateTurn {
+                    tasks[currentIndex].executionTurnID = candidateTurn.id
+                    switch normalizedTurnStatus(candidateTurn.status) {
+                    case "completed":
+                        if let recoveredText = candidateTurn.items.reversed().compactMap({ item in
+                            item.type == "agentMessage" ? item.text : nil
+                        }).first, !recoveredText.isEmpty {
+                            tasks[currentIndex].resultText = recoveredText
+                        }
+                        appendLog(
+                            at: currentIndex,
+                            "远端执行已完成；已通过 thread/read 对账，未重复启动 Turn。",
+                            level: .success
+                        )
+                        // A disconnect closes the in-memory run before the user
+                        // asks us to reconcile it. thread/read is authoritative:
+                        // reopen that exact run briefly so the normal completion
+                        // path can attach delivery evidence and enter review.
+                        if let runIndex = tasks[currentIndex].runs.lastIndex(where: {
+                            $0.phase == .execution
+                                && ($0.turnID == candidateTurn.id || $0.turnID == nil)
+                        }) {
+                            tasks[currentIndex].runs[runIndex].outcome = .running
+                            tasks[currentIndex].runs[runIndex].endedAt = nil
+                            tasks[currentIndex].runs[runIndex].error = nil
+                        }
+                        tasks[currentIndex].stage = .executing
+                        tasks[currentIndex].failureState = nil
+                        completeTurn(
+                            at: currentIndex,
+                            turnID: candidateTurn.id,
+                            status: "completed",
+                            error: nil
+                        )
+                        return
+
+                    case "inprogress", "running", "active", "pending", "queued":
+                        tasks[currentIndex].stage = .executing
+                        tasks[currentIndex].executionApproved = false
+                        tasks[currentIndex].lastError = nil
+                        tasks[currentIndex].liveMessage = "正在重新连接远端执行…"
+                        tasks[currentIndex].updatedAt = Date()
+                        scheduleSave()
+                        do {
+                            let resumed = try await hostClient.resumeThread(
+                                threadID: threadID,
+                                cwd: detail.summary.cwd
+                            )
+                            guard let resumedIndex = taskIndex(taskID) else { return }
+                            tasks[resumedIndex].sessionID = resumed.sessionID
+                            tasks[resumedIndex].actualModel = resumed.model
+                            if tasks[resumedIndex].requestedModel.isEmpty {
+                                tasks[resumedIndex].requestedModel = resumed.model
+                            }
+                            tasks[resumedIndex].liveMessage = "已重新连接正在运行的远端 Turn"
+                            appendLog(
+                                at: resumedIndex,
+                                "已通过 thread/read 确认远端 Turn 仍在运行，没有重复执行。",
+                                level: .success
+                            )
+                            scheduleSave()
+                        } catch {
+                            if let failureIndex = taskIndex(taskID) {
+                                failTask(
+                                    at: failureIndex,
+                                    message: "已确认远端 Turn 仍在运行，但重新订阅失败：\(error.localizedDescription)"
+                                )
+                            }
+                        }
+                        return
+
+                    case "failed", "interrupted", "cancelled", "canceled":
+                        appendLog(
+                            at: currentIndex,
+                            "远端上次 Turn 状态为 \(candidateTurn.status)；将从当前工作区启动新的执行 Turn。",
+                            level: .warning
+                        )
+
+                    default:
+                        failTask(
+                            at: currentIndex,
+                            message: "远端 Turn 状态无法安全判断：\(candidateTurn.status)。未启动新 Turn。"
+                        )
+                        return
+                    }
+                }
+            } catch {
+                if let failureIndex = taskIndex(taskID) {
+                    failTask(
+                        at: failureIndex,
+                        message: "无法读取远端 thread 以确认上次执行状态：\(error.localizedDescription) 未启动新 Turn。"
+                    )
+                }
+                return
+            }
+        }
+
+        guard let finalIndex = taskIndex(taskID) else { return }
+        enqueueContinuedExecution(at: finalIndex)
+    }
+
+    private func enqueueContinuedExecution(at index: Int) {
         tasks[index].executionTurnID = nil
         tasks[index].failureState = nil
         tasks[index].stage = .awaitingApproval
         tasks[index].executionApproved = true
-        appendLog(at: index, "已请求从当前工作区状态继续执行。")
+        tasks[index].lastError = nil
+        tasks[index].updatedAt = Date()
+        appendLog(at: index, "已完成远端状态对账，从当前工作区继续执行。")
         scheduleSave(immediate: true)
         scheduleExecutionQueue()
+    }
+
+    private func normalizedTurnStatus(_ status: String) -> String {
+        status.lowercased().filter(\.isLetter)
     }
 
     func acceptReview(taskID: UUID) {
@@ -895,7 +1498,10 @@ final class BoardStore {
             return
         }
         do {
-            try await client.interrupt(threadID: threadID, turnID: turnID)
+            guard let host = host(for: tasks[initialIndex].hostID), host.isEnabled else {
+                throw CodexClientError.invalidResponse("任务主机已停用或不再存在")
+            }
+            try await clientForHost(host).interrupt(threadID: threadID, turnID: turnID)
             clearInteractions(for: taskID)
             if let index = taskIndex(taskID) {
                 appendLog(at: index, "已发送停止请求。", level: .warning)
@@ -964,18 +1570,21 @@ final class BoardStore {
     }
 
     func revealProject(_ project: ProjectRecord) {
-        guard project.existsOnDisk else { return }
+        guard isLocalHost(project.hostID), project.existsOnDisk else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: project.path)])
     }
 
-    func revealAttachment(_ attachment: TaskAttachment) {
+    func revealAttachment(_ attachment: TaskAttachment, for task: BoardTask) {
+        guard isLocalHost(task.hostID) else { return }
         let url = URL(fileURLWithPath: attachment.path)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     func deliveryArtifactURL(_ artifact: TaskDeliveryArtifact, for task: BoardTask) -> URL? {
-        guard let project = projects.first(where: { $0.id == task.projectID }) else { return nil }
+        guard isLocalHost(task.hostID),
+              let project = projects.first(where: { $0.id == task.projectID })
+        else { return nil }
         let workspacePath = task.workspace.path.flatMap { path in
             FileManager.default.fileExists(atPath: path) ? path : nil
         }
@@ -1008,7 +1617,8 @@ final class BoardStore {
     }
 
     func revealWorkspace(for task: BoardTask) {
-        guard let path = task.workspace.path,
+        guard isLocalHost(task.hostID),
+              let path = task.workspace.path,
               FileManager.default.fileExists(atPath: path)
         else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
@@ -1017,6 +1627,7 @@ final class BoardStore {
     func cleanupWorktree(taskID: UUID) async {
         guard let index = taskIndex(taskID),
               !tasks[index].stage.isActive,
+              isLocalHost(tasks[index].hostID),
               tasks[index].workspace.kind == .worktree,
               let project = project(forTaskAt: index)
         else { return }
@@ -1038,7 +1649,8 @@ final class BoardStore {
     }
 
     func openTaskInCodex(_ task: BoardTask) {
-        guard let threadID = task.threadID,
+        guard isLocalHost(task.hostID),
+              let threadID = task.threadID,
               let url = URL(string: "codex://thread/\(threadID)")
         else { return }
         NSWorkspace.shared.open(url)
@@ -1047,23 +1659,38 @@ final class BoardStore {
     private func scheduleCapabilityRefresh(projectID: String, forceRefresh: Bool) {
         capabilityRefreshTask?.cancel()
         capabilityRefreshTask = Task { @MainActor [weak self] in
-            await self?.refreshCapabilities(projectID: projectID, forceRefresh: forceRefresh)
+            guard let self, self.selectedProjectID == projectID else { return }
+            await self.refreshModels(for: projectID)
+            guard !Task.isCancelled, self.selectedProjectID == projectID else { return }
+            await self.refreshCapabilities(projectID: projectID, forceRefresh: forceRefresh)
         }
     }
 
     private func loadAndConnect() async {
+        var persistedActiveTaskIDs: [UUID] = []
         do {
             let snapshot = try await persistence.load()
             tasks = snapshot.tasks
-            manualProjectPaths = snapshot.manualProjectPaths
+            persistedActiveTaskIDs = tasks.filter { $0.stage.isActive }.map(\.id)
+            hosts = snapshot.hosts
+            manualProjects = snapshot.manualProjects
             hiddenProjectPaths = Set(snapshot.hiddenProjectPaths)
             preferences = snapshot.preferences
-            normalizeInterruptedTasks()
+            for host in hosts where hostConnectionStates[host.id] == nil {
+                hostConnectionStates[host.id] = .disconnected
+            }
+            let configuredHostIDs = Set(hosts.map(\.id))
+            hostConnectionStates = hostConnectionStates.filter {
+                configuredHostIDs.contains($0.key)
+            }
         } catch {
             lastError = error.localizedDescription
         }
+        await refreshSSHSuggestions()
         await refreshProjects()
         rebuildPlanAttentions()
+        await reconcilePersistedActiveTasks(persistedActiveTaskIDs)
+        normalizePendingRetriesAfterRestart()
         scheduleEligiblePlanningTasks()
         scheduleExecutionQueue()
     }
@@ -1113,11 +1740,335 @@ final class BoardStore {
         }
     }
 
+    private func reconcilePersistedActiveTasks(_ taskIDs: [UUID]) async {
+        for taskID in taskIDs {
+            guard let index = taskIndex(taskID), tasks[index].stage.isActive else { continue }
+            let taskSnapshot = tasks[index]
+            let turnID = taskSnapshot.stage == .planning
+                ? taskSnapshot.planningTurnID
+                : taskSnapshot.executionTurnID
+            guard let host = host(for: taskSnapshot.hostID), host.isEnabled,
+                  let threadID = taskSnapshot.threadID,
+                  let turnID
+            else {
+                failTask(
+                    at: index,
+                    message: "无法确认应用退出时的远端执行状态；任务已暂停，未启动新 Turn。"
+                )
+                continue
+            }
+
+            do {
+                let hostClient = clientForHost(host)
+                try await hostClient.connect()
+                let detail = try await hostClient.readThread(
+                    threadID: threadID,
+                    includeTurns: true
+                )
+                guard let currentIndex = taskIndex(taskID),
+                      let turn = detail.turns.first(where: { $0.id == turnID })
+                else {
+                    if let failureIndex = taskIndex(taskID) {
+                        failTask(
+                            at: failureIndex,
+                            message: "thread/read 未返回上次 Turn \(shortID(turnID))；任务已暂停以避免重复副作用。"
+                        )
+                    }
+                    continue
+                }
+
+                switch normalizedTurnStatus(turn.status) {
+                case "completed":
+                    if taskSnapshot.stage == .planning {
+                        if let planText = turn.items.reversed().compactMap({ item in
+                            item.type == "plan" ? item.text : nil
+                        }).first, !planText.isEmpty {
+                            tasks[currentIndex].planText = planText
+                            tasks[currentIndex].hasFinalPlan = true
+                        }
+                    } else if let finalText = turn.items.reversed().compactMap({ item in
+                        item.type == "agentMessage" ? item.text : nil
+                    }).first, !finalText.isEmpty {
+                        tasks[currentIndex].resultText = finalText
+                    }
+                    appendLog(
+                        at: currentIndex,
+                        "启动时已通过 thread/read 对账到上次 Turn 完成。",
+                        level: .success
+                    )
+                    completeTurn(
+                        at: currentIndex,
+                        turnID: turn.id,
+                        status: "completed",
+                        error: nil
+                    )
+
+                case "inprogress", "running", "active", "pending", "queued":
+                    let resumed = try await hostClient.resumeThread(
+                        threadID: threadID,
+                        cwd: detail.summary.cwd
+                    )
+                    guard let resumedIndex = taskIndex(taskID) else { continue }
+                    tasks[resumedIndex].sessionID = resumed.sessionID
+                    tasks[resumedIndex].actualModel = resumed.model
+                    if tasks[resumedIndex].requestedModel.isEmpty {
+                        tasks[resumedIndex].requestedModel = resumed.model
+                    }
+                    tasks[resumedIndex].lastError = nil
+                    tasks[resumedIndex].liveMessage = "已恢复对正在运行 Turn 的订阅"
+                    appendLog(
+                        at: resumedIndex,
+                        "启动时确认上次 Turn 仍在运行，已重新订阅而未重复执行。",
+                        level: .success
+                    )
+                    scheduleSave()
+
+                case "failed", "interrupted", "cancelled", "canceled":
+                    failTask(
+                        at: currentIndex,
+                        message: "应用退出时的 Turn 状态为 \(turn.status)；请检查工作区后再继续。"
+                    )
+
+                default:
+                    failTask(
+                        at: currentIndex,
+                        message: "无法安全判断应用退出时的 Turn 状态：\(turn.status)。未启动新 Turn。"
+                    )
+                }
+            } catch {
+                if let failureIndex = taskIndex(taskID) {
+                    failTask(
+                        at: failureIndex,
+                        message: "启动恢复对账失败：\(error.localizedDescription) 未启动新 Turn。"
+                    )
+                }
+            }
+        }
+    }
+
+    private func normalizePendingRetriesAfterRestart() {
+        var changed = false
+        for index in tasks.indices where tasks[index].failureState?.nextRetryAt != nil {
+            tasks[index].failureState?.nextRetryAt = nil
+            tasks[index].failureState?.circuitOpen = true
+            tasks[index].liveMessage = "已熔断，等待人工处理"
+            appendLog(at: index, "应用重启后未自动恢复失败重试；请先检查现场。", level: .warning)
+            changed = true
+        }
+        if changed {
+            scheduleSave()
+        }
+    }
+
+    private func clientForHost(_ host: CodexHost) -> any CodexTaskClient {
+        if let existing = clients[host.id] {
+            if didStart { subscribeToEvents(hostID: host.id, client: existing) }
+            return existing
+        }
+        let newClient = clientFactory(host)
+        clients[host.id] = newClient
+        if didStart { subscribeToEvents(hostID: host.id, client: newClient) }
+        return newClient
+    }
+
+    private func reflectTransportState(
+        of client: any CodexTaskClient,
+        for host: CodexHost,
+        fallbackError: Error
+    ) {
+        switch client.connectionState {
+        case let .failed(message):
+            hostConnectionStates[host.id] = .failed(message)
+        case .disconnected:
+            hostConnectionStates[host.id] = .failed(fallbackError.localizedDescription)
+        case .connecting, .connected:
+            // Model, path, sandbox and turn-level RPC errors belong to the task;
+            // they do not imply that every project on this host is offline.
+            break
+        }
+        accountReady = connectedHostCount > 0
+    }
+
+    private func subscribeToEvents(hostID: String, client: any CodexTaskClient) {
+        guard eventTasks[hostID] == nil else { return }
+        let events = client.events
+        eventTasks[hostID] = Task { @MainActor [weak self] in
+            for await event in events {
+                guard !Task.isCancelled else { break }
+                self?.handle(event, hostID: hostID)
+            }
+        }
+    }
+
+    private func refreshHost(
+        _ host: CodexHost,
+        manualPaths: [String]
+    ) async -> HostRefreshResult {
+        guard host.isEnabled else {
+            let projects = await discovery.discover(
+                threads: [],
+                manualPaths: manualPaths,
+                ignoredPaths: managedWorktreePaths(for: host.id),
+                hostID: host.id,
+                isRemote: host.kind == .ssh
+            )
+            return HostRefreshResult(
+                hostID: host.id,
+                projects: projects,
+                connectionState: .disconnected,
+                errorDescription: nil
+            )
+        }
+
+        do {
+            let hostClient = clientForHost(host)
+            try await hostClient.connect()
+            guard try await hostClient.verifyAccount() else {
+                throw CodexClientError.invalidResponse("尚未登录 Codex")
+            }
+            let threads = try await listAllThreads(using: hostClient)
+            let remotePathInfo: [String: CodexProjectPathInfo]
+            if host.kind == .ssh {
+                remotePathInfo = await inspectRemoteProjectPaths(
+                    threadPaths: threads.map(\.cwd),
+                    manualPaths: manualPaths,
+                    using: hostClient
+                )
+            } else {
+                remotePathInfo = [:]
+            }
+            let projects = await discovery.discover(
+                threads: threads,
+                manualPaths: manualPaths,
+                ignoredPaths: managedWorktreePaths(for: host.id),
+                hostID: host.id,
+                isRemote: host.kind == .ssh,
+                remotePathInfo: remotePathInfo
+            )
+            return HostRefreshResult(
+                hostID: host.id,
+                projects: projects,
+                connectionState: .connected,
+                errorDescription: nil
+            )
+        } catch {
+            let message = error.localizedDescription
+            let projects = await discovery.discover(
+                threads: [],
+                manualPaths: manualPaths,
+                ignoredPaths: managedWorktreePaths(for: host.id),
+                hostID: host.id,
+                isRemote: host.kind == .ssh
+            )
+            return HostRefreshResult(
+                hostID: host.id,
+                projects: projects,
+                connectionState: .failed(message),
+                errorDescription: message
+            )
+        }
+    }
+
+    private func listAllThreads(using client: any CodexTaskClient) async throws -> [CodexThreadSummary] {
+        var threads: [CodexThreadSummary] = []
+        for archived in [false, true] {
+            var cursor: String?
+            repeat {
+                let page = try await client.listThreads(cursor: cursor, archived: archived)
+                threads.append(contentsOf: page.threads)
+                cursor = page.nextCursor
+            } while cursor != nil
+        }
+        return threads
+    }
+
+    private func inspectRemoteProjectPaths(
+        threadPaths: [String],
+        manualPaths: [String],
+        using client: any CodexTaskClient
+    ) async -> [String: CodexProjectPathInfo] {
+        let normalizedPaths = Set((threadPaths + manualPaths).compactMap { rawPath -> String? in
+            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard (trimmed as NSString).isAbsolutePath else { return nil }
+            return (trimmed as NSString).standardizingPath
+        })
+        var information: [String: CodexProjectPathInfo] = [:]
+        information.reserveCapacity(normalizedPaths.count)
+        for path in normalizedPaths {
+            guard path != "/" else {
+                information[path] = CodexProjectPathInfo(
+                    canonicalWorkingDirectory: path,
+                    projectPath: path,
+                    exists: false,
+                    isGitRepository: false
+                )
+                continue
+            }
+            do {
+                information[path] = try await client.inspectProjectPath(path)
+            } catch {
+                information[path] = CodexProjectPathInfo(
+                    canonicalWorkingDirectory: path,
+                    projectPath: path,
+                    exists: false,
+                    isGitRepository: false
+                )
+            }
+        }
+        return information
+    }
+
+    private func normalizeProjectPath(_ path: String, isRemote: Bool) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if isRemote {
+            guard (trimmed as NSString).isAbsolutePath else { return nil }
+            let standardized = (trimmed as NSString).standardizingPath
+            guard standardized != "/" else { return nil }
+            return standardized
+        }
+        return URL(fileURLWithPath: trimmed, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+    }
+
+    private func projectSortOrder(_ lhs: ProjectRecord, _ rhs: ProjectRecord) -> Bool {
+        switch (lhs.manualPriority, rhs.manualPriority) {
+        case let (lhsPriority?, rhsPriority?) where lhsPriority != rhsPriority:
+            return lhsPriority < rhsPriority
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            break
+        }
+        switch (lhs.latestActivityAt, rhs.latestActivityAt) {
+        case let (lhsDate?, rhsDate?) where lhsDate != rhsDate:
+            return lhsDate > rhsDate
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            if lhs.hostID != rhs.hostID { return lhs.hostID < rhs.hostID }
+            return lhs.path < rhs.path
+        }
+    }
+
     private func scheduleExecutionQueue() {
         let available = max(0, preferences.maxConcurrentExecutions - activeExecutionCount)
-        var activeDirectWorkspaceProjects = Set(
+        guard available > 0 else { return }
+        var activeByHost = Dictionary(grouping: tasks.filter { $0.stage == .executing }, by: \.hostID)
+            .mapValues(\.count)
+        var occupiedProjects = Set(
             tasks.lazy
-                .filter { $0.stage == .executing && $0.workspace.kind == .project }
+                .filter {
+                    $0.workspace.kind == .project
+                        && ($0.stage == .executing
+                            || ($0.stage == .needsAttention && $0.hasFinalPlan && $0.threadID != nil))
+                }
                 .map(\.projectID)
         )
         var queued: [Int] = []
@@ -1131,20 +2082,26 @@ final class BoardStore {
             }
             .sorted { tasks[$0].updatedAt < tasks[$1].updatedAt }
         for index in candidates {
-            let task = tasks[index]
-            if task.workspace.kind == .project {
-                guard !activeDirectWorkspaceProjects.contains(task.projectID) else {
-                    tasks[index].liveMessage = "等待同项目的主目录任务结束"
-                    continue
-                }
-            }
             guard queued.count < available else {
                 tasks[index].liveMessage = "等待可用执行槽位"
                 continue
             }
-            if task.workspace.kind == .project {
-                activeDirectWorkspaceProjects.insert(task.projectID)
+            guard let candidateHost = host(for: tasks[index].hostID), candidateHost.isEnabled else {
+                tasks[index].liveMessage = "等待任务主机恢复"
+                continue
             }
+            guard activeByHost[candidateHost.id, default: 0] < candidateHost.maxConcurrentExecutions else {
+                tasks[index].liveMessage = "等待 \(candidateHost.name) 的执行槽位"
+                continue
+            }
+            if tasks[index].workspace.kind == .project {
+                guard !occupiedProjects.contains(tasks[index].projectID) else {
+                    tasks[index].liveMessage = "等待同项目的主目录任务结束"
+                    continue
+                }
+                occupiedProjects.insert(tasks[index].projectID)
+            }
+            activeByHost[candidateHost.id, default: 0] += 1
             queued.append(index)
         }
         for index in queued {
@@ -1169,24 +2126,53 @@ final class BoardStore {
             }
             return
         }
-        do {
-            let preparedWorkspace = try await worktreeManager.prepare(
-                taskID: taskID,
-                projectPath: project.path,
-                configuration: tasks[index].workspace
-            )
-            guard let preparedIndex = taskIndex(taskID) else { return }
-            tasks[preparedIndex].workspace = preparedWorkspace
-            let executionPath = preparedWorkspace.path ?? project.path
-            if preparedWorkspace.kind == .worktree, preparedWorkspace.path != nil {
-                appendLog(
-                    at: preparedIndex,
-                    "使用独立 Worktree：\(preparedWorkspace.branch ?? executionPath)",
-                    level: .success
+        guard let host = host(for: tasks[index].hostID), host.isEnabled else {
+            failTask(at: index, message: "任务主机已停用或不再存在。")
+            scheduleExecutionQueue()
+            return
+        }
+        guard await saveImmediately() else {
+            if let failureIndex = taskIndex(taskID) {
+                failTask(
+                    at: failureIndex,
+                    message: "无法持久化已排队的执行状态；未启动执行 Turn。"
                 )
+                scheduleExecutionQueue()
             }
-            try await attachmentStorage.validate(tasks[index].attachments)
-            let resumed = try await client.resumeThread(threadID: threadID, cwd: executionPath)
+            return
+        }
+        let hostClient = clientForHost(host)
+        do {
+            let executionPath: String
+            if host.kind == .ssh {
+                guard tasks[index].attachments.isEmpty else {
+                    throw BoardStoreError.remoteAttachmentsUnsupported
+                }
+                guard tasks[index].workspace.kind != .worktree else {
+                    throw BoardStoreError.remoteWorktreeUnsupported
+                }
+                executionPath = project.path
+            } else {
+                let preparedWorkspace = try await worktreeManager.prepare(
+                    taskID: taskID,
+                    projectPath: project.path,
+                    configuration: tasks[index].workspace
+                )
+                guard let preparedIndex = taskIndex(taskID) else { return }
+                tasks[preparedIndex].workspace = preparedWorkspace
+                executionPath = preparedWorkspace.path ?? project.path
+                if preparedWorkspace.kind == .worktree, preparedWorkspace.path != nil {
+                    appendLog(
+                        at: preparedIndex,
+                        "使用独立 Worktree：\(preparedWorkspace.branch ?? executionPath)",
+                        level: .success
+                    )
+                }
+                try await attachmentStorage.validate(tasks[preparedIndex].attachments)
+            }
+            try await hostClient.connect()
+            hostConnectionStates[host.id] = .connected
+            let resumed = try await hostClient.resumeThread(threadID: threadID, cwd: executionPath)
             guard let currentIndex = taskIndex(taskID) else { return }
             tasks[currentIndex].sessionID = resumed.sessionID
             if tasks[currentIndex].requestedModel.isEmpty {
@@ -1217,6 +2203,14 @@ final class BoardStore {
                 scheduleExecutionQueue()
                 return
             }
+            guard await saveImmediately() else {
+                failTask(
+                    at: currentIndex,
+                    message: "无法持久化恢复后的 session；未启动执行 Turn。"
+                )
+                scheduleExecutionQueue()
+                return
+            }
             var runtimeTask = tasks[inputIndex]
             runtimeTask.selectedApps = runtimeSafeApps
             let input = TaskPromptBuilder.executionInput(
@@ -1224,7 +2218,7 @@ final class BoardStore {
                 projectPath: executionPath,
                 sourceProjectPath: project.path
             )
-            let turn = try await client.startExecutionTurn(
+            let turn = try await hostClient.startExecutionTurn(
                 threadID: threadID,
                 cwd: executionPath,
                 input: input,
@@ -1237,7 +2231,7 @@ final class BoardStore {
                   tasks[finalIndex].stage == .executing,
                   !cancellationIntentTaskIDs.contains(taskID)
             else {
-                try? await client.interrupt(threadID: threadID, turnID: turn.turnID)
+                try? await hostClient.interrupt(threadID: threadID, turnID: turn.turnID)
                 if let cancelledIndex = taskIndex(taskID),
                    tasks[cancelledIndex].stage == .executing {
                     failTask(
@@ -1255,8 +2249,19 @@ final class BoardStore {
                 run.turnID = turn.turnID
             }
             appendLog(at: finalIndex, "执行会话已启动：\(shortID(turn.turnID))")
-            scheduleSave(immediate: true)
+            guard await saveImmediately() else {
+                try? await hostClient.interrupt(threadID: threadID, turnID: turn.turnID)
+                if let failureIndex = taskIndex(taskID) {
+                    failTask(
+                        at: failureIndex,
+                        message: "执行 Turn 已启动但无法持久化其标识；已发送停止请求，请检查工作区和远端 thread。"
+                    )
+                    scheduleExecutionQueue()
+                }
+                return
+            }
         } catch {
+            reflectTransportState(of: hostClient, for: host, fallbackError: error)
             if let failureIndex = taskIndex(taskID) {
                 let kind: TaskFailureKind = error is WorktreeManagerError ? .workspace : classifyFailure(error.localizedDescription)
                 failTask(
@@ -1271,10 +2276,10 @@ final class BoardStore {
         }
     }
 
-    private func handle(_ event: CodexEvent) {
+    private func handle(_ event: CodexEvent, hostID: String) {
         switch event {
         case let .agentDelta(threadID, turnID, delta):
-            guard let index = taskIndex(threadID: threadID, turnID: turnID) else { return }
+            guard let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             let taskID = tasks[index].id
             if tasks[index].stage == .planning {
                 pendingStreamUpdates[taskID, default: PendingStreamUpdate()].planDelta += delta
@@ -1285,14 +2290,14 @@ final class BoardStore {
             }
             scheduleStreamFlush()
         case let .turnDiffUpdated(threadID, turnID, diff):
-            guard let index = taskIndex(threadID: threadID, turnID: turnID) else { return }
+            guard let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             let taskID = tasks[index].id
             pendingStreamUpdates[taskID, default: PendingStreamUpdate()].turnDiffID = turnID
             pendingStreamUpdates[taskID, default: PendingStreamUpdate()].turnDiff = diff
             scheduleStreamFlush()
         case let .agentFinal(threadID, turnID, text):
             flushPendingStreamUpdates()
-            guard let index = taskIndex(threadID: threadID, turnID: turnID) else { return }
+            guard let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             if tasks[index].stage == .planning, tasks[index].planText.isEmpty {
                 tasks[index].planText = text
             } else if tasks[index].stage == .executing {
@@ -1301,28 +2306,28 @@ final class BoardStore {
             scheduleSave(immediate: true)
         case let .planFinal(threadID, turnID, text):
             flushPendingStreamUpdates()
-            guard let index = taskIndex(threadID: threadID, turnID: turnID) else { return }
+            guard let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             tasks[index].planText = text
             tasks[index].hasFinalPlan = true
             scheduleSave(immediate: true)
         case let .planUpdated(threadID, turnID, explanation, steps):
-            guard let index = taskIndex(threadID: threadID, turnID: turnID) else { return }
+            guard let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             tasks[index].structuredPlan = steps
             if let explanation, !explanation.isEmpty { tasks[index].liveMessage = explanation }
             scheduleSave()
         case let .activity(threadID, turnID, message):
-            guard let index = taskIndex(threadID: threadID, turnID: turnID) else { return }
+            guard let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             pendingStreamUpdates[tasks[index].id, default: PendingStreamUpdate()].liveMessage = message
             scheduleStreamFlush()
         case let .configurationWarning(threadID, turnID, message):
             guard let threadID,
-                  let index = taskIndex(threadID: threadID, turnID: turnID) else { return }
+                  let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             appendLog(at: index, message, level: .warning)
             scheduleSave(immediate: true)
         case let .warning(threadID, turnID, message):
             guard let threadID,
-                  let index = taskIndex(threadID: threadID, turnID: turnID) else {
-                lastError = message
+                  let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else {
+                lastError = "\(hostName(for: hostID))：\(message)"
                 return
             }
             appendLog(at: index, message, level: .warning)
@@ -1330,12 +2335,16 @@ final class BoardStore {
             scheduleSave(immediate: true)
         case let .turnCompleted(threadID, turnID, status, error):
             flushPendingStreamUpdates()
-            guard let index = taskIndex(threadID: threadID, turnID: turnID) else { return }
+            guard let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             completeTurn(at: index, turnID: turnID, status: status, error: error)
         case .threadStatus:
             break
         case let .interactionRequested(request):
-            guard let index = taskIndex(threadID: request.threadID, turnID: request.turnID),
+            guard let index = taskIndex(
+                threadID: request.threadID,
+                turnID: request.turnID,
+                hostID: hostID
+            ),
                   tasks[index].stage.isActive
             else { return }
             let taskID = tasks[index].id
@@ -1361,7 +2370,9 @@ final class BoardStore {
             }
             scheduleSave()
         case let .interactionResolved(threadID, requestID):
-            guard let taskID = tasks.first(where: { $0.threadID == threadID })?.id else { return }
+            guard let taskID = tasks.first(where: {
+                $0.hostID == hostID && $0.threadID == threadID
+            })?.id else { return }
             removeInteraction(taskID: taskID, requestID: requestID)
             if let index = taskIndex(taskID), tasks[index].stage.isActive {
                 tasks[index].liveMessage = hasPendingInteraction(for: taskID)
@@ -1371,30 +2382,50 @@ final class BoardStore {
                 scheduleSave()
             }
         case let .mcpOAuthCompleted(completion):
-            oauthServersInProgress.remove(completion.serverName)
+            setOAuthInProgress(
+                false,
+                key: HostServerKey(hostID: hostID, serverName: completion.serverName)
+            )
+            let selectedHostID = selectedTask?.hostID
+                ?? selectedProject?.hostID
+                ?? CodexHost.localID
             if completion.success {
-                mcpServerError = nil
+                if selectedHostID == hostID {
+                    mcpServerError = nil
+                }
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
+                    guard let self,
+                          (self.selectedTask?.hostID
+                              ?? self.selectedProject?.hostID
+                              ?? CodexHost.localID) == hostID
+                    else { return }
                     await self.refreshMCPServers()
-                    if let projectID = self.selectedProjectID {
+                    if let projectID = self.selectedProjectID,
+                       self.projects.first(where: { $0.id == projectID })?.hostID == hostID {
                         await self.refreshCapabilities(projectID: projectID, forceRefresh: true)
                     }
                 }
-            } else {
+            } else if selectedHostID == hostID {
                 mcpServerError = completion.error?.nilIfBlank
                     ?? "\(completion.serverName) OAuth 授权失败。"
             }
         case let .connectionLost(message):
             flushPendingStreamUpdates()
-            resolveAllInteractionAttentions()
-            pendingInteractionsByTaskID.removeAll()
-            respondingRequestIDs.removeAll()
-            oauthServersInProgress.removeAll()
-            for index in tasks.indices where tasks[index].stage.isActive {
+            hostConnectionStates[hostID] = .failed(message)
+            accountReady = connectedHostCount > 0
+            let affectedTaskIDs = Set(tasks.lazy.filter { $0.hostID == hostID }.map(\.id))
+            respondingRequests = Set(respondingRequests.filter { $0.hostID != hostID })
+            respondingRequestIDs = Set(respondingRequests.map(\.requestID))
+            oauthRequestsInProgress = Set(oauthRequestsInProgress.filter { $0.hostID != hostID })
+            oauthServersInProgress = Set(oauthRequestsInProgress.map(\.serverName))
+            for taskID in affectedTaskIDs {
+                clearInteractions(for: taskID)
+            }
+            for index in tasks.indices
+                where tasks[index].hostID == hostID && tasks[index].stage.isActive {
                 failTask(
                     at: index,
-                    message: "Codex 连接已断开：\(message) 请检查工作区后再继续。",
+                    message: "\(hostName(for: hostID)) 的 Codex 连接已断开：\(message) 请检查工作区后再继续。",
                     kind: .connection
                 )
             }
@@ -1493,34 +2524,6 @@ final class BoardStore {
             scheduleSave(immediate: true)
             scheduleExecutionQueue()
         }
-    }
-
-    private func normalizeInterruptedTasks() {
-        for index in tasks.indices where tasks[index].stage.isActive {
-            finishActiveRun(
-                at: index,
-                phase: tasks[index].stage == .planning ? .planning : .execution,
-                outcome: .interrupted,
-                summary: "应用退出时运行尚未完成。",
-                error: "应用上次退出时任务仍在运行。"
-            )
-            tasks[index].stage = .needsAttention
-            tasks[index].executionApproved = false
-            tasks[index].lastError = "应用上次退出时任务仍在运行；请检查当前工作区后选择继续。"
-            tasks[index].failureState = TaskFailureState(
-                kind: .interrupted,
-                circuitOpen: true,
-                message: tasks[index].lastError ?? "运行被中断。"
-            )
-            appendLog(at: index, "检测到未完成的上次运行，已暂停以避免重复副作用。", level: .warning)
-        }
-        for index in tasks.indices where tasks[index].failureState?.nextRetryAt != nil {
-            tasks[index].failureState?.nextRetryAt = nil
-            tasks[index].failureState?.circuitOpen = true
-            tasks[index].liveMessage = "已熔断，等待人工处理"
-            appendLog(at: index, "应用重启后未自动恢复失败重试；请先检查现场。", level: .warning)
-        }
-        scheduleSave()
     }
 
     private func failTask(
@@ -1700,9 +2703,9 @@ final class BoardStore {
         tasks.firstIndex(where: { $0.id == id })
     }
 
-    private func taskIndex(threadID: String, turnID: String?) -> Int? {
+    private func taskIndex(threadID: String, turnID: String?, hostID: String) -> Int? {
         tasks.firstIndex { task in
-            guard task.threadID == threadID else { return false }
+            guard task.hostID == hostID, task.threadID == threadID else { return false }
             guard let turnID else { return true }
             return task.planningTurnID == turnID || task.executionTurnID == turnID
                 || (task.stage == .planning && task.planningTurnID == nil)
@@ -1718,7 +2721,12 @@ final class BoardStore {
         } else {
             pendingInteractionsByTaskID[taskID] = requests
         }
-        respondingRequestIDs.remove(requestID)
+        if let hostID = tasks.first(where: { $0.id == taskID })?.hostID {
+            setResponding(
+                false,
+                key: HostRequestKey(hostID: hostID, requestID: requestID)
+            )
+        }
         resolveInteractionAttention(taskID: taskID, requestID: requestID)
     }
 
@@ -1726,7 +2734,12 @@ final class BoardStore {
         guard let turnID else {
             let requests = pendingInteractionsByTaskID.removeValue(forKey: taskID) ?? []
             requests.forEach { request in
-                respondingRequestIDs.remove(request.id)
+                if let hostID = tasks.first(where: { $0.id == taskID })?.hostID {
+                    setResponding(
+                        false,
+                        key: HostRequestKey(hostID: hostID, requestID: request.id)
+                    )
+                }
                 resolveInteractionAttention(taskID: taskID, requestID: request.id)
             }
             return
@@ -1735,7 +2748,12 @@ final class BoardStore {
         let removed = requests.filter { $0.turnID == nil || $0.turnID == turnID }
         requests.removeAll { $0.turnID == nil || $0.turnID == turnID }
         removed.forEach { request in
-            respondingRequestIDs.remove(request.id)
+            if let hostID = tasks.first(where: { $0.id == taskID })?.hostID {
+                setResponding(
+                    false,
+                    key: HostRequestKey(hostID: hostID, requestID: request.id)
+                )
+            }
             resolveInteractionAttention(taskID: taskID, requestID: request.id)
         }
         if requests.isEmpty {
@@ -1750,7 +2768,12 @@ final class BoardStore {
         requestID: CodexRequestID,
         createdAt: Date
     ) {
-        let key = InteractionAttentionKey(taskID: taskID, requestID: requestID)
+        guard let hostID = tasks.first(where: { $0.id == taskID })?.hostID else { return }
+        let key = InteractionAttentionKey(
+            hostID: hostID,
+            taskID: taskID,
+            requestID: requestID
+        )
         guard interactionAttentionIDs[key] == nil else { return }
         let notice = TaskAttentionNotice(
             id: UUID(),
@@ -1763,9 +2786,32 @@ final class BoardStore {
     }
 
     private func resolveInteractionAttention(taskID: UUID, requestID: CodexRequestID) {
-        let key = InteractionAttentionKey(taskID: taskID, requestID: requestID)
+        guard let hostID = tasks.first(where: { $0.id == taskID })?.hostID else { return }
+        let key = InteractionAttentionKey(
+            hostID: hostID,
+            taskID: taskID,
+            requestID: requestID
+        )
         guard let noticeID = interactionAttentionIDs.removeValue(forKey: key) else { return }
         attentionNotices.removeAll { $0.id == noticeID }
+    }
+
+    private func setResponding(_ isResponding: Bool, key: HostRequestKey) {
+        if isResponding {
+            respondingRequests.insert(key)
+        } else {
+            respondingRequests.remove(key)
+        }
+        respondingRequestIDs = Set(respondingRequests.map(\.requestID))
+    }
+
+    private func setOAuthInProgress(_ isInProgress: Bool, key: HostServerKey) {
+        if isInProgress {
+            oauthRequestsInProgress.insert(key)
+        } else {
+            oauthRequestsInProgress.remove(key)
+        }
+        oauthServersInProgress = Set(oauthRequestsInProgress.map(\.serverName))
     }
 
     private func resolveAllInteractionAttentions() {
@@ -1814,10 +2860,15 @@ final class BoardStore {
 
     private func cancelPendingInteractions(for taskID: UUID) async {
         let requests = pendingInteractionsByTaskID[taskID] ?? []
+        guard let task = tasks.first(where: { $0.id == taskID }),
+              let host = host(for: task.hostID),
+              host.isEnabled
+        else { return }
+        let hostClient = clientForHost(host)
         for request in requests {
             guard let response = cancellationResponse(for: request) else { continue }
             do {
-                try await client.respond(to: request.id, with: response)
+                try await hostClient.respond(to: request.id, with: response)
                 removeInteraction(taskID: taskID, requestID: request.id)
             } catch {
                 // Keep the request visible so the user can retry if interrupting
@@ -1855,10 +2906,13 @@ final class BoardStore {
     ) async -> [TaskAppSelection] {
         guard !selectedApps.isEmpty else { return [] }
         do {
-            let threadID = tasks.first(where: { $0.id == taskID })?.threadID
-            let currentCatalog = try await client.listApps(
+            guard let task = tasks.first(where: { $0.id == taskID }),
+                  let host = host(for: task.hostID),
+                  host.isEnabled
+            else { return [] }
+            let currentCatalog = try await clientForHost(host).listApps(
                 forceRefresh: true,
-                threadID: threadID
+                threadID: task.threadID
             )
             let readOnlyAppIDs = Set(currentCatalog.lazy.filter(\.supportsReadOnlyUse).map(\.id))
             let safeSelections = selectedApps.filter {
@@ -1900,9 +2954,9 @@ final class BoardStore {
         })?.id ?? visibleProjects.first?.id
     }
 
-    private var managedWorktreePaths: [String] {
+    private func managedWorktreePaths(for hostID: String) -> [String] {
         tasks.compactMap { task in
-            guard task.workspace.kind == .worktree else { return nil }
+            guard task.hostID == hostID, task.workspace.kind == .worktree else { return nil }
             return task.workspace.path
         }
     }
@@ -1916,15 +2970,29 @@ final class BoardStore {
         }
     }
 
-    private static func isSameOrDescendant(_ path: String, of ancestor: String) -> Bool {
-        let pathComponents = URL(fileURLWithPath: path, isDirectory: true)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-            .pathComponents
-        let ancestorComponents = URL(fileURLWithPath: ancestor, isDirectory: true)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-            .pathComponents
+    private static func isSameOrDescendant(
+        _ path: String,
+        of ancestor: String,
+        isRemote: Bool = false
+    ) -> Bool {
+        let pathComponents: [String]
+        let ancestorComponents: [String]
+        if isRemote {
+            // Remote paths belong to another filesystem. Comparing them must be
+            // purely lexical; resolving symlinks here would inspect the Mac and
+            // could remove an unrelated remote manual project.
+            pathComponents = ((path as NSString).standardizingPath as NSString).pathComponents
+            ancestorComponents = ((ancestor as NSString).standardizingPath as NSString).pathComponents
+        } else {
+            pathComponents = URL(fileURLWithPath: path, isDirectory: true)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .pathComponents
+            ancestorComponents = URL(fileURLWithPath: ancestor, isDirectory: true)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .pathComponents
+        }
         guard ancestorComponents.count <= pathComponents.count else { return false }
         return pathComponents.prefix(ancestorComponents.count).elementsEqual(ancestorComponents)
     }
@@ -2103,13 +3171,7 @@ final class BoardStore {
         guard !isSaving, savedRevision < saveRevision else { return }
         isSaving = true
         let revision = saveRevision
-        let snapshot = BoardSnapshot(
-            version: BoardSnapshot.currentVersion,
-            tasks: tasks,
-            manualProjectPaths: manualProjectPaths,
-            preferences: preferences,
-            hiddenProjectPaths: hiddenProjectPaths.sorted()
-        )
+        let snapshot = currentSnapshot()
         let deletedTasks = pendingAttachmentDeletions
         var succeeded = false
         do {
@@ -2150,6 +3212,31 @@ final class BoardStore {
         }
     }
 
+    @discardableResult
+    private func saveImmediately() async -> Bool {
+        guard didStart else { return false }
+        saveTask?.cancel()
+        saveTask = nil
+        do {
+            try await persistence.save(currentSnapshot())
+            return true
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func currentSnapshot() -> BoardSnapshot {
+        BoardSnapshot(
+            version: BoardSnapshot.currentVersion,
+            tasks: tasks,
+            hosts: hosts,
+            manualProjects: manualProjects,
+            preferences: preferences,
+            hiddenProjectPaths: hiddenProjectPaths.sorted()
+        )
+    }
+
     private func shortID(_ value: String) -> String {
         String(value.prefix(8))
     }
@@ -2179,10 +3266,7 @@ final class BoardStore {
     }
 
     private func normalizedDirectoryPath(_ path: String) -> String {
-        URL(fileURLWithPath: path, isDirectory: true)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-            .path
+        (path as NSString).standardizingPath
     }
 
     private func stableUniqueSkills(_ skills: [CodexSkillMetadata]) -> [CodexSkillMetadata] {
@@ -2237,5 +3321,12 @@ private extension String {
     var nilIfBlank: String? {
         let clean = trimmingCharacters(in: .whitespacesAndNewlines)
         return clean.isEmpty ? nil : clean
+    }
+}
+
+private extension CodexConnectionState {
+    var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
     }
 }

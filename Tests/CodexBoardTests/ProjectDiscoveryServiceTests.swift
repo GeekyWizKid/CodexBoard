@@ -48,6 +48,7 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
             project.observedWorkingDirectories,
             [tests.resolvingSymlinksInPath().path, sources.resolvingSymlinksInPath().path]
         )
+        XCTAssertEqual(project.manualPaths, [repository.resolvingSymlinksInPath().path])
         XCTAssertEqual(project.latestActivityAt, newerDate)
         XCTAssertEqual(project.threadCount, 2)
         XCTAssertEqual(project.activeThreadCount, 1)
@@ -119,6 +120,7 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
         XCTAssertEqual(ordinaryProject.threadCount, 0)
         XCTAssertEqual(ordinaryProject.observedWorkingDirectories, [])
         XCTAssertNil(projects.first { $0.path == recentDirectory.resolvingSymlinksInPath().path })
+        XCTAssertEqual(ordinaryProject.manualPaths, [ordinaryDirectory.resolvingSymlinksInPath().path])
         XCTAssertNil(
             projects.first { $0.path == nestedRepository.resolvingSymlinksInPath().path },
             "The service must not scan children looking for repositories"
@@ -286,6 +288,168 @@ final class ProjectDiscoveryServiceTests: XCTestCase {
             [repository.resolvingSymlinksInPath().path, first.path, automatic.path]
         )
         XCTAssertEqual(projects.map(\.manualPriority), [0, 1, nil])
+    }
+
+    func testRemoteDiscoveryNamespacesProjectsAndNeverUsesLocalFilesystemState() async throws {
+        let remotePath = "/srv/work/shared-app"
+        let service = ProjectDiscoveryService()
+        let first = await service.discover(
+            threads: [
+                makeThread(
+                    id: "remote-a",
+                    cwd: remotePath,
+                    updatedAt: Date(timeIntervalSince1970: 500),
+                    status: "active"
+                )
+            ],
+            manualPaths: ["relative/is/not/a/remote/cwd"],
+            hostID: "ssh:build-a",
+            isRemote: true,
+            remotePathInfo: [
+                remotePath: CodexProjectPathInfo(
+                     canonicalWorkingDirectory: remotePath,
+                     projectPath: remotePath,
+                     exists: true,
+                     isGitRepository: true
+                )
+            ]
+        )
+        let second = await service.discover(
+            threads: [],
+            manualPaths: [remotePath],
+            hostID: "ssh:build-b",
+            isRemote: true,
+            remotePathInfo: [
+                remotePath: CodexProjectPathInfo(
+                    canonicalWorkingDirectory: remotePath,
+                    projectPath: remotePath,
+                    exists: true,
+                    isGitRepository: false
+                )
+            ]
+        )
+
+        let firstProject = try XCTUnwrap(first.first)
+        let secondProject = try XCTUnwrap(second.first)
+        XCTAssertEqual(first.count, 1)
+        XCTAssertEqual(second.count, 1)
+        XCTAssertEqual(firstProject.path, remotePath)
+        XCTAssertEqual(secondProject.path, remotePath)
+        XCTAssertEqual(firstProject.hostID, "ssh:build-a")
+        XCTAssertEqual(secondProject.hostID, "ssh:build-b")
+        XCTAssertNotEqual(firstProject.id, secondProject.id)
+        XCTAssertTrue(firstProject.existsOnDisk)
+        XCTAssertTrue(firstProject.isGitRepository)
+        XCTAssertEqual(firstProject.activeThreadCount, 1)
+    }
+
+    func testRemoteGitSubdirectoriesCollapseToCanonicalWorktreeRoot() async throws {
+        let root = "/srv/repo"
+        let subdirectory = "/srv/repo/Sources/Feature"
+        let projects = await ProjectDiscoveryService().discover(
+            threads: [
+                makeThread(
+                    id: "root",
+                    cwd: root,
+                    updatedAt: Date(timeIntervalSince1970: 600),
+                    status: "completed"
+                ),
+                makeThread(
+                    id: "subdirectory",
+                    cwd: subdirectory,
+                    updatedAt: Date(timeIntervalSince1970: 700),
+                    status: "active"
+                )
+            ],
+            manualPaths: [subdirectory],
+            hostID: "ssh:worker",
+            isRemote: true,
+            remotePathInfo: [
+                root: CodexProjectPathInfo(
+                    canonicalWorkingDirectory: root,
+                    projectPath: root,
+                    exists: true,
+                    isGitRepository: true
+                ),
+                subdirectory: CodexProjectPathInfo(
+                    canonicalWorkingDirectory: subdirectory,
+                    projectPath: root,
+                    exists: true,
+                    isGitRepository: true
+                )
+            ]
+        )
+
+        let project = try XCTUnwrap(projects.first)
+        XCTAssertEqual(projects.count, 1)
+        XCTAssertEqual(project.path, root)
+        XCTAssertEqual(project.threadCount, 2)
+        XCTAssertEqual(project.activeThreadCount, 1)
+        XCTAssertTrue(project.isGitRepository)
+        XCTAssertEqual(project.observedWorkingDirectories, [subdirectory, root])
+        XCTAssertEqual(project.manualPaths, [subdirectory])
+    }
+
+    func testRemoteDiscoveryKeepsMainlineGitAndIgnoredPathFiltering() async throws {
+        let ordinaryPath = "/srv/conversations/notes"
+        let managedWorktreePath = "/srv/codex-worktrees/task-1"
+        let threads = [
+            makeThread(id: "ordinary", cwd: ordinaryPath, updatedAt: Date(), status: "active"),
+            makeThread(id: "managed", cwd: managedWorktreePath, updatedAt: Date(), status: "active")
+        ]
+        let remotePathInfo = [
+            ordinaryPath: CodexProjectPathInfo(
+                canonicalWorkingDirectory: ordinaryPath,
+                projectPath: ordinaryPath,
+                exists: true,
+                isGitRepository: false
+            ),
+            managedWorktreePath: CodexProjectPathInfo(
+                canonicalWorkingDirectory: managedWorktreePath,
+                projectPath: managedWorktreePath,
+                exists: true,
+                isGitRepository: true
+            )
+        ]
+        let service = ProjectDiscoveryService()
+
+        let filtered = await service.discover(
+            threads: threads,
+            manualPaths: [],
+            ignoredPaths: [managedWorktreePath],
+            hostID: "ssh:worker",
+            isRemote: true,
+            remotePathInfo: remotePathInfo
+        )
+        XCTAssertTrue(filtered.isEmpty)
+
+        let explicitlyAdded = await service.discover(
+            threads: threads,
+            manualPaths: [managedWorktreePath, ordinaryPath],
+            ignoredPaths: [managedWorktreePath],
+            hostID: "ssh:worker",
+            isRemote: true,
+            remotePathInfo: remotePathInfo
+        )
+        XCTAssertEqual(explicitlyAdded.map(\.path), [managedWorktreePath, ordinaryPath])
+        XCTAssertEqual(explicitlyAdded.map(\.manualPriority), [0, 1])
+        XCTAssertTrue(explicitlyAdded.allSatisfy(\.isManual))
+        XCTAssertTrue(explicitlyAdded.allSatisfy { $0.threadCount == 1 })
+    }
+
+    func testOfflineRemotePathRemainsVisibleButUnavailable() async throws {
+        let projects = await ProjectDiscoveryService().discover(
+            threads: [],
+            manualPaths: ["/srv/offline"],
+            hostID: "ssh:offline",
+            isRemote: true
+        )
+        let project = try XCTUnwrap(projects.first)
+
+        XCTAssertEqual(project.path, "/srv/offline")
+        XCTAssertEqual(project.manualPaths, ["/srv/offline"])
+        XCTAssertTrue(project.isManual)
+        XCTAssertFalse(project.existsOnDisk)
     }
 
     private func makeTemporaryDirectory() throws -> URL {

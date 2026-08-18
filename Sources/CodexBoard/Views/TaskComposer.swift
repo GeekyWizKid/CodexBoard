@@ -26,7 +26,11 @@ struct TaskComposer: View {
         let initialProjectID = store.selectedProjectID ?? store.visibleProjects.first?.id ?? ""
         _projectID = State(initialValue: initialProjectID)
         let initialProject = store.visibleProjects.first(where: { $0.id == initialProjectID })
-        _workspaceKind = State(initialValue: initialProject?.isGitRepository == true ? .worktree : .project)
+        _workspaceKind = State(initialValue:
+            initialProject?.isGitRepository == true && initialProject?.hostID == CodexHost.localID
+                ? .worktree
+                : .project
+        )
         _autoRun = State(initialValue: store.preferences.defaultAutoRun)
         let configuredModel = store.preferences.modelOverride.trimmingCharacters(in: .whitespacesAndNewlines)
         let initialModel: String
@@ -39,6 +43,18 @@ struct TaskComposer: View {
         }
         _model = State(initialValue: initialModel)
         _effort = State(initialValue: store.defaultTaskEffort(for: initialModel))
+    }
+
+    private var selectedProject: ProjectRecord? {
+        store.visibleProjects.first(where: { $0.id == projectID })
+    }
+
+    private var selectedProjectIsRunnable: Bool {
+        selectedProject.map(store.isProjectRunnable) == true
+    }
+
+    private var selectedProjectIsRemote: Bool {
+        selectedProject.map { !store.isLocalHost($0.hostID) } == true
     }
 
     var body: some View {
@@ -58,7 +74,27 @@ struct TaskComposer: View {
             Form {
                 Picker("项目", selection: $projectID) {
                     ForEach(store.visibleProjects) { project in
-                        Text(project.name).tag(project.id)
+                        Text(projectPickerLabel(project))
+                            .tag(project.id)
+                    }
+                }
+
+                if let selectedProject {
+                    LabeledContent("运行主机") {
+                        let state = store.hostConnectionState(for: selectedProject.hostID)
+                        Label(store.hostName(for: selectedProject.hostID), systemImage: "server.rack")
+                            .foregroundStyle(state.hostStatusColor)
+                            .help(state.hostStatusDetail)
+                    }
+                    if !selectedProjectIsRunnable {
+                        Label(
+                            store.host(for: selectedProject.hostID)?.isEnabled == true
+                                ? "项目路径尚未在该主机验证，暂不能创建任务。"
+                                : "所属主机已停用，暂不能创建任务。",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(BoardTheme.danger)
                     }
                 }
 
@@ -98,6 +134,15 @@ struct TaskComposer: View {
                     reportImportMessage: { submissionError = $0 }
                 )
 
+                if selectedProjectIsRemote {
+                    Label(
+                        "远程任务暂不支持从这台 Mac 上传附件；请把所需文件放入远程项目后，在任务描述中写明路径。",
+                        systemImage: "paperclip.badge.ellipsis"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
                 Toggle(isOn: $autoRun) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("全自动模式")
@@ -130,6 +175,8 @@ struct TaskComposer: View {
                 .disabled(
                     isSubmitting
                         || projectID.isEmpty
+                        || !selectedProjectIsRunnable
+                        || (selectedProjectIsRemote && !attachments.isEmpty)
                         || (sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             && attachments.isEmpty)
                 )
@@ -152,6 +199,9 @@ struct TaskComposer: View {
         .onChange(of: projectID) { _, _ in
             selectedSkillIDs.removeAll()
             selectedAppIDs.removeAll()
+            if selectedProjectIsRemote {
+                workspaceKind = .project
+            }
         }
         .onChange(of: model) { _, _ in
             synchronizeModelCapabilities()
@@ -159,6 +209,23 @@ struct TaskComposer: View {
         .onChange(of: store.availableModels) { _, _ in
             synchronizeModelSelection(selectDefaultWhenEmpty: true)
         }
+        .onChange(of: store.visibleProjects.map(\.id)) { _, projectIDs in
+            if !projectIDs.contains(projectID) {
+                projectID = store.selectedProjectID ?? projectIDs.first ?? ""
+            }
+        }
+    }
+
+    private func projectPickerLabel(_ project: ProjectRecord) -> String {
+        let suffix: String
+        if store.host(for: project.hostID)?.isEnabled != true {
+            suffix = " · 已停用"
+        } else if !project.existsOnDisk {
+            suffix = " · 路径未验证"
+        } else {
+            suffix = ""
+        }
+        return "\(project.name) — \(store.hostName(for: project.hostID))\(suffix)"
     }
 
     private var codexOptionsEditor: some View {
@@ -280,6 +347,10 @@ struct TaskComposer: View {
     }
 
     private func chooseFiles() {
+        guard !selectedProjectIsRemote else {
+            submissionError = "远程任务暂不支持上传本机附件。请改为在远程项目中准备文件并填写路径。"
+            return
+        }
         let panel = NSOpenPanel()
         panel.title = L10n.text("添加任务附件", fallback: "添加任务附件")
         panel.prompt = L10n.text("添加", fallback: "添加")

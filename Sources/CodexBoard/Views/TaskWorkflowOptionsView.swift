@@ -16,10 +16,18 @@ struct TaskWorkflowOptionsView: View {
         store.dependencyCandidates(for: projectID)
     }
 
+    private var isRemoteProject: Bool {
+        project.map { !store.isLocalHost($0.hostID) } == true
+    }
+
+    private var availableWorkspaceKinds: [TaskWorkspaceKind] {
+        project?.isGitRepository == true && !isRemoteProject ? TaskWorkspaceKind.allCases : [.project]
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Picker("执行工作区", selection: $workspaceKind) {
-                ForEach(project?.isGitRepository == true ? TaskWorkspaceKind.allCases : [.project]) { kind in
+                ForEach(availableWorkspaceKinds) { kind in
                     Text(kind.title).tag(kind)
                 }
             }
@@ -46,7 +54,7 @@ struct TaskWorkflowOptionsView: View {
         }
         .onChange(of: projectID) { _, _ in
             dependencyIDs.removeAll()
-            if project?.isGitRepository != true {
+            if project?.isGitRepository != true || isRemoteProject {
                 workspaceKind = .project
             }
         }
@@ -86,6 +94,12 @@ struct TaskWorkflowOptionsView: View {
     }
 
     private var workspaceDescription: String {
+        if isRemoteProject {
+            return L10n.text(
+                "远程项目直接在服务器上的项目目录执行；本机不会为它创建 Worktree。",
+                fallback: "远程项目直接在服务器上的项目目录执行；本机不会为它创建 Worktree。"
+            )
+        }
         if workspaceKind == .worktree {
             if project?.isGitRepository == true {
                 return L10n.text(

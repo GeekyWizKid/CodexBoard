@@ -52,15 +52,34 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         let nextCursor: String?
     }
 
+    private struct DynamicToolRegistration {
+        let id: UUID
+        let threadID: String
+        let tool: String
+        let handler: CodexDynamicToolHandler
+    }
+
+    private struct DynamicToolCallKey: Hashable {
+        let threadID: String
+        let callID: String
+    }
+
     private let resolver: CodexExecutableResolver
+    private let launchMode: CodexAppServerLaunchMode
+    private let transportFactory: (@Sendable () async throws -> AppServerTransport)?
     private let parser = RPCMessageParser()
     private let requestTimeout: TimeInterval
     private var transport: AppServerTransport?
     private var connectWaiters: [CheckedContinuation<Void, Error>] = []
+    private var connectionGeneration: UInt64 = 0
     private var nextRequestID = 1
     private var pendingRequests: [Int: PendingRequest] = [:]
     private var pendingInteractions: [CodexRequestID: PendingInteraction] = [:]
     private var eventContinuation: AsyncStream<CodexEvent>.Continuation?
+    private var realtimeEventContinuation: AsyncStream<CodexRealtimeEvent>.Continuation?
+    private var dynamicToolRegistrations: [UUID: DynamicToolRegistration] = [:]
+    private var dynamicToolResults: [DynamicToolCallKey: CodexDynamicToolResult] = [:]
+    private var dynamicToolTasks: [DynamicToolCallKey: Task<CodexDynamicToolResult, Never>] = [:]
 
     var pendingInteractionIDs: Set<CodexRequestID> {
         Set(pendingInteractions.keys)
@@ -72,17 +91,29 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         }
     }
 
+    lazy var realtimeEvents: AsyncStream<CodexRealtimeEvent> = AsyncStream { [weak self] continuation in
+        Task { @MainActor [weak self] in
+            self?.realtimeEventContinuation = continuation
+        }
+    }
+
     init(
+        launchMode: CodexAppServerLaunchMode = .local,
         resolver: CodexExecutableResolver = CodexExecutableResolver(),
-        requestTimeout: TimeInterval = 30
+        requestTimeout: TimeInterval = 30,
+        transportFactory: (@Sendable () async throws -> AppServerTransport)? = nil
     ) {
+        self.launchMode = launchMode
         self.resolver = resolver
         self.requestTimeout = max(1, requestTimeout)
+        self.transportFactory = transportFactory
     }
 
     deinit {
         transport?.stop()
         eventContinuation?.finish()
+        realtimeEventContinuation?.finish()
+        dynamicToolTasks.values.forEach { $0.cancel() }
     }
 
     func connect() async throws {
@@ -92,24 +123,63 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
                 connectWaiters.append(continuation)
             }
         }
+        connectionGeneration &+= 1
+        let attemptGeneration = connectionGeneration
         connectionState = .connecting
         lastError = nil
-        let resolver = resolver
+        var attemptTransport: AppServerTransport?
         do {
-            let executable = try await Task.detached(priority: .userInitiated) {
-                try resolver.resolve()
-            }.value
-            let newTransport = AppServerTransport(executableURL: executable)
+            let newTransport: AppServerTransport
+            if let transportFactory {
+                newTransport = try await transportFactory()
+            } else {
+                switch launchMode {
+                case .local:
+                    let resolver = resolver
+                    let executable = try await Task.detached(priority: .userInitiated) {
+                        try resolver.resolve()
+                    }.value
+                    newTransport = AppServerTransport(executableURL: executable)
+                case let .realtimeLocal(apiKey):
+                    let resolver = resolver
+                    let executable = try await Task.detached(priority: .userInitiated) {
+                        try resolver.resolve()
+                    }.value
+                    newTransport = AppServerTransport(
+                        executableURL: executable,
+                        arguments: [
+                            "app-server",
+                            "--stdio",
+                            "--enable", "realtime_conversation",
+                            "-c", "allow_login_shell=false",
+                            "-c", "shell_environment_policy.inherit=\"core\"",
+                            "-c", "shell_environment_policy.ignore_default_excludes=false",
+                            "-c", "shell_environment_policy.exclude=[\"OPENAI_API_KEY\"]"
+                        ],
+                        environmentOverrides: ["OPENAI_API_KEY": apiKey]
+                    )
+                case let .ssh(hostAlias):
+                    newTransport = try AppServerTransport(sshHostAlias: hostAlias)
+                }
+            }
+            attemptTransport = newTransport
+            try requireCurrentConnectionAttempt(attemptGeneration)
             newTransport.delegate = self
             transport = newTransport
             try newTransport.start()
             let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
             _ = try await request(method: "initialize", params: Self.makeInitializeParams(version: version))
+            try requireCurrentConnectionAttempt(attemptGeneration)
             try notify(method: "initialized", params: .object([:]))
             connectionState = .connected
             resumeConnectWaiters()
         } catch {
             let normalized = normalize(error)
+            guard connectionGeneration == attemptGeneration else {
+                attemptTransport?.delegate = nil
+                attemptTransport?.stop()
+                throw normalized
+            }
             lastError = normalized.localizedDescription
             connectionState = .failed(normalized.localizedDescription)
             disconnect(failingWith: normalized)
@@ -119,8 +189,10 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     }
 
     func disconnect() {
+        connectionGeneration &+= 1
         disconnect(failingWith: .disconnected)
         connectionState = .disconnected
+        resumeConnectWaiters(throwing: CodexClientError.disconnected)
     }
 
     func verifyAccount() async throws -> Bool {
@@ -294,6 +366,73 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         return CodexThreadPage(threads: threads, nextCursor: nextCursor)
     }
 
+    func inspectProjectPath(_ path: String) async throws -> CodexProjectPathInfo {
+        try await ensureConnected()
+        let fallbackPath = (path as NSString).standardizingPath
+        guard (fallbackPath as NSString).isAbsolutePath, fallbackPath != "/" else {
+            return CodexProjectPathInfo(
+                canonicalWorkingDirectory: fallbackPath,
+                projectPath: fallbackPath,
+                exists: false,
+                isGitRepository: false
+            )
+        }
+        let physicalDirectory = try await executeReadOnlyCommand(
+            command: ["pwd", "-P"],
+            cwd: path
+        )
+        guard physicalDirectory.exitCode == 0,
+              let canonicalWorkingDirectory = Self.absolutePath(from: physicalDirectory.stdout)
+        else {
+            return CodexProjectPathInfo(
+                canonicalWorkingDirectory: fallbackPath,
+                projectPath: fallbackPath,
+                exists: false,
+                isGitRepository: false
+            )
+        }
+        guard canonicalWorkingDirectory != "/" else {
+            return CodexProjectPathInfo(
+                canonicalWorkingDirectory: canonicalWorkingDirectory,
+                projectPath: canonicalWorkingDirectory,
+                exists: false,
+                isGitRepository: false
+            )
+        }
+
+        let gitResult = try await executeReadOnlyCommand(
+            command: ["git", "-C", canonicalWorkingDirectory, "rev-parse", "--show-toplevel"],
+            cwd: canonicalWorkingDirectory
+        )
+        if gitResult.exitCode == 0,
+           let gitRoot = Self.absolutePath(from: gitResult.stdout),
+           gitRoot != "/",
+           Self.isSameOrDescendant(canonicalWorkingDirectory, of: gitRoot) {
+            return CodexProjectPathInfo(
+                canonicalWorkingDirectory: canonicalWorkingDirectory,
+                projectPath: gitRoot,
+                exists: true,
+                isGitRepository: true
+            )
+        }
+
+        return CodexProjectPathInfo(
+            canonicalWorkingDirectory: canonicalWorkingDirectory,
+            projectPath: canonicalWorkingDirectory,
+            exists: true,
+            isGitRepository: false
+        )
+    }
+
+    func readThread(threadID: String, includeTurns: Bool) async throws -> CodexThreadDetail {
+        try await ensureConnected()
+        let value = try await request(method: "thread/read", params: .object([
+            "threadId": .string(threadID),
+            "includeTurns": .bool(includeTurns)
+        ]))
+        return try Self.parseThreadReadResponse(value)
+    }
+
     func startThread(cwd: String, model: String?, serviceTier: String) async throws -> CodexStartedThread {
         try await ensureConnected()
         let params = Self.makeThreadStartParams(cwd: cwd, model: model, serviceTier: serviceTier)
@@ -307,6 +446,126 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             throw CodexClientError.invalidResponse("thread/start 缺少 thread/session/cwd/model")
         }
         return CodexStartedThread(threadID: threadID, sessionID: sessionID, model: actualModel, cwd: actualCWD)
+    }
+
+    func startLiveThread(
+        cwd: String,
+        model: String?,
+        tools: [CodexDynamicToolSpec]
+    ) async throws -> CodexStartedThread {
+        try await ensureConnected()
+        var params: [String: JSONValue] = [
+            "cwd": .string(cwd),
+            "approvalPolicy": .string("never"),
+            "sandbox": .string("read-only"),
+            "personality": .string("pragmatic"),
+            "serviceName": .string("codex_board_live"),
+            "ephemeral": .bool(true),
+            "runtimeWorkspaceRoots": .array([.string(cwd)]),
+            "environments": .array([]),
+            "dynamicTools": .array(tools.map(Self.dynamicToolJSON))
+        ]
+        if let model, !model.isEmpty { params["model"] = .string(model) }
+        let value = try await request(method: "thread/start", params: .object(params))
+        return try Self.parseStartedThread(value, method: "thread/start")
+    }
+
+    func listRealtimeVoices() async throws -> CodexRealtimeVoiceCatalog {
+        try await ensureConnected()
+        let value = try await request(method: "thread/realtime/listVoices", params: .object([:]))
+        guard let voices = value["voices"],
+              let v1 = voices["v1"]?.arrayValue?.compactMap(\.stringValue),
+              let v2 = voices["v2"]?.arrayValue?.compactMap(\.stringValue),
+              let defaultV1 = voices["defaultV1"]?.stringValue,
+              let defaultV2 = voices["defaultV2"]?.stringValue,
+              !v1.isEmpty,
+              !v2.isEmpty
+        else { throw CodexRealtimeError.invalidVoiceCatalog }
+        return CodexRealtimeVoiceCatalog(v1: v1, v2: v2, defaultV1: defaultV1, defaultV2: defaultV2)
+    }
+
+    func startRealtime(threadID: String, options: CodexRealtimeStartOptions) async throws {
+        try await ensureConnected()
+        var params: [String: JSONValue] = [
+            "threadId": .string(threadID),
+            "outputModality": .string(options.outputModality.rawValue),
+            "version": .string(options.version.rawValue),
+            "includeStartupContext": .bool(options.includeStartupContext),
+            "clientManagedHandoffs": .bool(false),
+            "codexResponsesAsItems": .bool(false),
+            "transport": .object(["type": .string("websocket")])
+        ]
+        if !options.model.isEmpty { params["model"] = .string(options.model) }
+        if let voice = options.voice, !voice.isEmpty { params["voice"] = .string(voice) }
+        if let prompt = options.prompt, !prompt.isEmpty { params["prompt"] = .string(prompt) }
+        _ = try await request(method: "thread/realtime/start", params: .object(params))
+    }
+
+    func appendRealtimeAudio(threadID: String, chunk: CodexRealtimeAudioChunk) async throws {
+        try await ensureConnected()
+        var audio: [String: JSONValue] = [
+            "data": .string(chunk.data.base64EncodedString()),
+            "numChannels": .integer(Int64(chunk.channelCount)),
+            "sampleRate": .integer(Int64(chunk.sampleRate))
+        ]
+        if let samples = chunk.samplesPerChannel {
+            audio["samplesPerChannel"] = .integer(Int64(samples))
+        }
+        if let itemID = chunk.itemID {
+            audio["itemId"] = .string(itemID)
+        }
+        _ = try await request(method: "thread/realtime/appendAudio", params: .object([
+            "threadId": .string(threadID),
+            "audio": .object(audio)
+        ]))
+    }
+
+    func appendRealtimeText(
+        threadID: String,
+        text: String,
+        role: CodexRealtimeTextRole = .user
+    ) async throws {
+        try await ensureConnected()
+        _ = try await request(method: "thread/realtime/appendText", params: .object([
+            "threadId": .string(threadID),
+            "text": .string(text),
+            "role": .string(role.rawValue)
+        ]))
+    }
+
+    func appendRealtimeSpeech(threadID: String, text: String) async throws {
+        try await ensureConnected()
+        _ = try await request(method: "thread/realtime/appendSpeech", params: .object([
+            "threadId": .string(threadID),
+            "text": .string(text)
+        ]))
+    }
+
+    func stopRealtime(threadID: String) async throws {
+        guard connectionState == .connected else { return }
+        _ = try await request(method: "thread/realtime/stop", params: .object([
+            "threadId": .string(threadID)
+        ]))
+    }
+
+    @discardableResult
+    func registerDynamicToolHandler(
+        threadID: String,
+        tool: String,
+        handler: @escaping CodexDynamicToolHandler
+    ) -> UUID {
+        let registration = DynamicToolRegistration(
+            id: UUID(),
+            threadID: threadID,
+            tool: tool,
+            handler: handler
+        )
+        dynamicToolRegistrations[registration.id] = registration
+        return registration.id
+    }
+
+    func unregisterDynamicToolHandler(_ registrationID: UUID) {
+        dynamicToolRegistrations.removeValue(forKey: registrationID)
     }
 
     func resumeThread(threadID: String, cwd: String) async throws -> CodexStartedThread {
@@ -567,6 +826,73 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         if connectionState != .connected { try await connect() }
     }
 
+    private func requireCurrentConnectionAttempt(_ generation: UInt64) throws {
+        guard connectionGeneration == generation, connectionState == .connecting else {
+            throw CodexClientError.disconnected
+        }
+    }
+
+    private struct CommandResult {
+        let exitCode: Int
+        let stdout: String
+        let stderr: String
+    }
+
+    private func executeReadOnlyCommand(command: [String], cwd: String) async throws -> CommandResult {
+        let value = try await request(
+            method: "command/exec",
+            params: Self.readOnlyCommandExecParams(command: command, cwd: cwd)
+        )
+        guard let exitCode = value["exitCode"]?.intValue,
+              let stdout = value["stdout"]?.stringValue,
+              let stderr = value["stderr"]?.stringValue
+        else {
+            throw CodexClientError.invalidResponse("command/exec 缺少 exitCode/stdout/stderr")
+        }
+        return CommandResult(exitCode: exitCode, stdout: stdout, stderr: stderr)
+    }
+
+    static func readOnlyCommandExecParams(command: [String], cwd: String) -> JSONValue {
+        .object([
+            "command": .array(command.map(JSONValue.string)),
+            "cwd": .string(cwd),
+            "timeoutMs": .integer(3_000),
+            "outputBytesCap": .integer(8_192),
+            "sandboxPolicy": .object([
+                "type": .string("readOnly"),
+                "networkAccess": .bool(false)
+            ]),
+            "env": .object([
+                "GIT_OPTIONAL_LOCKS": .string("0"),
+                "GIT_TERMINAL_PROMPT": .string("0"),
+                "GIT_DIR": .null,
+                "GIT_WORK_TREE": .null,
+                "GIT_INDEX_FILE": .null,
+                "GIT_COMMON_DIR": .null,
+                "GIT_OBJECT_DIRECTORY": .null,
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": .null,
+                "GIT_CEILING_DIRECTORIES": .null
+            ])
+        ])
+    }
+
+    private static func absolutePath(from output: String) -> String? {
+        let path = output.trimmingCharacters(in: .newlines)
+        guard !path.isEmpty,
+              !path.contains("\0"),
+              !path.unicodeScalars.contains(where: CharacterSet.newlines.contains),
+              (path as NSString).isAbsolutePath
+        else { return nil }
+        return (path as NSString).standardizingPath
+    }
+
+    private static func isSameOrDescendant(_ path: String, of ancestor: String) -> Bool {
+        let pathComponents = (path as NSString).pathComponents
+        let ancestorComponents = (ancestor as NSString).pathComponents
+        guard ancestorComponents.count <= pathComponents.count else { return false }
+        return pathComponents.prefix(ancestorComponents.count).elementsEqual(ancestorComponents)
+    }
+
     private func request(method: String, params: JSONValue? = nil) async throws -> JSONValue {
         guard let transport else { throw CodexClientError.disconnected }
         let id = nextRequestID
@@ -653,6 +979,10 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     }
 
     func handleServerRequest(id: JSONValue, method: String, params: JSONValue?) {
+        if method == "item/tool/call" {
+            handleDynamicToolRequest(id: id, params: params)
+            return
+        }
         do {
             switch method {
             case "currentTime/read":
@@ -694,6 +1024,71 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         }
     }
 
+    private func handleDynamicToolRequest(id: JSONValue, params: JSONValue?) {
+        guard let params,
+              let threadID = params["threadId"]?.stringValue,
+              let turnID = params["turnId"]?.stringValue,
+              let callID = params["callId"]?.stringValue,
+              let tool = params["tool"]?.stringValue,
+              let arguments = params["arguments"]
+        else {
+            respondToDynamicTool(
+                id: id,
+                result: Self.failedDynamicToolResult("工具请求格式无效。")
+            )
+            return
+        }
+
+        let key = DynamicToolCallKey(threadID: threadID, callID: callID)
+        if let result = dynamicToolResults[key] {
+            respondToDynamicTool(id: id, result: result)
+            return
+        }
+
+        let call = CodexDynamicToolCall(
+            threadID: threadID,
+            turnID: turnID,
+            callID: callID,
+            namespace: params["namespace"]?.stringValue,
+            tool: tool,
+            arguments: arguments
+        )
+        let requestGeneration = connectionGeneration
+        let task: Task<CodexDynamicToolResult, Never>
+        if let existing = dynamicToolTasks[key] {
+            task = existing
+        } else if let registration = dynamicToolRegistrations.values.first(where: {
+            $0.threadID == threadID && $0.tool == tool
+        }) {
+            task = Task { @MainActor in
+                await registration.handler(call)
+            }
+            dynamicToolTasks[key] = task
+        } else {
+            let result = Self.failedDynamicToolResult("Live 会话请求了未注册的工具：\(tool)")
+            dynamicToolResults[key] = result
+            respondToDynamicTool(id: id, result: result)
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            let result = await task.value
+            guard let self else { return }
+            self.dynamicToolTasks.removeValue(forKey: key)
+            guard self.connectionGeneration == requestGeneration, self.transport != nil else { return }
+            self.dynamicToolResults[key] = result
+            self.respondToDynamicTool(id: id, result: result)
+        }
+    }
+
+    private func respondToDynamicTool(id: JSONValue, result: CodexDynamicToolResult) {
+        do {
+            try respond(id: id, result: result.jsonValue)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
     func handleNotification(method: String, params: JSONValue?) {
         guard let params else { return }
         let threadID = params["threadId"]?.stringValue
@@ -719,6 +1114,43 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             return
         }
         switch method {
+        case "thread/realtime/started":
+            guard let threadID,
+                  let rawVersion = params["version"]?.stringValue,
+                  let version = CodexRealtimeVersion(rawValue: rawVersion)
+            else { return }
+            realtimeEventContinuation?.yield(.started(
+                threadID: threadID,
+                version: version,
+                sessionID: params["realtimeSessionId"]?.stringValue
+            ))
+        case "thread/realtime/itemAdded":
+            guard let threadID, let item = params["item"] else { return }
+            realtimeEventContinuation?.yield(.itemAdded(threadID: threadID, item: item))
+        case "thread/realtime/transcript/delta":
+            guard let threadID,
+                  let role = params["role"]?.stringValue,
+                  let delta = params["delta"]?.stringValue
+            else { return }
+            realtimeEventContinuation?.yield(.transcriptDelta(threadID: threadID, role: role, delta: delta))
+        case "thread/realtime/transcript/done":
+            guard let threadID,
+                  let role = params["role"]?.stringValue,
+                  let text = params["text"]?.stringValue
+            else { return }
+            realtimeEventContinuation?.yield(.transcriptDone(threadID: threadID, role: role, text: text))
+        case "thread/realtime/outputAudio/delta":
+            guard let threadID, let audio = params["audio"], let chunk = Self.parseRealtimeAudio(audio) else { return }
+            realtimeEventContinuation?.yield(.outputAudioDelta(threadID: threadID, chunk: chunk))
+        case "thread/realtime/sdp":
+            guard let threadID, let sdp = params["sdp"]?.stringValue else { return }
+            realtimeEventContinuation?.yield(.sdp(threadID: threadID, sdp: sdp))
+        case "thread/realtime/error":
+            guard let threadID, let message = params["message"]?.stringValue else { return }
+            realtimeEventContinuation?.yield(.error(threadID: threadID, message: message))
+        case "thread/realtime/closed":
+            guard let threadID else { return }
+            realtimeEventContinuation?.yield(.closed(threadID: threadID, reason: params["reason"]?.stringValue))
         case "item/agentMessage/delta":
             guard let threadID, let turnID, let delta = params["delta"]?.stringValue else { return }
             eventContinuation?.yield(.agentDelta(threadID: threadID, turnID: turnID, delta: delta))
@@ -783,6 +1215,46 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         default:
             return nil
         }
+    }
+
+    private static func parseRealtimeAudio(_ value: JSONValue) -> CodexRealtimeAudioChunk? {
+        guard let encoded = value["data"]?.stringValue,
+              let data = Data(base64Encoded: encoded),
+              let channels = value["numChannels"]?.intValue.flatMap(UInt16.init(exactly:)),
+              let sampleRate = value["sampleRate"]?.intValue.flatMap(UInt32.init(exactly:))
+        else { return nil }
+        let samples = value["samplesPerChannel"]?.intValue.flatMap(UInt32.init(exactly:))
+        return try? CodexRealtimeAudioChunk(
+            data: data,
+            sampleRate: sampleRate,
+            channelCount: channels,
+            samplesPerChannel: samples,
+            itemID: value["itemId"]?.stringValue
+        )
+    }
+
+    private static func dynamicToolJSON(_ tool: CodexDynamicToolSpec) -> JSONValue {
+        .object([
+            "type": .string("function"),
+            "name": .string(tool.name),
+            "description": .string(tool.description),
+            "inputSchema": tool.inputSchema,
+            "deferLoading": .bool(tool.deferLoading)
+        ])
+    }
+
+    private static func parseStartedThread(_ value: JSONValue, method: String) throws -> CodexStartedThread {
+        guard let thread = value["thread"],
+              let threadID = thread["id"]?.stringValue,
+              let sessionID = thread["sessionId"]?.stringValue,
+              let actualCWD = value["cwd"]?.stringValue,
+              let actualModel = value["model"]?.stringValue
+        else { throw CodexClientError.invalidResponse("\(method) 缺少 thread/session/cwd/model") }
+        return CodexStartedThread(threadID: threadID, sessionID: sessionID, model: actualModel, cwd: actualCWD)
+    }
+
+    private static func failedDynamicToolResult(_ message: String) -> CodexDynamicToolResult {
+        CodexDynamicToolResult(success: false, contentItems: [.text(message)])
     }
 
     private func emitWarning(params: JSONValue?, message: String) {
@@ -1400,6 +1872,55 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         )
     }
 
+    static func parseThreadReadResponse(_ value: JSONValue) throws -> CodexThreadDetail {
+        guard let thread = value["thread"], let summary = parseThread(thread) else {
+            throw CodexClientError.invalidResponse("thread/read 缺少有效 thread")
+        }
+        guard let rawTurns = thread["turns"]?.arrayValue else {
+            throw CodexClientError.invalidResponse("thread/read 缺少 turns")
+        }
+        let turns = rawTurns.compactMap(parseThreadTurn)
+        guard turns.count == rawTurns.count else {
+            throw CodexClientError.invalidResponse("thread/read 包含无效 turn")
+        }
+        return CodexThreadDetail(summary: summary, turns: turns)
+    }
+
+    private static func parseThreadTurn(_ value: JSONValue) -> CodexThreadTurn? {
+        guard let id = value["id"]?.stringValue,
+              let status = value["status"]?.stringValue,
+              let rawItems = value["items"]?.arrayValue
+        else { return nil }
+        let items = rawItems.compactMap(parseThreadItem)
+        guard items.count == rawItems.count else { return nil }
+        return CodexThreadTurn(
+            id: id,
+            status: status,
+            items: items,
+            error: turnErrorDescription(value["error"]),
+            startedAt: parseOptionalDate(value["startedAt"]),
+            completedAt: parseOptionalDate(value["completedAt"]),
+            durationMilliseconds: value["durationMs"]?.int64Value
+        )
+    }
+
+    private static func parseThreadItem(_ value: JSONValue) -> CodexThreadItem? {
+        guard let id = value["id"]?.stringValue,
+              let type = value["type"]?.stringValue
+        else { return nil }
+        return CodexThreadItem(
+            id: id,
+            type: type,
+            text: value["text"]?.stringValue,
+            status: value["status"]?.stringValue
+        )
+    }
+
+    private static func parseOptionalDate(_ value: JSONValue?) -> Date? {
+        guard let seconds = value?.int64Value else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(seconds))
+    }
+
     private static func sourceKind(_ value: JSONValue?) -> String {
         if let source = value?.stringValue { return source }
         guard let object = value?.objectValue else { return "unknown" }
@@ -1461,6 +1982,10 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             request.timeoutTask?.cancel()
             request.continuation.resume(throwing: error)
         }
+        dynamicToolTasks.values.forEach { $0.cancel() }
+        dynamicToolTasks.removeAll()
+        dynamicToolResults.removeAll()
+        dynamicToolRegistrations.removeAll()
     }
 }
 
@@ -1472,11 +1997,14 @@ extension CodexAppServerClient: AppServerTransportDelegate {
     nonisolated func transportDidExit(status: Int32) {
         MainActor.assumeIsolated { [weak self] in
             guard let self, self.transport != nil else { return }
-            let error = CodexClientError.processExited(status)
+            let error = CodexClientError.processExited(status, stderr: self.transport?.stderrDiagnostics)
+            self.connectionGeneration &+= 1
             self.lastError = error.localizedDescription
             self.connectionState = .failed(error.localizedDescription)
             self.disconnect(failingWith: error)
+            self.resumeConnectWaiters(throwing: error)
             self.eventContinuation?.yield(.connectionLost(message: error.localizedDescription))
+            self.realtimeEventContinuation?.yield(.connectionLost(message: error.localizedDescription))
         }
     }
 }

@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 
 enum BoardPersistenceError: LocalizedError, Sendable {
+    case invalidDataPath(value: String)
     case createDirectoryFailed(path: String, reason: String)
     case readFailed(path: String, reason: String)
     case corruptFile(path: String, reason: String)
@@ -11,6 +12,8 @@ enum BoardPersistenceError: LocalizedError, Sendable {
 
     var errorDescription: String? {
         switch self {
+        case let .invalidDataPath(value):
+            "CODEXBOARD_DATA_PATH 必须是安全的绝对文件路径，当前值为：\(value)"
         case let .createDirectoryFailed(path, reason):
             "无法创建看板数据目录 \(path)：\(reason)"
         case let .readFailed(path, reason):
@@ -33,19 +36,51 @@ protocol BoardPersisting: Sendable {
 }
 
 actor BoardPersistence: BoardPersisting {
+    static let dataPathEnvironmentKey = "CODEXBOARD_DATA_PATH"
+
     private let fileURL: URL
     private let fileManager: FileManager
+    private let configurationError: BoardPersistenceError?
 
-    init(fileURL: URL? = nil) {
+    init(
+        fileURL: URL? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
         let fileManager = FileManager.default
         self.fileManager = fileManager
-        self.fileURL = (fileURL ?? fileManager.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/CodexBoard", isDirectory: true)
-            .appendingPathComponent("board.json", isDirectory: false))
-            .standardizedFileURL
+
+        if let fileURL {
+            self.fileURL = fileURL.standardizedFileURL
+            configurationError = nil
+        } else if let configuredPath = environment[Self.dataPathEnvironmentKey] {
+            let path = configuredPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedURL = URL(fileURLWithPath: path, isDirectory: false).standardizedFileURL
+            if !path.isEmpty,
+               (path as NSString).isAbsolutePath,
+               resolvedURL.path != "/",
+               !resolvedURL.lastPathComponent.isEmpty {
+                self.fileURL = resolvedURL
+                configurationError = nil
+            } else {
+                self.fileURL = fileManager.temporaryDirectory
+                    .appendingPathComponent("CodexBoard-invalid-data-path", isDirectory: true)
+                    .appendingPathComponent("board.json", isDirectory: false)
+                configurationError = .invalidDataPath(value: configuredPath)
+            }
+        } else {
+            self.fileURL = fileManager.homeDirectoryForCurrentUser
+                .appendingPathComponent(
+                    "Library/Application Support/CodexBoard",
+                    isDirectory: true
+                )
+                .appendingPathComponent("board.json", isDirectory: false)
+                .standardizedFileURL
+            configurationError = nil
+        }
     }
 
     func load() throws -> BoardSnapshot {
+        try validateConfiguration()
         guard let data = try existingData() else {
             return .empty
         }
@@ -56,6 +91,7 @@ actor BoardPersistence: BoardPersisting {
     }
 
     func save(_ snapshot: BoardSnapshot) throws {
+        try validateConfiguration()
         try prepareDirectory()
 
         // Refuse to replace an unreadable or malformed file. This preserves the
@@ -78,6 +114,12 @@ actor BoardPersistence: BoardPersisting {
 
     private var directoryURL: URL {
         fileURL.deletingLastPathComponent()
+    }
+
+    private func validateConfiguration() throws {
+        if let configurationError {
+            throw configurationError
+        }
     }
 
     private func existingData() throws -> Data? {
