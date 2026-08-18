@@ -69,6 +69,14 @@ enum JSONValue: Codable, Equatable, Sendable {
         }
     }
 
+    var int64Value: Int64? {
+        switch self {
+        case let .integer(value): value
+        case let .number(value): Int64(exactly: value)
+        default: nil
+        }
+    }
+
     var boolValue: Bool? {
         guard case let .bool(value) = self else { return nil }
         return value
@@ -120,6 +128,11 @@ enum CodexConnectionState: Equatable, Sendable {
     case failed(String)
 }
 
+enum CodexAppServerLaunchMode: Equatable, Sendable {
+    case local
+    case ssh(hostAlias: String)
+}
+
 struct CodexThreadSummary: Equatable, Sendable {
     let id: String
     let sessionID: String
@@ -137,6 +150,35 @@ struct CodexThreadSummary: Equatable, Sendable {
 struct CodexThreadPage: Equatable, Sendable {
     let threads: [CodexThreadSummary]
     let nextCursor: String?
+}
+
+struct CodexProjectPathInfo: Equatable, Sendable {
+    let canonicalWorkingDirectory: String
+    let projectPath: String
+    let exists: Bool
+    let isGitRepository: Bool
+}
+
+struct CodexThreadDetail: Equatable, Sendable {
+    let summary: CodexThreadSummary
+    let turns: [CodexThreadTurn]
+}
+
+struct CodexThreadTurn: Equatable, Sendable {
+    let id: String
+    let status: String
+    let items: [CodexThreadItem]
+    let error: String?
+    let startedAt: Date?
+    let completedAt: Date?
+    let durationMilliseconds: Int64?
+}
+
+struct CodexThreadItem: Equatable, Sendable {
+    let id: String
+    let type: String
+    let text: String?
+    let status: String?
 }
 
 struct CodexStartedThread: Equatable, Sendable {
@@ -165,23 +207,30 @@ enum CodexEvent: Sendable {
 
 enum CodexClientError: LocalizedError, Equatable {
     case executableNotFound
+    case invalidSSHHostAlias
     case processLaunchFailed
     case disconnected
     case transportWriteFailed
     case invalidResponse(String)
     case requestTimedOut(String)
-    case processExited(Int32)
+    case processExited(Int32, stderr: String? = nil)
     case rpc(code: Int, message: String)
 
     var errorDescription: String? {
         switch self {
         case .executableNotFound: "找不到本机 Codex CLI。"
+        case .invalidSSHHostAlias: "SSH 主机别名无效；仅支持字母、数字、点、下划线和连字符。"
         case .processLaunchFailed: "无法启动 Codex app-server。"
         case .disconnected: "Codex app-server 已断开。"
         case .transportWriteFailed: "无法向 Codex app-server 发送请求。"
         case let .invalidResponse(detail): "Codex app-server 返回了无效响应：\(detail)"
         case let .requestTimedOut(method): "Codex 请求超时：\(method)"
-        case let .processExited(status): "Codex app-server 已退出（状态 \(status)）。"
+        case let .processExited(status, stderr):
+            if let stderr, !stderr.isEmpty {
+                "Codex app-server 已退出（状态 \(status)）：\(stderr)"
+            } else {
+                "Codex app-server 已退出（状态 \(status)）。"
+            }
         case let .rpc(code, message): "Codex 错误 \(code)：\(message)"
         }
     }

@@ -6,10 +6,14 @@ protocol AppServerTransportDelegate: AnyObject, Sendable {
 }
 
 final class AppServerTransport: @unchecked Sendable {
+    static let remoteAppServerCommand = "exec codex app-server --stdio"
+
     weak var delegate: (any AppServerTransportDelegate)?
 
     private let executableURL: URL
+    private let arguments: [String]
     private let maximumLineBytes: Int
+    private let maximumStderrBytes: Int
     private let stateLock = NSLock()
     private let writeLock = NSLock()
     // A single FIFO queue preserves JSONL ordering. It targets the main queue so
@@ -24,13 +28,79 @@ final class AppServerTransport: @unchecked Sendable {
     private var outputHandle: FileHandle?
     private var errorHandle: FileHandle?
     private var buffer = Data()
+    private var stderrBuffer = Data()
+    private var stderrWasTruncated = false
     private var didExit = false
     private var stdoutReachedEOF = false
+    private var stderrReachedEOF = false
     private var terminationStatus: Int32?
 
-    init(executableURL: URL, maximumLineBytes: Int = 8 * 1_024 * 1_024) {
+    init(
+        executableURL: URL,
+        maximumLineBytes: Int = 8 * 1_024 * 1_024,
+        maximumStderrBytes: Int = 32 * 1_024
+    ) {
         self.executableURL = executableURL
-        self.maximumLineBytes = maximumLineBytes
+        arguments = ["app-server", "--stdio"]
+        self.maximumLineBytes = max(1, maximumLineBytes)
+        self.maximumStderrBytes = max(0, maximumStderrBytes)
+    }
+
+    init(
+        executableURL: URL,
+        arguments: [String],
+        maximumLineBytes: Int = 8 * 1_024 * 1_024,
+        maximumStderrBytes: Int = 32 * 1_024
+    ) {
+        self.executableURL = executableURL
+        self.arguments = arguments
+        self.maximumLineBytes = max(1, maximumLineBytes)
+        self.maximumStderrBytes = max(0, maximumStderrBytes)
+    }
+
+    convenience init(
+        sshHostAlias: String,
+        maximumLineBytes: Int = 8 * 1_024 * 1_024,
+        maximumStderrBytes: Int = 32 * 1_024
+    ) throws {
+        self.init(
+            executableURL: URL(fileURLWithPath: "/usr/bin/ssh"),
+            arguments: try Self.sshArguments(for: sshHostAlias),
+            maximumLineBytes: maximumLineBytes,
+            maximumStderrBytes: maximumStderrBytes
+        )
+    }
+
+    var stderrDiagnostics: String? {
+        stateLock.withLock { stderrDiagnosticsLocked() }
+    }
+
+    static func validateSSHHostAlias(_ alias: String) throws {
+        guard !alias.isEmpty,
+              alias.utf8.count <= 253,
+              let first = alias.utf8.first,
+              isASCIIAlphaNumeric(first),
+              alias.utf8.allSatisfy({ byte in
+                  isASCIIAlphaNumeric(byte) || byte == 0x2D || byte == 0x2E || byte == 0x5F
+              })
+        else {
+            throw CodexClientError.invalidSSHHostAlias
+        }
+    }
+
+    static func sshArguments(for hostAlias: String) throws -> [String] {
+        try validateSSHHostAlias(hostAlias)
+        return [
+            "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ClearAllForwardings=yes",
+            "-o", "ConnectTimeout=15",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "--",
+            hostAlias,
+            remoteAppServerCommand
+        ]
     }
 
     func start() throws {
@@ -39,7 +109,7 @@ final class AppServerTransport: @unchecked Sendable {
         let outputPipe = Pipe()
         let errorPipe = Pipe()
         process.executableURL = executableURL
-        process.arguments = ["app-server", "--stdio"]
+        process.arguments = arguments
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
@@ -55,8 +125,11 @@ final class AppServerTransport: @unchecked Sendable {
         errorHandle = errorPipe.fileHandleForReading
         didExit = false
         stdoutReachedEOF = false
+        stderrReachedEOF = false
         terminationStatus = nil
         buffer.removeAll(keepingCapacity: true)
+        stderrBuffer.removeAll(keepingCapacity: true)
+        stderrWasTruncated = false
         stateLock.unlock()
 
         outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -68,8 +141,14 @@ final class AppServerTransport: @unchecked Sendable {
                 self?.consume(bytes)
             }
         }
-        errorPipe.fileHandleForReading.readabilityHandler = { handle in
-            if handle.availableData.isEmpty { handle.readabilityHandler = nil }
+        errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let bytes = handle.availableData
+            if bytes.isEmpty {
+                handle.readabilityHandler = nil
+                self?.recordStderrEOF()
+            } else {
+                self?.consumeStderr(bytes)
+            }
         }
         process.terminationHandler = { [weak self] process in
             self?.recordTermination(status: process.terminationStatus)
@@ -128,9 +207,14 @@ final class AppServerTransport: @unchecked Sendable {
             var line = Data(buffer[..<newline])
             buffer.removeSubrange(...newline)
             if line.last == 0x0D { line.removeLast() }
+            if line.count > maximumLineBytes {
+                buffer.removeAll()
+                exceededLimit = true
+                break
+            }
             if !line.isEmpty { lines.append(line) }
         }
-        if buffer.count > maximumLineBytes {
+        if !exceededLimit, buffer.count > maximumLineBytes {
             buffer.removeAll()
             exceededLimit = true
         }
@@ -151,6 +235,33 @@ final class AppServerTransport: @unchecked Sendable {
         if let status { enqueueExit(status: status) }
     }
 
+    private func consumeStderr(_ bytes: Data) {
+        guard !bytes.isEmpty else { return }
+        stateLock.lock()
+        if maximumStderrBytes == 0 {
+            stderrWasTruncated = true
+        } else if bytes.count >= maximumStderrBytes {
+            stderrBuffer = Data(bytes.suffix(maximumStderrBytes))
+            stderrWasTruncated = true
+        } else {
+            let overflow = stderrBuffer.count + bytes.count - maximumStderrBytes
+            if overflow > 0 {
+                stderrBuffer.removeFirst(overflow)
+                stderrWasTruncated = true
+            }
+            stderrBuffer.append(bytes)
+        }
+        stateLock.unlock()
+    }
+
+    private func recordStderrEOF() {
+        stateLock.lock()
+        stderrReachedEOF = true
+        let status = readyExitStatusLocked()
+        stateLock.unlock()
+        if let status { enqueueExit(status: status) }
+    }
+
     private func recordTermination(status: Int32) {
         stateLock.lock()
         terminationStatus = status
@@ -160,7 +271,7 @@ final class AppServerTransport: @unchecked Sendable {
     }
 
     private func readyExitStatusLocked() -> Int32? {
-        guard !didExit, stdoutReachedEOF, let terminationStatus else { return nil }
+        guard !didExit, stdoutReachedEOF, stderrReachedEOF, let terminationStatus else { return nil }
         didExit = true
         return terminationStatus
     }
@@ -183,5 +294,20 @@ final class AppServerTransport: @unchecked Sendable {
         stateLock.unlock()
         enqueueExit(status: -1)
         if process?.isRunning == true { process?.terminate() }
+    }
+
+    private func stderrDiagnosticsLocked() -> String? {
+        var diagnostics = String(decoding: stderrBuffer, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if stderrWasTruncated {
+            diagnostics = diagnostics.isEmpty ? "[stderr 已截断]" : "…\n\(diagnostics)"
+        }
+        return diagnostics.isEmpty ? nil : diagnostics
+    }
+
+    private static func isASCIIAlphaNumeric(_ byte: UInt8) -> Bool {
+        (0x30...0x39).contains(byte)
+            || (0x41...0x5A).contains(byte)
+            || (0x61...0x7A).contains(byte)
     }
 }

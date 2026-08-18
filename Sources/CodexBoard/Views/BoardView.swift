@@ -37,11 +37,20 @@ struct BoardView: View {
                 Text(store.selectedProject?.name ?? "项目看板")
                     .font(.title2.weight(.semibold))
                 if let project = store.selectedProject {
-                    Text(BoardFormatters.displayPath(project.path))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .textSelection(.enabled)
+                    HStack(spacing: 6) {
+                        let state = store.hostConnectionState(for: project.hostID)
+                        Label(store.hostName(for: project.hostID), systemImage: "server.rack")
+                            .foregroundStyle(state.hostStatusColor)
+                            .help(state.hostStatusDetail)
+                        Text("·")
+                        Text(store.isLocalHost(project.hostID)
+                             ? BoardFormatters.displayPath(project.path)
+                             : project.path)
+                            .textSelection(.enabled)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
                 }
             }
             Spacer()
@@ -63,7 +72,7 @@ struct BoardView: View {
             Button("新建任务") { showingComposer = true }
                 .buttonStyle(.borderedProminent)
                 .tint(BoardTheme.accent)
-                .disabled(store.selectedProject == nil)
+                .disabled(store.selectedProject.map(store.isProjectRunnable) != true)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
@@ -73,7 +82,7 @@ struct BoardView: View {
         ContentUnavailableView {
             Label("没有可用项目", systemImage: "folder.badge.questionmark")
         } description: {
-            Text("等待本机 Codex 项目扫描完成，或从侧边栏添加一个项目文件夹。")
+            Text("等待已启用主机的项目扫描完成，或从侧边栏添加一个项目路径。")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -181,6 +190,13 @@ private struct TaskCard: View {
                     Text(BoardFormatters.relativeDate(task.updatedAt))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
+                    Text("·")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Label(store.hostName(for: task.hostID), systemImage: "server.rack")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
                     Spacer()
                     if let model = task.model {
                         Text(model)

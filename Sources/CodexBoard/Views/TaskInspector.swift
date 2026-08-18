@@ -33,6 +33,10 @@ struct TaskInspector: View {
                 Label(task.stage.title, systemImage: task.stage.symbol)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(BoardTheme.color(for: task.stage))
+                Label(store.hostName(for: task.hostID), systemImage: "server.rack")
+                    .font(.caption)
+                    .foregroundStyle(store.hostConnectionState(for: task.hostID).hostStatusColor)
+                    .help(store.hostConnectionState(for: task.hostID).hostStatusDetail)
                 Spacer()
                 if task.autoRun {
                     Label("全自动", systemImage: "bolt.fill")
@@ -116,7 +120,9 @@ struct TaskInspector: View {
     private func sessionSection(_ task: BoardTask) -> some View {
         inspectorSection("Codex 会话", systemImage: "terminal") {
             VStack(alignment: .leading, spacing: 7) {
-                metadata("模型", task.model ?? "由本机 Codex 选择")
+                metadata("主机", store.hostName(for: task.hostID))
+                metadata("连接", store.hostConnectionState(for: task.hostID).hostStatusTitle)
+                metadata("模型", task.model ?? "由当前主机 Codex 选择")
                 metadata("Thread", task.threadID.map(shortID) ?? "尚未创建")
                 metadata("Session", task.sessionID.map(shortID) ?? "尚未创建")
                 if let turn = task.planningTurnID { metadata("规划 Turn", shortID(turn)) }

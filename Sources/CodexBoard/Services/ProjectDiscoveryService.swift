@@ -15,12 +15,18 @@ struct ProjectDiscoveryService: Sendable {
 
     func discover(
         threads: [CodexThreadSummary],
-        manualPaths: [String]
+        manualPaths: [String],
+        hostID: String = CodexHost.localID,
+        isRemote: Bool = false,
+        remotePathInfo: [String: CodexProjectPathInfo] = [:]
     ) async -> [ProjectRecord] {
         await Task.detached(priority: .utility) {
             Self.discoverSynchronously(
                 threads: threads,
                 manualPaths: manualPaths,
+                hostID: hostID,
+                isRemote: isRemote,
+                remotePathInfo: remotePathInfo,
                 gitExecutableURL: gitExecutableURL,
                 gitProbeTimeout: gitProbeTimeout
             )
@@ -35,8 +41,10 @@ struct ProjectDiscoveryService: Sendable {
     }
 
     private struct ProjectAccumulator {
+        let hostID: String
         let path: String
         var observedWorkingDirectoryDates: [String: Date] = [:]
+        var manualPaths: Set<String> = []
         var latestActivityAt: Date?
         var threadCount = 0
         var activeThreadCount = 0
@@ -62,8 +70,9 @@ struct ProjectDiscoveryService: Sendable {
             mergeMetadata(from: probe)
         }
 
-        mutating func addManualPath(probe: PathProbe) {
+        mutating func addManualPath(_ inputPath: String, probe: PathProbe) {
             isManual = true
+            manualPaths.insert(inputPath)
             mergeMetadata(from: probe)
         }
 
@@ -85,10 +94,11 @@ struct ProjectDiscoveryService: Sendable {
             let url = URL(fileURLWithPath: path, isDirectory: true)
             let lastPathComponent = url.lastPathComponent
             return ProjectRecord(
-                id: path,
+                hostID: hostID,
                 name: lastPathComponent.isEmpty ? path : lastPathComponent,
                 path: path,
                 observedWorkingDirectories: observedWorkingDirectories,
+                manualPaths: manualPaths.sorted(),
                 latestActivityAt: latestActivityAt,
                 threadCount: threadCount,
                 activeThreadCount: activeThreadCount,
@@ -102,14 +112,19 @@ struct ProjectDiscoveryService: Sendable {
     private static func discoverSynchronously(
         threads: [CodexThreadSummary],
         manualPaths: [String],
+        hostID: String,
+        isRemote: Bool,
+        remotePathInfo: [String: CodexProjectPathInfo],
         gitExecutableURL: URL,
         gitProbeTimeout: TimeInterval
     ) -> [ProjectRecord] {
         let normalizedThreadInputs = threads.compactMap { thread -> (CodexThreadSummary, String)? in
-            guard let path = normalizedPath(thread.cwd) else { return nil }
+            guard let path = normalizedPath(thread.cwd, isRemote: isRemote) else { return nil }
             return (thread, path)
         }
-        let normalizedManualInputs = manualPaths.compactMap(normalizedPath)
+        let normalizedManualInputs = manualPaths.compactMap {
+            normalizedPath($0, isRemote: isRemote)
+        }
         let inputPaths = Set(
             normalizedThreadInputs.map(\.1) + normalizedManualInputs
         )
@@ -120,18 +135,33 @@ struct ProjectDiscoveryService: Sendable {
         var probes: [String: PathProbe] = [:]
         probes.reserveCapacity(inputPaths.count)
         for path in inputPaths {
-            probes[path] = probe(
-                path: path,
-                gitExecutableURL: gitExecutableURL,
-                gitProbeTimeout: gitProbeTimeout
-            )
+            if isRemote {
+                // A remote path must never be checked with the controller Mac's
+                // FileManager or Git. Only path information obtained through
+                // that host's app-server can mark it usable or collapse it to a
+                // canonical Git/worktree root; offline paths stay visible but
+                // unavailable.
+                let info = remotePathInfo[path]
+                probes[path] = PathProbe(
+                    canonicalWorkingDirectory: info?.canonicalWorkingDirectory ?? path,
+                    projectPath: info?.projectPath ?? path,
+                    existsOnDisk: info?.exists ?? false,
+                    isGitRepository: info?.isGitRepository ?? false
+                )
+            } else {
+                probes[path] = probe(
+                    path: path,
+                    gitExecutableURL: gitExecutableURL,
+                    gitProbeTimeout: gitProbeTimeout
+                )
+            }
         }
 
         var projects: [String: ProjectAccumulator] = [:]
         for (thread, inputPath) in normalizedThreadInputs {
             guard let probe = probes[inputPath] else { continue }
             var accumulator = projects[probe.projectPath]
-                ?? ProjectAccumulator(path: probe.projectPath)
+                ?? ProjectAccumulator(hostID: hostID, path: probe.projectPath)
             accumulator.add(thread: thread, probe: probe)
             projects[probe.projectPath] = accumulator
         }
@@ -139,8 +169,8 @@ struct ProjectDiscoveryService: Sendable {
         for inputPath in normalizedManualInputs {
             guard let probe = probes[inputPath] else { continue }
             var accumulator = projects[probe.projectPath]
-                ?? ProjectAccumulator(path: probe.projectPath)
-            accumulator.addManualPath(probe: probe)
+                ?? ProjectAccumulator(hostID: hostID, path: probe.projectPath)
+            accumulator.addManualPath(inputPath, probe: probe)
             projects[probe.projectPath] = accumulator
         }
 
@@ -149,9 +179,14 @@ struct ProjectDiscoveryService: Sendable {
             .sorted(by: projectSortOrder)
     }
 
-    private static func normalizedPath(_ rawPath: String) -> String? {
+    private static func normalizedPath(_ rawPath: String, isRemote: Bool) -> String? {
         let trimmedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPath.isEmpty else { return nil }
+
+        if isRemote {
+            guard (trimmedPath as NSString).isAbsolutePath else { return nil }
+            return (trimmedPath as NSString).standardizingPath
+        }
 
         let expandedPath = (trimmedPath as NSString).expandingTildeInPath
         let absoluteURL: URL

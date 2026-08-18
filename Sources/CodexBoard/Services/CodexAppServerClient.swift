@@ -12,10 +12,13 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     }
 
     private let resolver: CodexExecutableResolver
+    private let launchMode: CodexAppServerLaunchMode
+    private let transportFactory: (@Sendable () async throws -> AppServerTransport)?
     private let parser = RPCMessageParser()
     private let requestTimeout: TimeInterval
     private var transport: AppServerTransport?
     private var connectWaiters: [CheckedContinuation<Void, Error>] = []
+    private var connectionGeneration: UInt64 = 0
     private var nextRequestID = 1
     private var pendingRequests: [Int: PendingRequest] = [:]
     private var eventContinuation: AsyncStream<CodexEvent>.Continuation?
@@ -27,11 +30,15 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     }
 
     init(
+        launchMode: CodexAppServerLaunchMode = .local,
         resolver: CodexExecutableResolver = CodexExecutableResolver(),
-        requestTimeout: TimeInterval = 30
+        requestTimeout: TimeInterval = 30,
+        transportFactory: (@Sendable () async throws -> AppServerTransport)? = nil
     ) {
+        self.launchMode = launchMode
         self.resolver = resolver
         self.requestTimeout = max(1, requestTimeout)
+        self.transportFactory = transportFactory
     }
 
     deinit {
@@ -46,14 +53,29 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
                 connectWaiters.append(continuation)
             }
         }
+        connectionGeneration &+= 1
+        let attemptGeneration = connectionGeneration
         connectionState = .connecting
         lastError = nil
-        let resolver = resolver
+        var attemptTransport: AppServerTransport?
         do {
-            let executable = try await Task.detached(priority: .userInitiated) {
-                try resolver.resolve()
-            }.value
-            let newTransport = AppServerTransport(executableURL: executable)
+            let newTransport: AppServerTransport
+            if let transportFactory {
+                newTransport = try await transportFactory()
+            } else {
+                switch launchMode {
+                case .local:
+                    let resolver = resolver
+                    let executable = try await Task.detached(priority: .userInitiated) {
+                        try resolver.resolve()
+                    }.value
+                    newTransport = AppServerTransport(executableURL: executable)
+                case let .ssh(hostAlias):
+                    newTransport = try AppServerTransport(sshHostAlias: hostAlias)
+                }
+            }
+            attemptTransport = newTransport
+            try requireCurrentConnectionAttempt(attemptGeneration)
             newTransport.delegate = self
             transport = newTransport
             try newTransport.start()
@@ -67,11 +89,17 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
                     "experimentalApi": .bool(true)
                 ])
             ]))
+            try requireCurrentConnectionAttempt(attemptGeneration)
             try notify(method: "initialized", params: .object([:]))
             connectionState = .connected
             resumeConnectWaiters()
         } catch {
             let normalized = normalize(error)
+            guard connectionGeneration == attemptGeneration else {
+                attemptTransport?.delegate = nil
+                attemptTransport?.stop()
+                throw normalized
+            }
             lastError = normalized.localizedDescription
             connectionState = .failed(normalized.localizedDescription)
             disconnect(failingWith: normalized)
@@ -81,8 +109,10 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     }
 
     func disconnect() {
+        connectionGeneration &+= 1
         disconnect(failingWith: .disconnected)
         connectionState = .disconnected
+        resumeConnectWaiters(throwing: CodexClientError.disconnected)
     }
 
     func verifyAccount() async throws -> Bool {
@@ -115,6 +145,73 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             nextCursor = nil
         }
         return CodexThreadPage(threads: threads, nextCursor: nextCursor)
+    }
+
+    func inspectProjectPath(_ path: String) async throws -> CodexProjectPathInfo {
+        try await ensureConnected()
+        let fallbackPath = (path as NSString).standardizingPath
+        guard (fallbackPath as NSString).isAbsolutePath, fallbackPath != "/" else {
+            return CodexProjectPathInfo(
+                canonicalWorkingDirectory: fallbackPath,
+                projectPath: fallbackPath,
+                exists: false,
+                isGitRepository: false
+            )
+        }
+        let physicalDirectory = try await executeReadOnlyCommand(
+            command: ["pwd", "-P"],
+            cwd: path
+        )
+        guard physicalDirectory.exitCode == 0,
+              let canonicalWorkingDirectory = Self.absolutePath(from: physicalDirectory.stdout)
+        else {
+            return CodexProjectPathInfo(
+                canonicalWorkingDirectory: fallbackPath,
+                projectPath: fallbackPath,
+                exists: false,
+                isGitRepository: false
+            )
+        }
+        guard canonicalWorkingDirectory != "/" else {
+            return CodexProjectPathInfo(
+                canonicalWorkingDirectory: canonicalWorkingDirectory,
+                projectPath: canonicalWorkingDirectory,
+                exists: false,
+                isGitRepository: false
+            )
+        }
+
+        let gitResult = try await executeReadOnlyCommand(
+            command: ["git", "-C", canonicalWorkingDirectory, "rev-parse", "--show-toplevel"],
+            cwd: canonicalWorkingDirectory
+        )
+        if gitResult.exitCode == 0,
+           let gitRoot = Self.absolutePath(from: gitResult.stdout),
+           gitRoot != "/",
+           Self.isSameOrDescendant(canonicalWorkingDirectory, of: gitRoot) {
+            return CodexProjectPathInfo(
+                canonicalWorkingDirectory: canonicalWorkingDirectory,
+                projectPath: gitRoot,
+                exists: true,
+                isGitRepository: true
+            )
+        }
+
+        return CodexProjectPathInfo(
+            canonicalWorkingDirectory: canonicalWorkingDirectory,
+            projectPath: canonicalWorkingDirectory,
+            exists: true,
+            isGitRepository: false
+        )
+    }
+
+    func readThread(threadID: String, includeTurns: Bool) async throws -> CodexThreadDetail {
+        try await ensureConnected()
+        let value = try await request(method: "thread/read", params: .object([
+            "threadId": .string(threadID),
+            "includeTurns": .bool(includeTurns)
+        ]))
+        return try Self.parseThreadReadResponse(value)
     }
 
     func startThread(cwd: String, model: String?) async throws -> CodexStartedThread {
@@ -269,6 +366,73 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
 
     private func ensureConnected() async throws {
         if connectionState != .connected { try await connect() }
+    }
+
+    private func requireCurrentConnectionAttempt(_ generation: UInt64) throws {
+        guard connectionGeneration == generation, connectionState == .connecting else {
+            throw CodexClientError.disconnected
+        }
+    }
+
+    private struct CommandResult {
+        let exitCode: Int
+        let stdout: String
+        let stderr: String
+    }
+
+    private func executeReadOnlyCommand(command: [String], cwd: String) async throws -> CommandResult {
+        let value = try await request(
+            method: "command/exec",
+            params: Self.readOnlyCommandExecParams(command: command, cwd: cwd)
+        )
+        guard let exitCode = value["exitCode"]?.intValue,
+              let stdout = value["stdout"]?.stringValue,
+              let stderr = value["stderr"]?.stringValue
+        else {
+            throw CodexClientError.invalidResponse("command/exec 缺少 exitCode/stdout/stderr")
+        }
+        return CommandResult(exitCode: exitCode, stdout: stdout, stderr: stderr)
+    }
+
+    static func readOnlyCommandExecParams(command: [String], cwd: String) -> JSONValue {
+        .object([
+            "command": .array(command.map(JSONValue.string)),
+            "cwd": .string(cwd),
+            "timeoutMs": .integer(3_000),
+            "outputBytesCap": .integer(8_192),
+            "sandboxPolicy": .object([
+                "type": .string("readOnly"),
+                "networkAccess": .bool(false)
+            ]),
+            "env": .object([
+                "GIT_OPTIONAL_LOCKS": .string("0"),
+                "GIT_TERMINAL_PROMPT": .string("0"),
+                "GIT_DIR": .null,
+                "GIT_WORK_TREE": .null,
+                "GIT_INDEX_FILE": .null,
+                "GIT_COMMON_DIR": .null,
+                "GIT_OBJECT_DIRECTORY": .null,
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": .null,
+                "GIT_CEILING_DIRECTORIES": .null
+            ])
+        ])
+    }
+
+    private static func absolutePath(from output: String) -> String? {
+        let path = output.trimmingCharacters(in: .newlines)
+        guard !path.isEmpty,
+              !path.contains("\0"),
+              !path.unicodeScalars.contains(where: CharacterSet.newlines.contains),
+              (path as NSString).isAbsolutePath
+        else { return nil }
+        return (path as NSString).standardizingPath
+    }
+
+    private static func isSameOrDescendant(_ path: String, of ancestor: String) -> Bool {
+        let pathComponents = (path as NSString).pathComponents
+        let ancestorComponents = (ancestor as NSString).pathComponents
+        guard ancestorComponents.count <= pathComponents.count else { return false }
+        return pathComponents.prefix(ancestorComponents.count).elementsEqual(ancestorComponents)
     }
 
     private func request(method: String, params: JSONValue? = nil) async throws -> JSONValue {
@@ -474,6 +638,55 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         )
     }
 
+    static func parseThreadReadResponse(_ value: JSONValue) throws -> CodexThreadDetail {
+        guard let thread = value["thread"], let summary = parseThread(thread) else {
+            throw CodexClientError.invalidResponse("thread/read 缺少有效 thread")
+        }
+        guard let rawTurns = thread["turns"]?.arrayValue else {
+            throw CodexClientError.invalidResponse("thread/read 缺少 turns")
+        }
+        let turns = rawTurns.compactMap(parseThreadTurn)
+        guard turns.count == rawTurns.count else {
+            throw CodexClientError.invalidResponse("thread/read 包含无效 turn")
+        }
+        return CodexThreadDetail(summary: summary, turns: turns)
+    }
+
+    private static func parseThreadTurn(_ value: JSONValue) -> CodexThreadTurn? {
+        guard let id = value["id"]?.stringValue,
+              let status = value["status"]?.stringValue,
+              let rawItems = value["items"]?.arrayValue
+        else { return nil }
+        let items = rawItems.compactMap(parseThreadItem)
+        guard items.count == rawItems.count else { return nil }
+        return CodexThreadTurn(
+            id: id,
+            status: status,
+            items: items,
+            error: turnErrorDescription(value["error"]),
+            startedAt: parseOptionalDate(value["startedAt"]),
+            completedAt: parseOptionalDate(value["completedAt"]),
+            durationMilliseconds: value["durationMs"]?.int64Value
+        )
+    }
+
+    private static func parseThreadItem(_ value: JSONValue) -> CodexThreadItem? {
+        guard let id = value["id"]?.stringValue,
+              let type = value["type"]?.stringValue
+        else { return nil }
+        return CodexThreadItem(
+            id: id,
+            type: type,
+            text: value["text"]?.stringValue,
+            status: value["status"]?.stringValue
+        )
+    }
+
+    private static func parseOptionalDate(_ value: JSONValue?) -> Date? {
+        guard let seconds = value?.int64Value else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(seconds))
+    }
+
     private static func sourceKind(_ value: JSONValue?) -> String {
         if let source = value?.stringValue { return source }
         guard let object = value?.objectValue else { return "unknown" }
@@ -545,10 +758,12 @@ extension CodexAppServerClient: AppServerTransportDelegate {
     nonisolated func transportDidExit(status: Int32) {
         MainActor.assumeIsolated { [weak self] in
             guard let self, self.transport != nil else { return }
-            let error = CodexClientError.processExited(status)
+            let error = CodexClientError.processExited(status, stderr: self.transport?.stderrDiagnostics)
+            self.connectionGeneration &+= 1
             self.lastError = error.localizedDescription
             self.connectionState = .failed(error.localizedDescription)
             self.disconnect(failingWith: error)
+            self.resumeConnectWaiters(throwing: error)
             self.eventContinuation?.yield(.connectionLost(message: error.localizedDescription))
         }
     }

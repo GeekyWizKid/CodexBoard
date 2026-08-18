@@ -24,6 +24,7 @@ struct RunningTasksMenuView: View {
                             RunningTaskRow(
                                 task: task,
                                 projectName: store.projectName(for: task),
+                                hostName: store.hostName(for: task.hostID),
                                 openTask: { showBoard(taskID: task.id) },
                                 stopTask: {
                                     Task { await store.cancel(taskID: task.id) }
@@ -54,19 +55,27 @@ struct RunningTasksMenuView: View {
                 Text("CodexBoard")
                     .font(.headline)
                 Text(store.runningTasks.isEmpty
-                     ? "所有任务均处于空闲状态"
-                     : "\(store.runningTaskCount) 个任务进行中")
+                     ? "\(store.connectedHostCount)/\(store.enabledHosts.count) 台主机已连接"
+                     : "\(store.runningTaskCount) 个任务进行中 · \(store.connectedHostCount) 台主机已连接")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             Spacer()
             Circle()
-                .fill(store.accountReady ? BoardTheme.completed : BoardTheme.danger)
+                .fill(overallConnectionColor)
                 .frame(width: 8, height: 8)
-                .accessibilityLabel(store.accountReady ? "本机 Codex 已连接" : "本机 Codex 未连接")
-                .help(store.accountReady ? "本机 Codex 已连接" : "Codex 未连接")
+                .accessibilityLabel("\(store.connectedHostCount) 台主机已连接")
+                .help(store.statusMessage)
         }
         .padding(12)
+    }
+
+    private var overallConnectionColor: Color {
+        guard !store.enabledHosts.isEmpty else { return BoardTheme.danger }
+        if store.connectedHostCount == store.enabledHosts.count { return BoardTheme.completed }
+        if store.connectedHostCount > 0 { return BoardTheme.approval }
+        return BoardTheme.danger
     }
 
     private var footer: some View {
@@ -121,6 +130,7 @@ struct RunningTasksMenuView: View {
 private struct RunningTaskRow: View {
     let task: BoardTask
     let projectName: String
+    let hostName: String
     let openTask: () -> Void
     let stopTask: () -> Void
 
@@ -137,14 +147,10 @@ private struct RunningTaskRow: View {
                             .font(.callout.weight(.semibold))
                             .lineLimit(1)
 
-                        HStack(spacing: 5) {
-                            Text(projectName)
-                                .lineLimit(1)
-                            Text("·")
-                            Text(task.stage.title)
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        Text("\(projectName) · \(hostName) · \(task.stage.title)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
 
                         if !task.liveMessage.isEmpty {
                             Text(task.liveMessage)
@@ -162,7 +168,7 @@ private struct RunningTaskRow: View {
             }
             .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityLabel("\(shortTitle)，\(projectName)，\(task.stage.title)")
+            .accessibilityLabel("\(shortTitle)，\(projectName)，\(hostName)，\(task.stage.title)")
             .help("在看板中查看")
 
             Button(role: .destructive, action: stopTask) {

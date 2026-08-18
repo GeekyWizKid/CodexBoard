@@ -16,6 +16,14 @@ struct TaskComposer: View {
         _autoRun = State(initialValue: store.preferences.defaultAutoRun)
     }
 
+    private var selectedProject: ProjectRecord? {
+        store.visibleProjects.first(where: { $0.id == projectID })
+    }
+
+    private var selectedProjectIsRunnable: Bool {
+        selectedProject.map(store.isProjectRunnable) == true
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack {
@@ -33,7 +41,27 @@ struct TaskComposer: View {
             Form {
                 Picker("项目", selection: $projectID) {
                     ForEach(store.visibleProjects) { project in
-                        Text(project.name).tag(project.id)
+                        Text(projectPickerLabel(project))
+                            .tag(project.id)
+                    }
+                }
+
+                if let selectedProject {
+                    LabeledContent("运行主机") {
+                        let state = store.hostConnectionState(for: selectedProject.hostID)
+                        Label(store.hostName(for: selectedProject.hostID), systemImage: "server.rack")
+                            .foregroundStyle(state.hostStatusColor)
+                            .help(state.hostStatusDetail)
+                    }
+                    if !selectedProjectIsRunnable {
+                        Label(
+                            store.host(for: selectedProject.hostID)?.isEnabled == true
+                                ? "项目路径尚未在该主机验证，暂不能创建任务。"
+                                : "所属主机已停用，暂不能创建任务。",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(BoardTheme.danger)
                     }
                 }
 
@@ -97,10 +125,31 @@ struct TaskComposer: View {
                 .buttonStyle(.borderedProminent)
                 .tint(BoardTheme.accent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(projectID.isEmpty || sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(
+                    projectID.isEmpty
+                        || !selectedProjectIsRunnable
+                        || sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
             }
         }
         .padding(22)
         .frame(width: 620, height: 610)
+        .onChange(of: store.visibleProjects.map(\.id)) { _, projectIDs in
+            if !projectIDs.contains(projectID) {
+                projectID = store.selectedProjectID ?? projectIDs.first ?? ""
+            }
+        }
+    }
+
+    private func projectPickerLabel(_ project: ProjectRecord) -> String {
+        let suffix: String
+        if store.host(for: project.hostID)?.isEnabled != true {
+            suffix = " · 已停用"
+        } else if !project.existsOnDisk {
+            suffix = " · 路径未验证"
+        } else {
+            suffix = ""
+        }
+        return "\(project.name) — \(store.hostName(for: project.hostID))\(suffix)"
     }
 }
