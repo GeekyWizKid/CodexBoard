@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import CodexBoard
@@ -342,6 +343,66 @@ final class AppServerTransportTests: XCTestCase {
         XCTAssertEqual(delegate.exitStatus, -1)
         transport.stop()
     }
+
+    func testStopTerminatesIgnoringDescendantProcessGroup() throws {
+        let fixture = try TemporaryExecutable(script: """
+        #!/bin/sh
+        trap '' TERM
+        /bin/sh -c 'trap "" TERM; printf "%s" "$$" > "$1"; while :; do /bin/sleep 1; done' child "$1" &
+        while :; do /bin/sleep 1; done
+        """)
+        defer { fixture.remove() }
+
+        let childPIDURL = fixture.directory.appendingPathComponent("child-pid")
+        let transport = AppServerTransport(
+            executableURL: fixture.url,
+            arguments: [childPIDURL.path]
+        )
+        try transport.start()
+        XCTAssertTrue(waitForTransportCondition {
+            FileManager.default.fileExists(atPath: childPIDURL.path)
+        })
+
+        let childPIDText = try String(contentsOf: childPIDURL, encoding: .utf8)
+        let childPID = try XCTUnwrap(pid_t(childPIDText))
+        let processGroup = getpgid(childPID)
+        XCTAssertGreaterThan(processGroup, 1)
+        XCTAssertNotEqual(processGroup, getpgrp())
+
+        transport.stop()
+
+        XCTAssertTrue(waitForTransportCondition {
+            errno = 0
+            return kill(-processGroup, 0) == -1 && errno == ESRCH
+        })
+        XCTAssertEqual(transport.lastTerminationCertainty, .localProcessGroupDrained)
+    }
+
+    func testSSHScopedManagedStopExposesRemoteUnknown() throws {
+        let fixture = try TemporaryExecutable(script: """
+        #!/bin/sh
+        trap '' TERM
+        printf 'ready' > "$1"
+        IFS= read -r ignored
+        exit 0
+        """)
+        defer { fixture.remove() }
+
+        let readyURL = fixture.directory.appendingPathComponent("ready")
+        let transport = AppServerTransport(
+            executableURL: fixture.url,
+            arguments: [readyURL.path],
+            launchScope: .ssh
+        )
+        try transport.start()
+        XCTAssertTrue(waitForTransportCondition {
+            FileManager.default.fileExists(atPath: readyURL.path)
+        })
+
+        transport.stop()
+
+        XCTAssertEqual(transport.lastTerminationCertainty, .remoteUnknown)
+    }
 }
 
 private struct TemporaryExecutable {
@@ -424,4 +485,17 @@ private final class DataRecordingTransportDelegate: AppServerTransportDelegate, 
         lock.withLock { receivedExitStatus = status }
         exitExpectation.fulfill()
     }
+}
+
+private func waitForTransportCondition(
+    timeout: TimeInterval = 3,
+    pollInterval: TimeInterval = 0.01,
+    _ predicate: () -> Bool
+) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if predicate() { return true }
+        Thread.sleep(forTimeInterval: pollInterval)
+    } while Date() < deadline
+    return predicate()
 }

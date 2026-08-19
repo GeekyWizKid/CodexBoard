@@ -20,6 +20,7 @@ final class AppServerTransport: @unchecked Sendable {
     private let executableURL: URL
     private let arguments: [String]
     private var environmentOverrides: [String: String]
+    private let launchScope: ManagedProcessSupervisor.LaunchScope
     private let maximumLineBytes: Int
     private let maximumStderrBytes: Int
     private let stateLock = NSLock()
@@ -31,7 +32,7 @@ final class AppServerTransport: @unchecked Sendable {
         label: "com.local.CodexBoard.app-server.events",
         target: .main
     )
-    private var process: Process?
+    private var supervisor: ManagedProcessSupervisor?
     private var inputHandle: FileHandle?
     private var outputHandle: FileHandle?
     private var errorHandle: FileHandle?
@@ -46,6 +47,7 @@ final class AppServerTransport: @unchecked Sendable {
     private var stdoutReachedEOF = false
     private var stderrReachedEOF = false
     private var terminationStatus: Int32?
+    private var terminationCertainty: ManagedProcessSupervisor.TerminationCertainty?
 
     init(
         executableURL: URL,
@@ -55,6 +57,7 @@ final class AppServerTransport: @unchecked Sendable {
         self.executableURL = executableURL
         arguments = Self.launchArguments
         environmentOverrides = [:]
+        launchScope = .local
         self.maximumLineBytes = max(1, maximumLineBytes)
         self.maximumStderrBytes = max(0, maximumStderrBytes)
     }
@@ -64,11 +67,13 @@ final class AppServerTransport: @unchecked Sendable {
         arguments: [String],
         environmentOverrides: [String: String] = [:],
         maximumLineBytes: Int = 64 * 1_024 * 1_024,
-        maximumStderrBytes: Int = 32 * 1_024
+        maximumStderrBytes: Int = 32 * 1_024,
+        launchScope: ManagedProcessSupervisor.LaunchScope = .local
     ) {
         self.executableURL = executableURL
         self.arguments = arguments
         self.environmentOverrides = environmentOverrides
+        self.launchScope = launchScope
         self.maximumLineBytes = max(1, maximumLineBytes)
         self.maximumStderrBytes = max(0, maximumStderrBytes)
     }
@@ -82,12 +87,17 @@ final class AppServerTransport: @unchecked Sendable {
             executableURL: URL(fileURLWithPath: "/usr/bin/ssh"),
             arguments: try Self.sshArguments(for: sshHostAlias),
             maximumLineBytes: maximumLineBytes,
-            maximumStderrBytes: maximumStderrBytes
+            maximumStderrBytes: maximumStderrBytes,
+            launchScope: .ssh
         )
     }
 
     var stderrDiagnostics: String? {
         stateLock.withLock { stderrDiagnosticsLocked() }
+    }
+
+    var lastTerminationCertainty: ManagedProcessSupervisor.TerminationCertainty? {
+        stateLock.withLock { terminationCertainty }
     }
 
     static func validateSSHHostAlias(_ alias: String) throws {
@@ -131,42 +141,54 @@ final class AppServerTransport: @unchecked Sendable {
     }
 
     func start() throws {
-        let process = Process()
-        let inputPipe = Pipe()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.executableURL = executableURL
-        process.arguments = arguments
-        // API credentials are opt-in for the dedicated Realtime launch only.
-        // Ordinary local and SSH transports must never inherit a caller's key.
-        process.environment = Self.childEnvironment(
+        let childEnvironment = Self.childEnvironment(
             inheriting: ProcessInfo.processInfo.environment,
             overrides: environmentOverrides
         )
-        process.standardInput = inputPipe
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
+        let supervisor = ManagedProcessSupervisor(scope: launchScope) { [weak self] event in
+            self?.recordTermination(event)
+        }
 
+        // API credentials are opt-in for the dedicated Realtime launch only.
+        // Ordinary local and SSH transports must never inherit a caller's key.
         stateLock.lock()
-        guard self.process == nil else {
+        guard self.supervisor == nil else {
             stateLock.unlock()
             return
         }
-        self.process = process
-        inputHandle = inputPipe.fileHandleForWriting
-        outputHandle = outputPipe.fileHandleForReading
-        errorHandle = errorPipe.fileHandleForReading
+        self.supervisor = supervisor
         didExit = false
         stdoutReachedEOF = false
         stderrReachedEOF = false
         terminationStatus = nil
+        terminationCertainty = nil
         buffer.removeAll(keepingCapacity: true)
         scannedByteCount = 0
         stderrBuffer.removeAll(keepingCapacity: true)
         stderrWasTruncated = false
-        stateLock.unlock()
 
-        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        let standardIO: ManagedProcessSupervisor.StandardIO
+        do {
+            standardIO = try supervisor.launch(
+                executableURL: executableURL,
+                arguments: arguments,
+                environment: childEnvironment
+            )
+            inputHandle = standardIO.input
+            outputHandle = standardIO.output
+            errorHandle = standardIO.error
+            stateLock.unlock()
+        } catch {
+            self.supervisor = nil
+            inputHandle = nil
+            outputHandle = nil
+            errorHandle = nil
+            stateLock.unlock()
+            environmentOverrides.removeAll(keepingCapacity: false)
+            throw CodexClientError.processLaunchFailed
+        }
+
+        standardIO.output.readabilityHandler = { [weak self] handle in
             let bytes = handle.availableData
             if bytes.isEmpty {
                 handle.readabilityHandler = nil
@@ -175,7 +197,7 @@ final class AppServerTransport: @unchecked Sendable {
                 self?.consume(bytes)
             }
         }
-        errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        standardIO.error.readabilityHandler = { [weak self] handle in
             let bytes = handle.availableData
             if bytes.isEmpty {
                 handle.readabilityHandler = nil
@@ -184,21 +206,9 @@ final class AppServerTransport: @unchecked Sendable {
                 self?.consumeStderr(bytes)
             }
         }
-        process.terminationHandler = { [weak self] process in
-            self?.recordTermination(status: process.terminationStatus)
-        }
-
-        do {
-            try process.run()
-            // Foundation snapshots the child environment during launch and
-            // rejects mutations afterwards. Drop our additional credential
-            // copy while the running Process retains only its launch state.
-            environmentOverrides.removeAll(keepingCapacity: false)
-        } catch {
-            environmentOverrides.removeAll(keepingCapacity: false)
-            stop()
-            throw CodexClientError.processLaunchFailed
-        }
+        // Drop the dedicated Realtime credential copy once posix_spawn has
+        // created the child's independent environment.
+        environmentOverrides.removeAll(keepingCapacity: false)
     }
 
     func send(_ data: Data) throws {
@@ -208,7 +218,7 @@ final class AppServerTransport: @unchecked Sendable {
         defer { writeLock.unlock() }
         stateLock.lock()
         let handle = inputHandle
-        let isRunning = process?.isRunning == true
+        let isRunning = supervisor?.isRunning == true
         stateLock.unlock()
         guard isRunning, let handle else { throw CodexClientError.disconnected }
         do {
@@ -220,8 +230,8 @@ final class AppServerTransport: @unchecked Sendable {
 
     func stop() {
         stateLock.lock()
-        let process = process
-        self.process = nil
+        let supervisor = supervisor
+        self.supervisor = nil
         let input = inputHandle
         let output = outputHandle
         let error = errorHandle
@@ -232,15 +242,16 @@ final class AppServerTransport: @unchecked Sendable {
         error?.readabilityHandler = nil
         stateLock.unlock()
         try? input?.close()
+        let result = supervisor?.stop()
         try? output?.close()
         try? error?.close()
-        if process?.isRunning == true { process?.terminate() }
+        if let result { recordTerminationCertainty(from: result) }
     }
 
     private func consume(_ bytes: Data) {
         var lines: [Data] = []
         var exceededLimit = false
-        var oversizedProcess: Process?
+        var oversizedSupervisor: ManagedProcessSupervisor?
         stateLock.lock()
         guard !didExit else {
             stateLock.unlock()
@@ -283,7 +294,7 @@ final class AppServerTransport: @unchecked Sendable {
             // second readability callback cannot consume bytes in between the
             // limit check and process termination.
             didExit = true
-            oversizedProcess = process
+            oversizedSupervisor = supervisor
             outputHandle?.readabilityHandler = nil
         } else {
             // Everything after the final complete line has now been scanned.
@@ -302,7 +313,9 @@ final class AppServerTransport: @unchecked Sendable {
         }
         if exceededLimit {
             enqueueExit(status: -1)
-            if oversizedProcess?.isRunning == true { oversizedProcess?.terminate() }
+            if let result = oversizedSupervisor?.stop() {
+                recordTerminationCertainty(from: result)
+            }
         }
     }
 
@@ -341,12 +354,29 @@ final class AppServerTransport: @unchecked Sendable {
         if let status { enqueueExit(status: status) }
     }
 
-    private func recordTermination(status: Int32) {
+    private func recordTermination(_ event: ManagedProcessSupervisor.ExitEvent) {
         stateLock.lock()
-        terminationStatus = status
+        terminationStatus = event.status
+        terminationCertainty = event.certainty
         let readyStatus = readyExitStatusLocked()
         stateLock.unlock()
         if let readyStatus { enqueueExit(status: readyStatus) }
+    }
+
+    private func recordTerminationCertainty(
+        from result: ManagedProcessSupervisor.StopResult
+    ) {
+        let certainty: ManagedProcessSupervisor.TerminationCertainty?
+        switch result {
+        case .notStarted:
+            certainty = nil
+        case let .exited(event):
+            certainty = event.certainty
+        case let .timedOut(timeoutCertainty):
+            certainty = timeoutCertainty
+        }
+        guard let certainty else { return }
+        stateLock.withLock { terminationCertainty = certainty }
     }
 
     private func readyExitStatusLocked() -> Int32? {
