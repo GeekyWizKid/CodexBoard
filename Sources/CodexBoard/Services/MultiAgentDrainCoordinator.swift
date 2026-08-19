@@ -254,7 +254,7 @@ struct MultiAgentDrainCoordinator: Sendable {
             switch Self.normalizedStatus(turn.status) {
             case "inprogress":
                 activeTurnIDs.append(turn.id)
-            case "completed", "interrupted", "failed":
+            case "completed", "interrupted", "failed", "cancelled", "canceled":
                 break
             default:
                 blockers.append(.unknownTurnStatus(

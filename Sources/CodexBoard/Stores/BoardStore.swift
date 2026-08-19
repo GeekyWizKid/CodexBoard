@@ -60,6 +60,17 @@ private struct HostServerKey: Hashable {
     let serverName: String
 }
 
+private enum DrainReconciliationAction {
+    case stop
+    case retry(after: Duration)
+}
+
+private struct ExecutionSchedulingDemand {
+    let taskIndex: Int
+    let isReady: Bool
+    let orderDate: Date
+}
+
 @MainActor
 @Observable
 final class BoardStore {
@@ -194,7 +205,19 @@ final class BoardStore {
     @ObservationIgnored
     private var pendingPlanningTaskIDs = Set<UUID>()
     @ObservationIgnored
+    private var planningStartupQueue: [UUID] = []
+    @ObservationIgnored
+    private var planningStartupWorker: Task<Void, Never>?
+    @ObservationIgnored
+    private var planningStartupWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+    @ObservationIgnored
     private var retryTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored
+    private var drainTasksByRunID: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored
+    private let drainCoordinator = MultiAgentDrainCoordinator()
+    @ObservationIgnored
+    private let drainStabilityDelay: Duration
     @ObservationIgnored
     private var cancellationIntentTaskIDs = Set<UUID>()
     @ObservationIgnored
@@ -220,7 +243,8 @@ final class BoardStore {
         worktreeManager: any WorktreeManaging = WorktreeManager(),
         externalURLOpener: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
         sshDiscovery: SSHHostDiscoveryService = SSHHostDiscoveryService(),
-        clientFactory: CodexTaskClientFactory? = nil
+        clientFactory: CodexTaskClientFactory? = nil,
+        drainStabilityDelay: Duration = .milliseconds(500)
     ) {
         self.client = client
         self.persistence = persistence
@@ -229,6 +253,7 @@ final class BoardStore {
         self.worktreeManager = worktreeManager
         self.externalURLOpener = externalURLOpener
         self.sshDiscovery = sshDiscovery
+        self.drainStabilityDelay = drainStabilityDelay
         self.clients = [CodexHost.localID: client]
         self.clientFactory = clientFactory ?? { host in
             switch host.kind {
@@ -247,7 +272,12 @@ final class BoardStore {
         saveTask?.cancel()
         capabilityRefreshTask?.cancel()
         streamFlushTask?.cancel()
+        planningStartupWorker?.cancel()
+        planningStartupWaiters.values
+            .flatMap { $0 }
+            .forEach { $0.resume() }
         retryTasks.values.forEach { $0.cancel() }
+        drainTasksByRunID.values.forEach { $0.cancel() }
     }
 
     var selectedProject: ProjectRecord? {
@@ -1021,6 +1051,13 @@ final class BoardStore {
     }
 
     func startPlanning(taskID: UUID) async {
+        await withCheckedContinuation { continuation in
+            planningStartupWaiters[taskID, default: []].append(continuation)
+            enqueuePlanning(taskID: taskID)
+        }
+    }
+
+    private func performPlanningStart(taskID: UUID) async {
         guard let initialIndex = taskIndex(taskID), let project = project(forTaskAt: initialIndex) else { return }
         guard tasks[initialIndex].stage == .inbox else { return }
         guard let host = host(for: tasks[initialIndex].hostID), host.isEnabled else {
@@ -1074,6 +1111,7 @@ final class BoardStore {
         tasks[initialIndex].updatedAt = Date()
         appendLog(at: initialIndex, "开始只读规划。")
         let planningRunID = beginRun(at: initialIndex, phase: .planning)
+        let planningAttachments = tasks[initialIndex].attachments
         guard await saveImmediately() else {
             if let failureIndex = taskIndex(taskID) {
                 failTask(
@@ -1087,7 +1125,7 @@ final class BoardStore {
         let hostClient = clientForHost(host)
         do {
             if host.kind == .local {
-                try await attachmentStorage.validate(tasks[initialIndex].attachments)
+                try await attachmentStorage.validate(planningAttachments)
             }
         } catch {
             if let failureIndex = taskIndex(taskID) {
@@ -1096,26 +1134,30 @@ final class BoardStore {
             return
         }
 
-        guard let index = taskIndex(taskID), tasks[index].stage == .planning else { return }
+        guard taskIndex(taskID).map({ tasks[$0].stage == .planning }) == true else { return }
 
         do {
             try await hostClient.connect()
             hostConnectionStates[host.id] = .connected
+            guard let connectionIndex = taskIndex(taskID),
+                  tasks[connectionIndex].stage == .planning
+            else { return }
+            let existingThreadID = tasks[connectionIndex].threadID
+            let requestedModel = tasks[connectionIndex].requestedModel
+            let fastMode = tasks[connectionIndex].fastMode
+            let taskTitle = tasks[connectionIndex].title
+            let isNewThread = existingThreadID == nil
             let startedThread: CodexStartedThread
-            if let existingThread = tasks[index].threadID {
+            if let existingThreadID {
                 startedThread = try await hostClient.resumeThread(
-                    threadID: existingThread,
+                    threadID: existingThreadID,
                     cwd: project.path
                 )
             } else {
                 startedThread = try await hostClient.startThread(
                     cwd: project.path,
-                    model: tasks[index].requestedModel,
-                    serviceTier: tasks[index].fastMode ? CodexServiceTier.fast : CodexServiceTier.standard
-                )
-                try? await hostClient.setThreadName(
-                    threadID: startedThread.threadID,
-                    name: "CodexBoard · \(tasks[index].title)"
+                    model: requestedModel,
+                    serviceTier: fastMode ? CodexServiceTier.fast : CodexServiceTier.standard
                 )
             }
             guard let currentIndex = taskIndex(taskID) else { return }
@@ -1131,10 +1173,30 @@ final class BoardStore {
                 run.sessionID = startedThread.sessionID
                 run.model = startedThread.model
             }
-            scheduleSave()
+            guard await saveImmediately() else {
+                if let failureIndex = taskIndex(taskID), tasks[failureIndex].stage == .planning {
+                    failTask(
+                        at: failureIndex,
+                        message: "Codex thread 已创建但无法持久化其标识；未启动规划 Turn。"
+                    )
+                }
+                return
+            }
+            guard let persistedThreadIndex = taskIndex(taskID),
+                  tasks[persistedThreadIndex].stage == .planning,
+                  tasks[persistedThreadIndex].runs.contains(where: {
+                      $0.id == planningRunID && $0.outcome.isActive
+                  })
+            else { return }
+            if isNewThread {
+                try? await hostClient.setThreadName(
+                    threadID: startedThread.threadID,
+                    name: "CodexBoard · \(taskTitle)"
+                )
+            }
 
             let runtimeSafeApps = await runtimeSafeApps(
-                selectedApps: tasks[currentIndex].selectedApps,
+                selectedApps: tasks[persistedThreadIndex].selectedApps,
                 taskID: taskID
             )
             guard let inputIndex = taskIndex(taskID),
@@ -1164,20 +1226,33 @@ final class BoardStore {
             updateRun(at: inputIndex, runID: planningRunID) { run in
                 run.policySnapshot = planningPolicy
             }
+            let planningModel = tasks[inputIndex].requestedModel
+            let planningEffort = tasks[inputIndex].reasoningEffort
+            let planningServiceTier = tasks[inputIndex].fastMode
+                ? CodexServiceTier.fast
+                : CodexServiceTier.standard
             guard await saveImmediately() else {
-                failTask(
-                    at: currentIndex,
-                    message: "Codex thread 已创建，但无法持久化其标识；未启动规划 Turn。"
-                )
+                if let failureIndex = taskIndex(taskID) {
+                    failTask(
+                        at: failureIndex,
+                        message: "无法持久化规划运行策略；未启动规划 Turn。"
+                    )
+                }
                 return
             }
+            guard let persistedIndex = taskIndex(taskID),
+                  tasks[persistedIndex].stage == .planning,
+                  tasks[persistedIndex].runs.contains(where: {
+                      $0.id == planningRunID && $0.outcome.isActive
+                  })
+            else { return }
             let turn = try await hostClient.startPlanningTurn(
                 threadID: startedThread.threadID,
                 cwd: project.path,
                 input: input,
-                model: tasks[inputIndex].requestedModel,
-                effort: tasks[inputIndex].reasoningEffort,
-                serviceTier: tasks[inputIndex].fastMode ? CodexServiceTier.fast : CodexServiceTier.standard
+                model: planningModel,
+                effort: planningEffort,
+                serviceTier: planningServiceTier
             )
             guard let finalIndex = taskIndex(taskID),
                   tasks[finalIndex].stage == .planning,
@@ -1495,18 +1570,55 @@ final class BoardStore {
         cancellationIntentTaskIDs.insert(taskID)
         guard cancellationRequestInFlightTaskIDs.insert(taskID).inserted else { return }
         defer { cancellationRequestInFlightTaskIDs.remove(taskID) }
-        guard let threadID = tasks[initialIndex].threadID else {
-            appendLog(at: initialIndex, "将在 Turn 启动完成后立即停止。", level: .warning)
-            scheduleSave(immediate: true)
-            return
-        }
+
+        let phase: TaskRunPhase = tasks[initialIndex].stage == .planning ? .planning : .execution
+        guard let runIndex = tasks[initialIndex].runs.lastIndex(where: {
+            $0.phase == phase && $0.outcome.isActive
+        }) else { return }
+        let runID = tasks[initialIndex].runs[runIndex].id
+        let hostID = tasks[initialIndex].hostID
+        let now = Date()
+        let threadID = tasks[initialIndex].runs[runIndex].threadID ?? tasks[initialIndex].threadID
         let activeTurnID = tasks[initialIndex].stage == .planning
             ? tasks[initialIndex].planningTurnID
             : tasks[initialIndex].executionTurnID
-        let turnID = activeTurnID
+        let turnID = tasks[initialIndex].runs[runIndex].turnID
+            ?? activeTurnID
             ?? pendingInteractionsByTaskID[taskID]?.compactMap(\.turnID).first
+        var drain = tasks[initialIndex].runs[runIndex].multiAgentDrain ?? TaskRunDrainState(
+            phase: .cancelling,
+            knownThreadIDs: threadID.map { [$0] } ?? [],
+            startedAt: now
+        )
+        drain.phase = .cancelling
+        if drain.cancellationRequestedAt == nil { drain.cancellationRequestedAt = now }
+        if let threadID {
+            drain.knownThreadIDs = Array(Set(drain.knownThreadIDs + [threadID])).sorted()
+            tasks[initialIndex].runs[runIndex].threadID = threadID
+        }
+        if let turnID { tasks[initialIndex].runs[runIndex].turnID = turnID }
+        tasks[initialIndex].runs[runIndex].multiAgentDrain = drain
+        tasks[initialIndex].liveMessage = "正在持久化停止意图…"
+        tasks[initialIndex].updatedAt = now
+        scheduleSave(immediate: true)
+        guard await saveImmediately() else {
+            if let index = taskIndex(taskID) {
+                appendLog(at: index, "停止意图无法持久化，未发送远端中断请求。", level: .error)
+            }
+            return
+        }
+        guard activeDrainLocation(taskID: taskID, runID: runID) != nil else { return }
+
+        guard let threadID else {
+            if let index = taskIndex(taskID) {
+                appendLog(at: index, "将在 Turn 启动完成后立即停止。", level: .warning)
+                scheduleSave(immediate: true)
+            }
+            return
+        }
 
         await cancelPendingInteractions(for: taskID)
+        guard activeDrainLocation(taskID: taskID, runID: runID) != nil else { return }
         guard let turnID else {
             if let index = taskIndex(taskID) {
                 appendLog(at: index, "停止请求正在等待 Turn 启动完成，请稍后重试。", level: .warning)
@@ -1515,7 +1627,7 @@ final class BoardStore {
             return
         }
         do {
-            guard let host = host(for: tasks[initialIndex].hostID), host.isEnabled else {
+            guard let host = host(for: hostID), host.isEnabled else {
                 throw CodexClientError.invalidResponse("任务主机已停用或不再存在")
             }
             try await clientForHost(host).interrupt(threadID: threadID, turnID: turnID)
@@ -1529,6 +1641,7 @@ final class BoardStore {
             }
         }
         scheduleSave(immediate: true)
+        scheduleDrainReconciliation(taskID: taskID, runID: runID)
     }
 
     func deleteTask(taskID: UUID) {
@@ -1713,11 +1826,36 @@ final class BoardStore {
     }
 
     private func enqueuePlanning(taskID: UUID) {
-        guard pendingPlanningTaskIDs.insert(taskID).inserted else { return }
-        Task { @MainActor [weak self] in
+        if pendingPlanningTaskIDs.insert(taskID).inserted {
+            planningStartupQueue.append(taskID)
+        }
+        schedulePlanningStartupWorker()
+    }
+
+    private func schedulePlanningStartupWorker() {
+        guard planningStartupWorker == nil, !planningStartupQueue.isEmpty else { return }
+        planningStartupWorker = Task { @MainActor [weak self] in
             guard let self else { return }
-            self.pendingPlanningTaskIDs.remove(taskID)
-            await self.startPlanning(taskID: taskID)
+            while !Task.isCancelled, let taskID = self.planningStartupQueue.first {
+                self.planningStartupQueue.removeFirst()
+                await self.performPlanningStart(taskID: taskID)
+                self.pendingPlanningTaskIDs.remove(taskID)
+                let waiters = self.planningStartupWaiters.removeValue(forKey: taskID) ?? []
+                waiters.forEach { $0.resume() }
+            }
+            if Task.isCancelled {
+                let remainingTaskIDs = self.planningStartupQueue
+                self.planningStartupQueue.removeAll()
+                for taskID in remainingTaskIDs {
+                    self.pendingPlanningTaskIDs.remove(taskID)
+                    let waiters = self.planningStartupWaiters.removeValue(forKey: taskID) ?? []
+                    waiters.forEach { $0.resume() }
+                }
+            }
+            self.planningStartupWorker = nil
+            if !self.planningStartupQueue.isEmpty {
+                self.schedulePlanningStartupWorker()
+            }
         }
     }
 
@@ -1761,9 +1899,27 @@ final class BoardStore {
         for taskID in taskIDs {
             guard let index = taskIndex(taskID), tasks[index].stage.isActive else { continue }
             let taskSnapshot = tasks[index]
+            let runPhase: TaskRunPhase = taskSnapshot.stage == .planning ? .planning : .execution
             let turnID = taskSnapshot.stage == .planning
                 ? taskSnapshot.planningTurnID
                 : taskSnapshot.executionTurnID
+            let persistedRun = taskSnapshot.runs.last(where: {
+                $0.phase == runPhase && $0.outcome.isActive
+                    && ($0.turnID == turnID || $0.turnID == nil || turnID == nil)
+            })
+            if let persistedRun,
+               persistedRun.multiAgentDrain?.cancellationRequestedAt != nil,
+               turnID == nil {
+                cancellationIntentTaskIDs.insert(taskID)
+                failTask(
+                    at: index,
+                    message: "任务已停止。",
+                    runOutcome: .interrupted,
+                    kind: .interrupted,
+                    automaticRetryAllowed: false
+                )
+                continue
+            }
             guard let host = host(for: taskSnapshot.hostID), host.isEnabled,
                   let threadID = taskSnapshot.threadID,
                   let turnID
@@ -1773,6 +1929,22 @@ final class BoardStore {
                     message: "无法确认应用退出时的远端执行状态；任务已暂停，未启动新 Turn。"
                 )
                 continue
+            }
+
+            if let persistedRun, let drain = persistedRun.multiAgentDrain {
+                if drain.phase == .drained, let terminalStatus = drain.rootTerminalStatus {
+                    finalizeDrainedTurn(
+                        at: index,
+                        turnID: turnID,
+                        status: terminalStatus,
+                        error: drain.rootTerminalError
+                    )
+                    continue
+                }
+                if drain.rootTerminalStatus != nil || drain.cancellationRequestedAt != nil {
+                    scheduleDrainReconciliation(taskID: taskID, runID: persistedRun.id)
+                    continue
+                }
             }
 
             do {
@@ -1793,6 +1965,11 @@ final class BoardStore {
                     }
                     continue
                 }
+                restoreRunForConfirmedTurn(
+                    at: currentIndex,
+                    phase: runPhase,
+                    turnID: turn.id
+                )
 
                 switch normalizedTurnStatus(turn.status) {
                 case "completed":
@@ -2082,6 +2259,11 @@ final class BoardStore {
         }
     }
 
+    /*
+     A completed root planning turn that is still draining reserves its place
+     in the execution queue. This keeps resource ordering stable without
+     moving the card out of its active phase before every descendant stops.
+     */
     private func scheduleExecutionQueue() {
         let available = max(0, preferences.maxConcurrentExecutions - activeExecutionCount)
         guard available > 0 else { return }
@@ -2097,7 +2279,8 @@ final class BoardStore {
                 .map(\.projectID)
         )
         var queued: [Int] = []
-        let candidates = tasks.indices
+        var reserved = 0
+        let readyDemands = tasks.indices
             .filter {
                 tasks[$0].stage == .awaitingApproval
                     && tasks[$0].executionApproved
@@ -2105,29 +2288,71 @@ final class BoardStore {
                     && tasks[$0].hasFinalPlan
                     && !tasks[$0].planText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
-            .sorted { tasks[$0].updatedAt < tasks[$1].updatedAt }
-        for index in candidates {
-            guard queued.count < available else {
-                tasks[index].liveMessage = "等待可用执行槽位"
+            .map {
+                ExecutionSchedulingDemand(
+                    taskIndex: $0,
+                    isReady: true,
+                    orderDate: tasks[$0].updatedAt
+                )
+            }
+        let reservationDemands = tasks.indices.compactMap { index -> ExecutionSchedulingDemand? in
+            guard tasks[index].stage == .planning,
+                  tasks[index].autoRun,
+                  !cancellationIntentTaskIDs.contains(tasks[index].id),
+                  let run = tasks[index].runs.last(where: {
+                      $0.phase == .planning && $0.outcome.isActive
+                  }),
+                  let drain = run.multiAgentDrain,
+                  drain.rootTerminalStatus.map({ normalizedTurnStatus($0) == "completed" }) == true
+            else { return nil }
+            return ExecutionSchedulingDemand(
+                taskIndex: index,
+                isReady: false,
+                orderDate: drain.rootTerminalObservedAt ?? tasks[index].updatedAt
+            )
+        }
+        let demands = (readyDemands + reservationDemands).sorted { lhs, rhs in
+            if lhs.orderDate != rhs.orderDate { return lhs.orderDate < rhs.orderDate }
+            let lhsTask = tasks[lhs.taskIndex]
+            let rhsTask = tasks[rhs.taskIndex]
+            if lhsTask.createdAt != rhsTask.createdAt { return lhsTask.createdAt < rhsTask.createdAt }
+            return lhs.taskIndex < rhs.taskIndex
+        }
+        for demand in demands {
+            let index = demand.taskIndex
+            guard queued.count + reserved < available else {
+                if demand.isReady {
+                    tasks[index].liveMessage = "等待可用执行槽位"
+                }
                 continue
             }
             guard let candidateHost = host(for: tasks[index].hostID), candidateHost.isEnabled else {
-                tasks[index].liveMessage = "等待任务主机恢复"
+                if demand.isReady {
+                    tasks[index].liveMessage = "等待任务主机恢复"
+                }
                 continue
             }
             guard activeByHost[candidateHost.id, default: 0] < candidateHost.maxConcurrentExecutions else {
-                tasks[index].liveMessage = "等待 \(candidateHost.name) 的执行槽位"
+                if demand.isReady {
+                    tasks[index].liveMessage = "等待 \(candidateHost.name) 的执行槽位"
+                }
                 continue
             }
             if tasks[index].workspace.kind == .project {
                 guard !occupiedProjects.contains(tasks[index].projectID) else {
-                    tasks[index].liveMessage = "等待同项目的主目录任务结束"
+                    if demand.isReady {
+                        tasks[index].liveMessage = "等待同项目的主目录任务结束"
+                    }
                     continue
                 }
                 occupiedProjects.insert(tasks[index].projectID)
             }
             activeByHost[candidateHost.id, default: 0] += 1
-            queued.append(index)
+            if demand.isReady {
+                queued.append(index)
+            } else {
+                reserved += 1
+            }
         }
         for index in queued {
             let taskID = tasks[index].id
@@ -2145,13 +2370,17 @@ final class BoardStore {
 
     private func performExecution(taskID: UUID, runID: UUID) async {
         discardPendingStreamUpdate(for: taskID)
-        guard let index = taskIndex(taskID), let project = project(forTaskAt: index), let threadID = tasks[index].threadID else {
+        guard let index = taskIndex(taskID),
+              let project = project(forTaskAt: index),
+              let threadID = tasks[index].threadID
+        else {
             if let index = taskIndex(taskID) {
                 failTask(at: index, message: "缺少可恢复的 Codex thread。", kind: .workspace)
             }
             return
         }
-        guard let host = host(for: tasks[index].hostID), host.isEnabled else {
+        let taskSnapshot = tasks[index]
+        guard let host = host(for: taskSnapshot.hostID), host.isEnabled else {
             failTask(at: index, message: "任务主机已停用或不再存在。")
             scheduleExecutionQueue()
             return
@@ -2170,10 +2399,10 @@ final class BoardStore {
         do {
             let executionPath: String
             if host.kind == .ssh {
-                guard tasks[index].attachments.isEmpty else {
+                guard taskSnapshot.attachments.isEmpty else {
                     throw BoardStoreError.remoteAttachmentsUnsupported
                 }
-                guard tasks[index].workspace.kind != .worktree else {
+                guard taskSnapshot.workspace.kind != .worktree else {
                     throw BoardStoreError.remoteWorktreeUnsupported
                 }
                 executionPath = project.path
@@ -2181,7 +2410,7 @@ final class BoardStore {
                 let preparedWorkspace = try await worktreeManager.prepare(
                     taskID: taskID,
                     projectPath: project.path,
-                    configuration: tasks[index].workspace
+                    configuration: taskSnapshot.workspace
                 )
                 guard let preparedIndex = taskIndex(taskID) else { return }
                 tasks[preparedIndex].workspace = preparedWorkspace
@@ -2193,7 +2422,8 @@ final class BoardStore {
                         level: .success
                     )
                 }
-                try await attachmentStorage.validate(tasks[preparedIndex].attachments)
+                let executionAttachments = tasks[preparedIndex].attachments
+                try await attachmentStorage.validate(executionAttachments)
             }
             try await hostClient.connect()
             hostConnectionStates[host.id] = .connected
@@ -2211,8 +2441,24 @@ final class BoardStore {
                 run.sessionID = resumed.sessionID
                 run.model = resumed.model
             }
+            guard await saveImmediately() else {
+                if let failureIndex = taskIndex(taskID) {
+                    failTask(
+                        at: failureIndex,
+                        message: "无法持久化恢复后的 session；未启动执行 Turn。"
+                    )
+                    scheduleExecutionQueue()
+                }
+                return
+            }
+            guard let persistedSessionIndex = taskIndex(taskID),
+                  tasks[persistedSessionIndex].stage == .executing,
+                  tasks[persistedSessionIndex].runs.contains(where: {
+                      $0.id == runID && $0.outcome.isActive
+                  })
+            else { return }
             let runtimeSafeApps = await runtimeSafeApps(
-                selectedApps: tasks[currentIndex].selectedApps,
+                selectedApps: tasks[persistedSessionIndex].selectedApps,
                 taskID: taskID
             )
             guard let inputIndex = taskIndex(taskID),
@@ -2236,14 +2482,6 @@ final class BoardStore {
             updateRun(at: inputIndex, runID: runID) { run in
                 run.policySnapshot = executionPolicy
             }
-            guard await saveImmediately() else {
-                failTask(
-                    at: currentIndex,
-                    message: "无法持久化恢复后的 session；未启动执行 Turn。"
-                )
-                scheduleExecutionQueue()
-                return
-            }
             var runtimeTask = tasks[inputIndex]
             runtimeTask.selectedApps = runtimeSafeApps
             let input = TaskPromptBuilder.executionInput(
@@ -2251,14 +2489,36 @@ final class BoardStore {
                 projectPath: executionPath,
                 sourceProjectPath: project.path
             )
+            let executionModel = tasks[inputIndex].requestedModel
+            let executionEffort = tasks[inputIndex].reasoningEffort
+            let executionServiceTier = tasks[inputIndex].fastMode
+                ? CodexServiceTier.fast
+                : CodexServiceTier.standard
+            let executionAllowsNetwork = preferences.allowNetworkAccess
+            guard await saveImmediately() else {
+                if let failureIndex = taskIndex(taskID) {
+                    failTask(
+                        at: failureIndex,
+                        message: "无法持久化执行运行策略；未启动执行 Turn。"
+                    )
+                    scheduleExecutionQueue()
+                }
+                return
+            }
+            guard let persistedIndex = taskIndex(taskID),
+                  tasks[persistedIndex].stage == .executing,
+                  tasks[persistedIndex].runs.contains(where: {
+                      $0.id == runID && $0.outcome.isActive
+                  })
+            else { return }
             let turn = try await hostClient.startExecutionTurn(
                 threadID: threadID,
                 cwd: executionPath,
                 input: input,
-                model: tasks[inputIndex].requestedModel,
-                effort: tasks[inputIndex].reasoningEffort,
-                serviceTier: tasks[inputIndex].fastMode ? CodexServiceTier.fast : CodexServiceTier.standard,
-                allowNetwork: preferences.allowNetworkAccess
+                model: executionModel,
+                effort: executionEffort,
+                serviceTier: executionServiceTier,
+                allowNetwork: executionAllowsNetwork
             )
             guard let finalIndex = taskIndex(taskID),
                   tasks[finalIndex].stage == .executing,
@@ -2370,7 +2630,13 @@ final class BoardStore {
             flushPendingStreamUpdates()
             guard let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             completeTurn(at: index, turnID: turnID, status: status, error: error)
-        case .threadStarted, .collabAgentToolCall, .subAgentActivity, .tokenUsageUpdated, .threadStatus:
+        case let .threadStarted(summary):
+            observeStartedSubagentThread(summary, hostID: hostID)
+        case let .collabAgentToolCall(threadID, _, _, call):
+            observeCollaborationCall(threadID: threadID, call: call, hostID: hostID)
+        case let .subAgentActivity(threadID, _, _, activity):
+            observeSubagentActivity(threadID: threadID, activity: activity, hostID: hostID)
+        case .tokenUsageUpdated, .threadStatus:
             break
         case let .interactionRequested(request):
             guard let index = taskIndex(
@@ -2456,17 +2722,671 @@ final class BoardStore {
             }
             for index in tasks.indices
                 where tasks[index].hostID == hostID && tasks[index].stage.isActive {
-                failTask(
-                    at: index,
-                    message: "\(hostName(for: hostID)) 的 Codex 连接已断开：\(message) 请检查工作区后再继续。",
-                    kind: .connection
-                )
+                let phase: TaskRunPhase = tasks[index].stage == .planning ? .planning : .execution
+                if let runIndex = tasks[index].runs.lastIndex(where: {
+                    $0.phase == phase && $0.outcome.isActive && $0.multiAgentDrain != nil
+                }), var drain = tasks[index].runs[runIndex].multiAgentDrain {
+                    let failureMessage = "\(hostName(for: hostID)) 的 Codex 连接已断开：\(message) 子代理状态尚未确认。"
+                    drain.phase = .blocked
+                    drain.blockedReason = failureMessage
+                    // A transport loss is already an externally confirmed
+                    // blocker, not a single noisy reconciliation sample. Mark
+                    // it at the durable attention threshold so restart rebuilds
+                    // the same actionable notice until a readback succeeds.
+                    drain.consecutiveReconciliationFailureCount = max(
+                        3,
+                        drain.consecutiveReconciliationFailureCount + 1
+                    )
+                    drain.stabilitySignature = nil
+                    drain.stableObservationCount = 0
+                    tasks[index].runs[runIndex].multiAgentDrain = drain
+                    tasks[index].lastError = failureMessage
+                    tasks[index].liveMessage = "连接已断开，任务保持占槽并等待重新对账"
+                    tasks[index].updatedAt = Date()
+                    addFailureAttention(
+                        taskID: tasks[index].id,
+                        runID: tasks[index].runs[runIndex].id,
+                        createdAt: tasks[index].updatedAt
+                    )
+                    scheduleDrainReconciliation(
+                        taskID: tasks[index].id,
+                        runID: tasks[index].runs[runIndex].id,
+                        after: .seconds(1)
+                    )
+                } else {
+                    failTask(
+                        at: index,
+                        message: "\(hostName(for: hostID)) 的 Codex 连接已断开：\(message) 请检查工作区后再继续。",
+                        kind: .connection
+                    )
+                }
             }
+            scheduleSave(immediate: true)
             scheduleExecutionQueue()
         }
     }
 
+    private func observeStartedSubagentThread(_ summary: CodexThreadSummary, hostID: String) {
+        guard let parentThreadID = summary.parentThreadID,
+              let location = drainEventLocation(
+                  hostID: hostID,
+                  candidateThreadIDs: [parentThreadID]
+              )
+        else { return }
+        mergeDrainObservation(
+            at: location.taskIndex,
+            runIndex: location.runIndex,
+            observedThreadIDs: [summary.id, parentThreadID],
+            authoritativeParents: [summary.id: parentThreadID]
+        )
+    }
+
+    private func observeCollaborationCall(
+        threadID: String,
+        call: CodexCollabAgentToolCall,
+        hostID: String
+    ) {
+        let candidates = Set([threadID, call.senderThreadID] + call.receiverThreadIDs)
+        guard let location = drainEventLocation(
+            hostID: hostID,
+            candidateThreadIDs: candidates
+        ) else { return }
+        var spawnParents: [String: String] = [:]
+        if call.tool == "spawnAgent" {
+            for receiverThreadID in call.receiverThreadIDs {
+                spawnParents[receiverThreadID] = call.senderThreadID
+            }
+        }
+        mergeDrainObservation(
+            at: location.taskIndex,
+            runIndex: location.runIndex,
+            observedThreadIDs: candidates,
+            supplementalParents: spawnParents
+        )
+    }
+
+    private func observeSubagentActivity(
+        threadID: String,
+        activity: CodexSubAgentActivity,
+        hostID: String
+    ) {
+        guard let location = drainEventLocation(
+            hostID: hostID,
+            candidateThreadIDs: [threadID]
+        ) else { return }
+        mergeDrainObservation(
+            at: location.taskIndex,
+            runIndex: location.runIndex,
+            observedThreadIDs: [threadID, activity.agentThreadID]
+        )
+    }
+
+    private func drainEventLocation(
+        hostID: String,
+        candidateThreadIDs: Set<String>
+    ) -> (taskIndex: Int, runIndex: Int)? {
+        for taskIndex in tasks.indices
+        where tasks[taskIndex].hostID == hostID && tasks[taskIndex].stage.isActive {
+            let phase: TaskRunPhase = tasks[taskIndex].stage == .planning ? .planning : .execution
+            guard let runIndex = tasks[taskIndex].runs.lastIndex(where: {
+                $0.phase == phase && $0.outcome.isActive
+            }) else { continue }
+            let run = tasks[taskIndex].runs[runIndex]
+            var ownedThreadIDs = Set(run.multiAgentDrain?.knownThreadIDs ?? [])
+            if let rootThreadID = run.threadID ?? tasks[taskIndex].threadID {
+                ownedThreadIDs.insert(rootThreadID)
+            }
+            if !ownedThreadIDs.isDisjoint(with: candidateThreadIDs) {
+                return (taskIndex, runIndex)
+            }
+        }
+        return nil
+    }
+
+    private func mergeDrainObservation(
+        at taskIndex: Int,
+        runIndex: Int,
+        observedThreadIDs: Set<String>,
+        authoritativeParents: [String: String] = [:],
+        supplementalParents: [String: String] = [:]
+    ) {
+        let now = Date()
+        let runID = tasks[taskIndex].runs[runIndex].id
+        let rootThreadID = tasks[taskIndex].runs[runIndex].threadID ?? tasks[taskIndex].threadID
+        var drain = tasks[taskIndex].runs[runIndex].multiAgentDrain ?? TaskRunDrainState(
+            phase: .observing,
+            knownThreadIDs: rootThreadID.map { [$0] } ?? [],
+            startedAt: now
+        )
+        let previousThreadIDs = Set(drain.knownThreadIDs)
+        let previousParents = drain.parentByThreadID
+        var mergedThreadIDs = previousThreadIDs
+        mergedThreadIDs.formUnion(observedThreadIDs.filter { !$0.isEmpty })
+        if let rootThreadID { mergedThreadIDs.insert(rootThreadID) }
+        for (childThreadID, parentThreadID) in supplementalParents
+        where drain.parentByThreadID[childThreadID] == nil {
+            drain.parentByThreadID[childThreadID] = parentThreadID
+        }
+        for (childThreadID, parentThreadID) in authoritativeParents {
+            drain.parentByThreadID[childThreadID] = parentThreadID
+        }
+        drain.knownThreadIDs = mergedThreadIDs.sorted()
+
+        let changed = previousThreadIDs != mergedThreadIDs || previousParents != drain.parentByThreadID
+        guard changed else { return }
+        drain.stabilitySignature = nil
+        drain.stableObservationCount = 0
+        if drain.rootTerminalStatus != nil {
+            drain.phase = drain.cancellationRequestedAt != nil
+                || cancellationIntentTaskIDs.contains(tasks[taskIndex].id)
+                || drain.rootTerminalStatus.map { normalizedTurnStatus($0) != "completed" } == true
+                ? .cancelling
+                : .draining
+        }
+        tasks[taskIndex].runs[runIndex].multiAgentDrain = drain
+        tasks[taskIndex].updatedAt = now
+        scheduleSave()
+        if drain.rootTerminalStatus != nil || drain.cancellationRequestedAt != nil {
+            scheduleDrainReconciliation(taskID: tasks[taskIndex].id, runID: runID)
+        }
+    }
+
+    private func scheduleDrainReconciliation(
+        taskID: UUID,
+        runID: UUID,
+        after delay: Duration = .zero
+    ) {
+        guard drainTasksByRunID[runID] == nil else { return }
+        drainTasksByRunID[runID] = Task { @MainActor [weak self] in
+            if delay > .zero {
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    return
+                }
+            }
+            guard !Task.isCancelled, let self else { return }
+            let action = await self.reconcileMultiAgentDrain(taskID: taskID, runID: runID)
+            self.drainTasksByRunID[runID] = nil
+            if case let .retry(nextDelay) = action {
+                self.scheduleDrainReconciliation(taskID: taskID, runID: runID, after: nextDelay)
+            }
+        }
+    }
+
+    private func reconcileMultiAgentDrain(
+        taskID: UUID,
+        runID: UUID
+    ) async -> DrainReconciliationAction {
+        guard let location = activeDrainLocation(taskID: taskID, runID: runID) else { return .stop }
+        guard await saveImmediately() else {
+            return recordDrainReconciliationFailure(
+                taskID: taskID,
+                runID: runID,
+                message: "无法持久化子代理排空状态；尚未执行远端对账。"
+            )
+        }
+
+        let taskSnapshot = tasks[location.taskIndex]
+        guard let rootThreadID = taskSnapshot.runs[location.runIndex].threadID ?? taskSnapshot.threadID,
+              let rootTurnID = taskSnapshot.runs[location.runIndex].turnID,
+              let host = host(for: taskSnapshot.hostID),
+              host.isEnabled
+        else {
+            return recordDrainReconciliationFailure(
+                taskID: taskID,
+                runID: runID,
+                message: "缺少根 Thread/Turn 或任务主机不可用，无法核对子代理。"
+            )
+        }
+
+        let hostClient = clientForHost(host)
+        let listedDescendants: [CodexThreadSummary]
+        do {
+            try await hostClient.connect()
+            hostConnectionStates[host.id] = .connected
+            listedDescendants = try await hostClient.listDescendantThreads(
+                ancestorThreadID: rootThreadID
+            )
+        } catch {
+            reflectTransportState(of: hostClient, for: host, fallbackError: error)
+            return recordDrainReconciliationFailure(
+                taskID: taskID,
+                runID: runID,
+                message: "列出子代理 Thread 失败：\(error.localizedDescription)"
+            )
+        }
+
+        guard let refreshedLocation = activeDrainLocation(taskID: taskID, runID: runID),
+              let drain = tasks[refreshedLocation.taskIndex].runs[refreshedLocation.runIndex].multiAgentDrain
+        else { return .stop }
+        let observationBaseline = drain
+        var candidateThreadIDs = Set(drain.knownThreadIDs)
+        candidateThreadIDs.insert(rootThreadID)
+        candidateThreadIDs.formUnion(listedDescendants.map(\.id))
+        guard candidateThreadIDs.count <= drainCoordinator.maximumNodeCount else {
+            return recordDrainReconciliationFailure(
+                taskID: taskID,
+                runID: runID,
+                message: "子代理图包含 \(candidateThreadIDs.count) 个节点，超过安全上限 \(drainCoordinator.maximumNodeCount)。"
+            )
+        }
+
+        if drain.rootTerminalStatus != nil,
+           candidateThreadIDs == [rootThreadID],
+           listedDescendants.isEmpty {
+            return await reconcileEmptyDescendantFixedPoint(
+                taskID: taskID,
+                runID: runID,
+                rootThreadID: rootThreadID,
+                rootTurnID: rootTurnID
+            )
+        }
+
+        var threadDetails: [CodexThreadDetail] = []
+        do {
+            for threadID in candidateThreadIDs.sorted() {
+                threadDetails.append(try await hostClient.readThread(
+                    threadID: threadID,
+                    includeTurns: true
+                ))
+            }
+        } catch {
+            return recordDrainReconciliationFailure(
+                taskID: taskID,
+                runID: runID,
+                message: "读取子代理 Thread 失败：\(error.localizedDescription)"
+            )
+        }
+
+        guard let currentLocation = activeDrainLocation(taskID: taskID, runID: runID),
+              var currentDrain = tasks[currentLocation.taskIndex].runs[currentLocation.runIndex].multiAgentDrain
+        else { return .stop }
+        guard currentDrain == observationBaseline else {
+            return .retry(after: drainStabilityDelay)
+        }
+        if currentDrain.rootTerminalStatus == nil {
+            guard let rootDetail = threadDetails.first(where: { $0.summary.id == rootThreadID }),
+                  let rootTurn = rootDetail.turns.first(where: { $0.id == rootTurnID })
+            else {
+                return recordDrainReconciliationFailure(
+                    taskID: taskID,
+                    runID: runID,
+                    message: "thread/read 未返回正在取消的根 Turn \(shortID(rootTurnID))。"
+                )
+            }
+            switch normalizedTurnStatus(rootTurn.status) {
+            case "completed", "failed", "interrupted", "cancelled", "canceled":
+                currentDrain.rootTerminalStatus = rootTurn.status
+                currentDrain.rootTerminalError = rootTurn.error
+                currentDrain.rootTerminalObservedAt = Date()
+            default:
+                break
+            }
+        }
+
+        let snapshot = drainCoordinator.makeSnapshot(
+            rootThreadID: rootThreadID,
+            threadDetails: threadDetails,
+            knownThreadIDs: candidateThreadIDs
+        )
+        currentDrain.knownThreadIDs = snapshot.observedThreadIDs
+        currentDrain.parentByThreadID = snapshot.parentByThreadID
+        currentDrain.activeTurns = snapshot.activeTurns.map {
+            TaskRunDrainTurnReference(threadID: $0.threadID, turnID: $0.turnID)
+        }
+        currentDrain.lastReconciledAt = Date()
+
+        if let blocker = snapshot.blockedReason {
+            currentDrain.phase = .blocked
+            currentDrain.blockedReason = blocker.description
+            currentDrain.stabilitySignature = nil
+            currentDrain.stableObservationCount = 0
+            currentDrain.consecutiveReconciliationFailureCount += 1
+            applyDrainState(
+                currentDrain,
+                taskID: taskID,
+                runID: runID,
+                liveMessage: "子代理状态无法安全确认"
+            )
+            if currentDrain.consecutiveReconciliationFailureCount >= 3,
+               let blockedLocation = activeDrainLocation(taskID: taskID, runID: runID) {
+                addFailureAttention(
+                    taskID: taskID,
+                    runID: runID,
+                    createdAt: tasks[blockedLocation.taskIndex].updatedAt
+                )
+            }
+            _ = await saveImmediately()
+            return .retry(after: .seconds(2))
+        }
+
+        currentDrain.blockedReason = nil
+        currentDrain.consecutiveReconciliationFailureCount = 0
+        let isCancelling = currentDrain.cancellationRequestedAt != nil
+            || cancellationIntentTaskIDs.contains(taskID)
+            || currentDrain.rootTerminalStatus.map { normalizedTurnStatus($0) != "completed" } == true
+
+        if snapshot.isDrained {
+            let stableCount = currentDrain.stabilitySignature == snapshot.stabilitySignature
+                ? currentDrain.stableObservationCount + 1
+                : 1
+            currentDrain.stabilitySignature = snapshot.stabilitySignature
+            currentDrain.stableObservationCount = stableCount
+            currentDrain.phase = stableCount >= 2 ? .drained : (isCancelling ? .cancelling : .draining)
+            applyDrainState(
+                currentDrain,
+                taskID: taskID,
+                runID: runID,
+                liveMessage: stableCount >= 2 ? "子代理已全部停止" : "正在确认子代理图已稳定…"
+            )
+            guard await saveImmediately() else {
+                return recordDrainReconciliationFailure(
+                    taskID: taskID,
+                    runID: runID,
+                    message: "子代理已排空，但最终状态无法持久化。"
+                )
+            }
+            guard let savedLocation = activeDrainLocation(taskID: taskID, runID: runID),
+                  tasks[savedLocation.taskIndex].runs[savedLocation.runIndex].multiAgentDrain == currentDrain
+            else {
+                return activeDrainLocation(taskID: taskID, runID: runID) == nil
+                    ? .stop
+                    : .retry(after: drainStabilityDelay)
+            }
+            guard stableCount >= 2 else { return .retry(after: drainStabilityDelay) }
+            return finalizePersistedDrain(
+                taskID: taskID,
+                runID: runID,
+                rootThreadID: rootThreadID,
+                rootTurnID: rootTurnID
+            )
+        }
+
+        currentDrain.phase = isCancelling ? .cancelling : .draining
+        currentDrain.stabilitySignature = snapshot.stabilitySignature
+        currentDrain.stableObservationCount = 0
+        let activeCount = snapshot.activeTurns.count + snapshot.pendingThreadIDs.count
+        applyDrainState(
+            currentDrain,
+            taskID: taskID,
+            runID: runID,
+            liveMessage: isCancelling
+                ? "正在停止并核对 \(activeCount) 个活动子代理…"
+                : "正在等待 \(activeCount) 个活动子代理…"
+        )
+        resolveFailureAttention(taskID: taskID)
+        guard await saveImmediately() else {
+            return recordDrainReconciliationFailure(
+                taskID: taskID,
+                runID: runID,
+                message: "无法持久化最新子代理状态；未发送中断请求。"
+            )
+        }
+        if isCancelling, !snapshot.activeTurns.isEmpty {
+            await interruptDrainTurns(
+                snapshot.activeTurns,
+                parentByThreadID: snapshot.parentByThreadID,
+                rootThreadID: rootThreadID,
+                client: hostClient
+            )
+        }
+        return .retry(after: drainStabilityDelay)
+    }
+
+    private func reconcileEmptyDescendantFixedPoint(
+        taskID: UUID,
+        runID: UUID,
+        rootThreadID: String,
+        rootTurnID: String
+    ) async -> DrainReconciliationAction {
+        guard let location = activeDrainLocation(taskID: taskID, runID: runID),
+              var drain = tasks[location.taskIndex].runs[location.runIndex].multiAgentDrain,
+              let terminalStatus = drain.rootTerminalStatus
+        else { return .stop }
+        let signature = "empty|\(rootThreadID)|\(rootTurnID)|\(terminalStatus)"
+        drain.stableObservationCount = drain.stabilitySignature == signature
+            ? drain.stableObservationCount + 1
+            : 1
+        drain.stabilitySignature = signature
+        drain.activeTurns = []
+        drain.parentByThreadID = [:]
+        drain.knownThreadIDs = [rootThreadID]
+        drain.lastReconciledAt = Date()
+        drain.blockedReason = nil
+        drain.consecutiveReconciliationFailureCount = 0
+        drain.phase = drain.stableObservationCount >= 2
+            ? .drained
+            : (drain.cancellationRequestedAt != nil
+                || normalizedTurnStatus(terminalStatus) != "completed"
+                ? .cancelling
+                : .draining)
+        applyDrainState(
+            drain,
+            taskID: taskID,
+            runID: runID,
+            liveMessage: drain.stableObservationCount >= 2
+                ? "未发现活动子代理"
+                : "正在确认没有遗漏的子代理…"
+        )
+        guard await saveImmediately() else {
+            return recordDrainReconciliationFailure(
+                taskID: taskID,
+                runID: runID,
+                message: "空子代理图已确认，但状态无法持久化。"
+            )
+        }
+        guard let savedLocation = activeDrainLocation(taskID: taskID, runID: runID),
+              tasks[savedLocation.taskIndex].runs[savedLocation.runIndex].multiAgentDrain == drain
+        else {
+            return activeDrainLocation(taskID: taskID, runID: runID) == nil
+                ? .stop
+                : .retry(after: drainStabilityDelay)
+        }
+        guard drain.stableObservationCount >= 2 else {
+            return .retry(after: drainStabilityDelay)
+        }
+        return finalizePersistedDrain(
+            taskID: taskID,
+            runID: runID,
+            rootThreadID: rootThreadID,
+            rootTurnID: rootTurnID
+        )
+    }
+
+    private func interruptDrainTurns(
+        _ activeTurns: [MultiAgentDrainActiveTurn],
+        parentByThreadID: [String: String],
+        rootThreadID: String,
+        client: any CodexTaskClient
+    ) async {
+        let orderedTurns = activeTurns.sorted { lhs, rhs in
+            let lhsDepth = drainDepth(
+                threadID: lhs.threadID,
+                rootThreadID: rootThreadID,
+                parentByThreadID: parentByThreadID
+            )
+            let rhsDepth = drainDepth(
+                threadID: rhs.threadID,
+                rootThreadID: rootThreadID,
+                parentByThreadID: parentByThreadID
+            )
+            if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
+            if lhs.threadID != rhs.threadID { return lhs.threadID < rhs.threadID }
+            return lhs.turnID < rhs.turnID
+        }
+        for turn in orderedTurns {
+            do {
+                try await client.interrupt(threadID: turn.threadID, turnID: turn.turnID)
+            } catch {
+                // A rejected interrupt may race with natural completion. The
+                // mandatory readback below, not the RPC result, is authoritative.
+            }
+            _ = try? await client.readThread(threadID: turn.threadID, includeTurns: true)
+        }
+    }
+
+    private func drainDepth(
+        threadID: String,
+        rootThreadID: String,
+        parentByThreadID: [String: String]
+    ) -> Int {
+        var depth = 0
+        var current = threadID
+        var visited = Set<String>()
+        while current != rootThreadID,
+              visited.insert(current).inserted,
+              let parent = parentByThreadID[current] {
+            depth += 1
+            current = parent
+        }
+        return current == rootThreadID ? depth : Int.max
+    }
+
+    private func finalizePersistedDrain(
+        taskID: UUID,
+        runID: UUID,
+        rootThreadID: String,
+        rootTurnID: String
+    ) -> DrainReconciliationAction {
+        guard let location = activeDrainLocation(taskID: taskID, runID: runID),
+              let drain = tasks[location.taskIndex].runs[location.runIndex].multiAgentDrain,
+              drain.phase == .drained,
+              (tasks[location.taskIndex].runs[location.runIndex].threadID
+                  ?? tasks[location.taskIndex].threadID) == rootThreadID,
+              tasks[location.taskIndex].runs[location.runIndex].turnID == rootTurnID,
+              let terminalStatus = drain.rootTerminalStatus
+        else { return .stop }
+        finalizeDrainedTurn(
+            at: location.taskIndex,
+            turnID: rootTurnID,
+            status: terminalStatus,
+            error: drain.rootTerminalError
+        )
+        return .stop
+    }
+
+    private func activeDrainLocation(
+        taskID: UUID,
+        runID: UUID
+    ) -> (taskIndex: Int, runIndex: Int)? {
+        guard let taskIndex = taskIndex(taskID), tasks[taskIndex].stage.isActive,
+              let runIndex = tasks[taskIndex].runs.firstIndex(where: {
+                  $0.id == runID && $0.outcome.isActive && $0.multiAgentDrain != nil
+              })
+        else { return nil }
+        return (taskIndex, runIndex)
+    }
+
+    private func applyDrainState(
+        _ drain: TaskRunDrainState,
+        taskID: UUID,
+        runID: UUID,
+        liveMessage: String
+    ) {
+        guard let location = activeDrainLocation(taskID: taskID, runID: runID) else { return }
+        tasks[location.taskIndex].runs[location.runIndex].multiAgentDrain = drain
+        tasks[location.taskIndex].liveMessage = liveMessage
+        tasks[location.taskIndex].lastError = drain.blockedReason
+        tasks[location.taskIndex].updatedAt = Date()
+        scheduleSave(immediate: true)
+    }
+
+    private func recordDrainReconciliationFailure(
+        taskID: UUID,
+        runID: UUID,
+        message: String
+    ) -> DrainReconciliationAction {
+        guard let location = activeDrainLocation(taskID: taskID, runID: runID),
+              var drain = tasks[location.taskIndex].runs[location.runIndex].multiAgentDrain
+        else { return .stop }
+        drain.phase = .blocked
+        drain.blockedReason = message
+        drain.consecutiveReconciliationFailureCount += 1
+        drain.stabilitySignature = nil
+        drain.stableObservationCount = 0
+        applyDrainState(
+            drain,
+            taskID: taskID,
+            runID: runID,
+            liveMessage: "子代理排空暂时受阻，将继续重试"
+        )
+        if drain.consecutiveReconciliationFailureCount >= 3 {
+            addFailureAttention(taskID: taskID, runID: runID, createdAt: Date())
+        }
+        return .retry(after: drain.consecutiveReconciliationFailureCount >= 3 ? .seconds(5) : .seconds(1))
+    }
+
     private func completeTurn(at index: Int, turnID: String, status: String, error: String?) {
+        let phase: TaskRunPhase
+        switch tasks[index].stage {
+        case .planning:
+            guard tasks[index].planningTurnID == nil || tasks[index].planningTurnID == turnID else { return }
+            phase = .planning
+        case .executing:
+            guard tasks[index].planningTurnID != turnID else { return }
+            guard tasks[index].executionTurnID == nil || tasks[index].executionTurnID == turnID else { return }
+            phase = .execution
+        default:
+            return
+        }
+
+        guard let runIndex = tasks[index].runs.lastIndex(where: {
+            $0.phase == phase && $0.outcome.isActive && ($0.turnID == nil || $0.turnID == turnID)
+        }) else { return }
+        let now = Date()
+        let rootThreadID = tasks[index].runs[runIndex].threadID ?? tasks[index].threadID
+        guard let rootThreadID else {
+            tasks[index].lastError = "主代理已结束，但缺少可用于排空子代理的根 Thread。"
+            tasks[index].liveMessage = "无法确认子代理是否已停止"
+            tasks[index].updatedAt = now
+            scheduleSave(immediate: true)
+            return
+        }
+
+        tasks[index].runs[runIndex].threadID = rootThreadID
+        tasks[index].runs[runIndex].turnID = turnID
+        var drain = tasks[index].runs[runIndex].multiAgentDrain ?? TaskRunDrainState(
+            phase: .observing,
+            knownThreadIDs: [rootThreadID],
+            startedAt: now
+        )
+        if let recordedStatus = drain.rootTerminalStatus,
+           normalizedTurnStatus(recordedStatus) != normalizedTurnStatus(status) {
+            drain.phase = .blocked
+            drain.blockedReason = "根 Turn 收到冲突终态：\(recordedStatus) / \(status)"
+            drain.consecutiveReconciliationFailureCount += 1
+            tasks[index].runs[runIndex].multiAgentDrain = drain
+            tasks[index].lastError = drain.blockedReason
+            tasks[index].liveMessage = "根 Turn 终态冲突，已停止自动收口"
+            tasks[index].updatedAt = now
+            addFailureAttention(taskID: tasks[index].id, runID: tasks[index].runs[runIndex].id, createdAt: now)
+            scheduleSave(immediate: true)
+            return
+        }
+
+        drain.rootTerminalStatus = status
+        if drain.rootTerminalError == nil { drain.rootTerminalError = error }
+        if drain.rootTerminalObservedAt == nil { drain.rootTerminalObservedAt = now }
+        drain.knownThreadIDs = Array(Set(drain.knownThreadIDs + [rootThreadID])).sorted()
+        if drain.cancellationRequestedAt != nil
+            || cancellationIntentTaskIDs.contains(tasks[index].id)
+            || normalizedTurnStatus(status) != "completed" {
+            drain.phase = .cancelling
+        } else {
+            drain.phase = .draining
+        }
+        drain.blockedReason = nil
+        tasks[index].runs[runIndex].multiAgentDrain = drain
+        tasks[index].liveMessage = drain.phase == .cancelling
+            ? "主代理已结束，正在停止并核对子代理…"
+            : "主代理已结束，正在核对子代理…"
+        tasks[index].updatedAt = now
+        scheduleSave(immediate: true)
+        scheduleDrainReconciliation(taskID: tasks[index].id, runID: tasks[index].runs[runIndex].id)
+    }
+
+    private func finalizeDrainedTurn(at index: Int, turnID: String, status: String, error: String?) {
         let isPlanning: Bool
         switch tasks[index].stage {
         case .planning:
@@ -2481,8 +3401,11 @@ final class BoardStore {
             // never move an already-settled card back into an active workflow.
             return
         }
+        let persistedCancellationRequested = tasks[index].runs.last(where: {
+            $0.outcome.isActive && $0.turnID == turnID
+        })?.multiAgentDrain?.cancellationRequestedAt != nil
         clearInteractions(for: tasks[index].id, turnID: turnID)
-        if cancellationIntentTaskIDs.contains(tasks[index].id) {
+        if cancellationIntentTaskIDs.contains(tasks[index].id) || persistedCancellationRequested {
             failTask(
                 at: index,
                 message: "任务已停止。",
@@ -2492,13 +3415,15 @@ final class BoardStore {
             scheduleExecutionQueue()
             return
         }
-        guard status == "completed" else {
-            let reason = error ?? (status == "interrupted" ? "任务已停止。" : "Codex turn 状态：\(status)")
+        let normalizedStatus = normalizedTurnStatus(status)
+        guard normalizedStatus == "completed" else {
+            let wasInterrupted = ["interrupted", "cancelled", "canceled"].contains(normalizedStatus)
+            let reason = error ?? (wasInterrupted ? "任务已停止。" : "Codex turn 状态：\(status)")
             failTask(
                 at: index,
                 message: reason,
-                runOutcome: status == "interrupted" ? .interrupted : .failed,
-                kind: status == "interrupted" ? .interrupted : .execution
+                runOutcome: wasInterrupted ? .interrupted : .failed,
+                kind: wasInterrupted ? .interrupted : .execution
             )
             scheduleExecutionQueue()
             return
@@ -2518,8 +3443,12 @@ final class BoardStore {
                     message: "规划轮已结束，但没有收到可确认的最终方案。",
                     kind: .execution
                 )
+                scheduleExecutionQueue()
                 return
             }
+            let completedAt = tasks[index].runs.last(where: {
+                $0.phase == .planning && $0.outcome.isActive
+            })?.multiAgentDrain?.rootTerminalObservedAt ?? Date()
             finishActiveRun(
                 at: index,
                 phase: .planning,
@@ -2532,7 +3461,6 @@ final class BoardStore {
             tasks[index].executionApproved = tasks[index].autoRun
             tasks[index].liveMessage = tasks[index].autoRun ? "方案完成，已进入自动执行队列" : "方案完成，等待确认"
             appendLog(at: index, tasks[index].autoRun ? "方案完成；全自动模式已跳过确认。" : "方案已生成，等待确认。", level: .success)
-            let completedAt = Date()
             tasks[index].updatedAt = completedAt
             if !tasks[index].autoRun {
                 addPlanAttention(taskID: tasks[index].id, createdAt: completedAt)
@@ -2946,6 +3874,13 @@ final class BoardStore {
                       tasks[index].failureState?.circuitOpen == true,
                       tasks[index].failureState?.kind != .interrupted {
                 expectedKind = .failure
+            } else if tasks[index].stage.isActive,
+                      tasks[index].runs.last(where: {
+                          $0.outcome.isActive
+                              && $0.multiAgentDrain?.phase == .blocked
+                              && ($0.multiAgentDrain?.consecutiveReconciliationFailureCount ?? 0) >= 3
+                      }) != nil {
+                expectedKind = .failure
             } else {
                 expectedKind = nil
             }
@@ -2962,7 +3897,11 @@ final class BoardStore {
             case .planApproval:
                 tasks[index].runs.last(where: { $0.phase == .planning })?.id
             case .failure:
-                tasks[index].runs.last(where: { $0.failure != nil || $0.error != nil })?.id
+                tasks[index].runs.last(where: {
+                    $0.failure != nil
+                        || $0.error != nil
+                        || ($0.outcome.isActive && $0.multiAgentDrain?.phase == .blocked)
+                })?.id
             }
             var attention = tasks[index].attention
             if attention?.kind != expectedKind {
@@ -3233,13 +4172,41 @@ final class BoardStore {
     }
 
     private func restoreExecutionRunForConfirmedTurn(at taskIndex: Int, turnID: String) {
-        guard let runIndex = tasks[taskIndex].runs.lastIndex(where: {
-            $0.phase == .execution && $0.turnID == turnID
-        }) else { return }
-        tasks[taskIndex].runs[runIndex].outcome = .running
-        tasks[taskIndex].runs[runIndex].endedAt = nil
-        tasks[taskIndex].runs[runIndex].error = nil
-        tasks[taskIndex].runs[runIndex].failure = nil
+        restoreRunForConfirmedTurn(at: taskIndex, phase: .execution, turnID: turnID)
+    }
+
+    private func restoreRunForConfirmedTurn(
+        at taskIndex: Int,
+        phase: TaskRunPhase,
+        turnID: String
+    ) {
+        if let runIndex = tasks[taskIndex].runs.lastIndex(where: {
+            $0.phase == phase && ($0.turnID == turnID || $0.turnID == nil)
+        }) {
+            tasks[taskIndex].runs[runIndex].turnID = turnID
+            tasks[taskIndex].runs[runIndex].outcome = .running
+            tasks[taskIndex].runs[runIndex].endedAt = nil
+            tasks[taskIndex].runs[runIndex].error = nil
+            tasks[taskIndex].runs[runIndex].failure = nil
+            return
+        }
+        let task = tasks[taskIndex]
+        tasks[taskIndex].runs.append(TaskRun(
+            phase: phase,
+            attempt: task.runs.count(where: { $0.phase == phase }) + 1,
+            threadID: task.threadID,
+            sessionID: task.sessionID,
+            turnID: turnID,
+            model: task.actualModel ?? task.requestedModel.nilIfEmpty,
+            reasoningEffort: task.reasoningEffort,
+            fastMode: task.fastMode,
+            continuation: TaskRunContinuation(
+                mode: task.threadID == nil ? .freshThread : .reusedThread,
+                sourceRunID: task.threadID.flatMap { threadID in
+                    task.runs.last(where: { $0.threadID == threadID })?.id
+                }
+            )
+        ))
     }
 
     private func finishActiveRun(
@@ -3379,9 +4346,11 @@ final class BoardStore {
         }
     }
 
-    private func persistLatestSnapshot() async {
+    @discardableResult
+    private func persistLatestSnapshot() async -> Bool {
         saveTask = nil
-        guard !isSaving, savedRevision < saveRevision else { return }
+        guard !isSaving else { return false }
+        guard savedRevision < saveRevision else { return true }
         isSaving = true
         let revision = saveRevision
         let snapshot = currentSnapshot()
@@ -3404,13 +4373,25 @@ final class BoardStore {
         }
         isSaving = false
 
-        guard succeeded, savedRevision < saveRevision else {
+        guard succeeded else {
+            let newerRevisionArrived = saveRevision > revision
             saveImmediatelyAfterCurrentWrite = false
-            return
+            if newerRevisionArrived {
+                // The failed snapshot was already stale before its write
+                // returned. Preserve the newer dirty revision and retry it
+                // with the normal debounce instead of dropping that state.
+                scheduleSaveWithoutRevision(immediate: false)
+            }
+            return false
+        }
+        guard savedRevision < saveRevision else {
+            saveImmediatelyAfterCurrentWrite = false
+            return true
         }
         let immediate = saveImmediatelyAfterCurrentWrite
         saveImmediatelyAfterCurrentWrite = false
         scheduleSaveWithoutRevision(immediate: immediate)
+        return true
     }
 
     private func scheduleSaveWithoutRevision(immediate: Bool) {
@@ -3428,15 +4409,26 @@ final class BoardStore {
     @discardableResult
     private func saveImmediately() async -> Bool {
         guard didStart else { return false }
+        saveRevision &+= 1
+        let targetRevision = saveRevision
+        saveImmediatelyAfterCurrentWrite = true
         saveTask?.cancel()
         saveTask = nil
-        do {
-            try await persistence.save(currentSnapshot())
-            return true
-        } catch {
-            lastError = error.localizedDescription
-            return false
+        while savedRevision < targetRevision {
+            if Task.isCancelled { return false }
+            if isSaving {
+                try? await Task.sleep(for: .milliseconds(5))
+                continue
+            }
+            saveTask?.cancel()
+            saveTask = nil
+            let succeeded = await persistLatestSnapshot()
+            if !succeeded, savedRevision < targetRevision {
+                saveImmediatelyAfterCurrentWrite = false
+                return false
+            }
         }
+        return true
     }
 
     private func currentSnapshot() -> BoardSnapshot {

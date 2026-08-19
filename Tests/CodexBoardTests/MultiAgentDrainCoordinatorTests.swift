@@ -64,6 +64,22 @@ final class MultiAgentDrainCoordinatorTests: XCTestCase {
         XCTAssertFalse(snapshot.isDrained)
     }
 
+    func testTreatsBothCancellationSpellingsAsTerminal() {
+        for status in ["cancelled", "canceled"] {
+            let snapshot = MultiAgentDrainCoordinator().makeSnapshot(
+                rootThreadID: "root",
+                threadDetails: [detail(
+                    id: "root",
+                    turnID: "cancelled-turn",
+                    turnStatus: status
+                )]
+            )
+
+            XCTAssertNil(snapshot.blockedReason, "status: \(status)")
+            XCTAssertTrue(snapshot.isDrained, "status: \(status)")
+        }
+    }
+
     func testBlocksWhenKnownThreadDetailIsMissing() {
         let snapshot = MultiAgentDrainCoordinator().makeSnapshot(
             rootThreadID: "root",

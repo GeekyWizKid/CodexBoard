@@ -3089,7 +3089,8 @@ final class BoardStoreWorkflowTests: XCTestCase {
             persistence: persistence,
             clientFactory: { host in
                 host.id == remoteHost.id ? remoteClient : localClient
-            }
+            },
+            drainStabilityDelay: .milliseconds(10)
         )
         store.start()
 
@@ -3777,24 +3778,445 @@ final class BoardStoreWorkflowTests: XCTestCase {
         }))
     }
 
+    func testRootCompletionPersistsDrainAndWaitsForActiveChild() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Wait for child",
+            sourceKind: .issue,
+            sourceText: "Do not finish while a child is active",
+            autoRun: false
+        )
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        let activeTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let rootThreadID = try XCTUnwrap(activeTask.threadID)
+        let rootTurnID = try XCTUnwrap(activeTask.planningTurnID)
+        let childThreadID = "thread-child-wait"
+        let childTurnID = "turn-child-wait"
+        let childSummary = makeThreadSummary(
+            cwd: fixture.projectPath,
+            threadID: childThreadID,
+            statusType: "active",
+            parentThreadID: rootThreadID
+        )
+        let listGate = AsyncGate()
+        fixture.client.descendantThreadListGate = listGate
+        fixture.client.descendantThreadSnapshots = [[childSummary]]
+        fixture.client.threadDetails[rootThreadID] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            threadID: rootThreadID,
+            turnID: rootTurnID,
+            status: "completed"
+        )
+        fixture.client.threadDetails[childThreadID] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            threadID: childThreadID,
+            turnID: childTurnID,
+            status: "inProgress",
+            parentThreadID: rootThreadID
+        )
+
+        fixture.client.send(.threadStarted(childSummary))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?
+                .runs.last(where: { $0.phase == .planning })?
+                .multiAgentDrain?.knownThreadIDs.contains(childThreadID) == true
+        }
+        fixture.client.send(.planFinal(
+            threadID: rootThreadID,
+            turnID: rootTurnID,
+            text: "Wait for the child, then finish"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: rootThreadID,
+            turnID: rootTurnID,
+            status: "completed",
+            error: nil
+        ))
+        try await eventually { fixture.client.descendantThreadCalls.count == 1 }
+
+        let persisted = try await BoardPersistence(
+            fileURL: fixture.directory.appendingPathComponent("board.json")
+        ).load()
+        let persistedTask = try XCTUnwrap(persisted.tasks.first(where: { $0.id == taskID }))
+        XCTAssertEqual(persistedTask.stage, .planning)
+        XCTAssertEqual(
+            persistedTask.runs.last(where: { $0.phase == .planning })?
+                .multiAgentDrain?.rootTerminalStatus,
+            "completed"
+        )
+
+        await listGate.open()
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?
+                .runs.last(where: { $0.phase == .planning })?
+                .multiAgentDrain?.activeTurns.contains(where: {
+                    $0.threadID == childThreadID && $0.turnID == childTurnID
+                }) == true
+        }
+        XCTAssertEqual(fixture.store.tasks.first(where: { $0.id == taskID })?.stage, .planning)
+
+        fixture.client.threadDetails[childThreadID] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            threadID: childThreadID,
+            turnID: childTurnID,
+            status: "completed",
+            parentThreadID: rootThreadID
+        )
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .awaitingApproval
+        }
+        let completedRun = try XCTUnwrap(
+            fixture.store.tasks.first(where: { $0.id == taskID })?
+                .runs.last(where: { $0.phase == .planning })
+        )
+        XCTAssertEqual(completedRun.multiAgentDrain?.phase, .drained)
+        XCTAssertTrue(completedRun.multiAgentDrain?.knownThreadIDs.contains(childThreadID) == true)
+        XCTAssertTrue(fixture.client.readThreadCalls.contains(childThreadID))
+    }
+
+    func testCancelDrainsDescendantsShallowFirstWithReadback() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Cancel agent tree",
+            sourceKind: .issue,
+            sourceText: "Stop every descendant safely",
+            autoRun: false
+        )
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        let activeTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let rootThreadID = try XCTUnwrap(activeTask.threadID)
+        let rootTurnID = try XCTUnwrap(activeTask.planningTurnID)
+        let childThreadID = "thread-cancel-child"
+        let childTurnID = "turn-cancel-child"
+        let grandchildThreadID = "thread-cancel-grandchild"
+        let grandchildTurnID = "turn-cancel-grandchild"
+        let childSummary = makeThreadSummary(
+            cwd: fixture.projectPath,
+            threadID: childThreadID,
+            statusType: "active",
+            parentThreadID: rootThreadID
+        )
+        let grandchildSummary = makeThreadSummary(
+            cwd: fixture.projectPath,
+            threadID: grandchildThreadID,
+            statusType: "active",
+            parentThreadID: childThreadID
+        )
+        fixture.client.descendantThreadSnapshots = [[childSummary, grandchildSummary]]
+        fixture.client.threadDetails[rootThreadID] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            threadID: rootThreadID,
+            turnID: rootTurnID,
+            status: "inProgress"
+        )
+        fixture.client.threadDetails[childThreadID] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            threadID: childThreadID,
+            turnID: childTurnID,
+            status: "inProgress",
+            parentThreadID: rootThreadID
+        )
+        fixture.client.threadDetails[grandchildThreadID] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            threadID: grandchildThreadID,
+            turnID: grandchildTurnID,
+            status: "inProgress",
+            parentThreadID: childThreadID
+        )
+        fixture.client.send(.threadStarted(childSummary))
+        fixture.client.send(.threadStarted(grandchildSummary))
+        try await eventually {
+            Set(fixture.store.tasks.first(where: { $0.id == taskID })?
+                .runs.last(where: { $0.phase == .planning })?
+                .multiAgentDrain?.knownThreadIDs ?? [])
+                == Set([rootThreadID, childThreadID, grandchildThreadID])
+        }
+
+        let parentByThreadID = [
+            childThreadID: rootThreadID,
+            grandchildThreadID: childThreadID
+        ]
+        let turnByThreadID = [
+            rootThreadID: rootTurnID,
+            childThreadID: childTurnID,
+            grandchildThreadID: grandchildTurnID
+        ]
+        fixture.client.interruptHook = { [weak client = fixture.client] threadID, _ in
+            guard let client, let turnID = turnByThreadID[threadID] else { return }
+            client.threadDetails[threadID] = self.makeThreadDetail(
+                cwd: fixture.projectPath,
+                threadID: threadID,
+                turnID: turnID,
+                status: "interrupted",
+                parentThreadID: parentByThreadID[threadID]
+            )
+        }
+
+        await fixture.store.cancel(taskID: taskID)
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+
+        XCTAssertEqual(
+            fixture.client.interruptCalls.map(\.threadID),
+            [rootThreadID, childThreadID, grandchildThreadID]
+        )
+        for (threadID, turnID) in [
+            (childThreadID, childTurnID),
+            (grandchildThreadID, grandchildTurnID)
+        ] {
+            let interrupt = MockRemoteOperation.interrupt(threadID: threadID, turnID: turnID)
+            let interruptIndex = try XCTUnwrap(
+                fixture.client.remoteOperations.firstIndex(of: interrupt)
+            )
+            XCTAssertLessThan(interruptIndex + 1, fixture.client.remoteOperations.count)
+            XCTAssertEqual(fixture.client.remoteOperations[interruptIndex + 1], .read(threadID))
+        }
+        let cancelledTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let cancelledRun = try XCTUnwrap(
+            cancelledTask.runs.last(where: { $0.phase == .planning })
+        )
+        XCTAssertEqual(cancelledRun.outcome, .interrupted)
+        XCTAssertEqual(cancelledRun.multiAgentDrain?.phase, .drained)
+        XCTAssertEqual(cancelledTask.failureState?.kind, .interrupted)
+    }
+
+    func testStartupResumesPersistedDrainWithoutStartingAnotherTurn() async throws {
+        let fixture = try await persistedDrainFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+
+        fixture.store.start()
+
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == fixture.taskID })?.stage == .review
+        }
+        let task = try XCTUnwrap(
+            fixture.store.tasks.first(where: { $0.id == fixture.taskID })
+        )
+        let run = try XCTUnwrap(task.runs.first(where: { $0.id == fixture.executionRunID }))
+        XCTAssertEqual(run.outcome, .awaitingReview)
+        XCTAssertEqual(run.multiAgentDrain?.phase, .drained)
+        XCTAssertEqual(
+            Set(run.multiAgentDrain?.knownThreadIDs ?? []),
+            Set([fixture.rootThreadID, fixture.childThreadID])
+        )
+        XCTAssertEqual(fixture.client.resumeThreadCount, 0)
+        XCTAssertEqual(fixture.client.executionTurnCount, 0)
+        XCTAssertEqual(fixture.client.descendantThreadCalls.count, 2)
+        XCTAssertEqual(fixture.client.readThreadCount, 4)
+    }
+
+    func testConnectionLossDuringDrainKeepsExecutionSlotOccupied() async throws {
+        let fixture = try Fixture(autoRunDefault: true)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let firstTaskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Active drain",
+            sourceKind: .issue,
+            sourceText: "Keep the execution slot while disconnected",
+            autoRun: true
+        )
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Execute while supervising descendants"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.client.executionTurnCount == 1
+                && fixture.store.tasks.first(where: { $0.id == firstTaskID })?.stage == .executing
+        }
+
+        let secondTaskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Queued behind drain",
+            sourceKind: .issue,
+            sourceText: "Wait for the same project",
+            autoRun: true
+        )
+        try await eventually { fixture.client.planningTurnCount == 2 }
+        fixture.client.send(.planFinal(
+            threadID: "thread-2",
+            turnID: "plan-2",
+            text: "Run after the first task"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-2",
+            turnID: "plan-2",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == secondTaskID })?.stage == .awaitingApproval
+                && fixture.store.tasks.first(where: { $0.id == secondTaskID })?.liveMessage
+                    == "等待同项目的主目录任务结束"
+        }
+
+        let childSummary = makeThreadSummary(
+            cwd: fixture.projectPath,
+            threadID: "thread-disconnected-child",
+            statusType: "active",
+            parentThreadID: "thread-1"
+        )
+        fixture.client.send(.threadStarted(childSummary))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == firstTaskID })?
+                .runs.last(where: { $0.phase == .execution })?
+                .multiAgentDrain != nil
+        }
+        fixture.client.send(.connectionLost(message: "transport closed during drain"))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == firstTaskID })?
+                .runs.last(where: { $0.phase == .execution })?
+                .multiAgentDrain?.phase == .blocked
+        }
+
+        XCTAssertEqual(fixture.store.tasks.first(where: { $0.id == firstTaskID })?.stage, .executing)
+        XCTAssertEqual(fixture.store.activeExecutionCount, 1)
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == secondTaskID })?.stage,
+            .awaitingApproval
+        )
+        XCTAssertEqual(fixture.client.executionTurnCount, 1)
+        XCTAssertTrue(fixture.store.attentionNotices.contains(where: {
+            $0.taskID == firstTaskID && $0.kind == .failure
+        }))
+    }
+
+    func testLateDescendantAndDuplicateTerminalRequireNewStableFixedPoint() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Late descendant",
+            sourceKind: .issue,
+            sourceText: "Require a new fixed point after a late spawn",
+            autoRun: false
+        )
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        let activeTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let rootThreadID = try XCTUnwrap(activeTask.threadID)
+        let rootTurnID = try XCTUnwrap(activeTask.planningTurnID)
+        let childThreadID = "thread-late-child"
+        let childTurnID = "turn-late-child"
+        let grandchildThreadID = "thread-late-grandchild"
+        let grandchildTurnID = "turn-late-grandchild"
+        let childSummary = makeThreadSummary(
+            cwd: fixture.projectPath,
+            threadID: childThreadID,
+            statusType: "idle",
+            parentThreadID: rootThreadID
+        )
+        let grandchildSummary = makeThreadSummary(
+            cwd: fixture.projectPath,
+            threadID: grandchildThreadID,
+            statusType: "idle",
+            parentThreadID: childThreadID
+        )
+        fixture.client.descendantThreadSnapshots = [
+            [childSummary],
+            [childSummary, grandchildSummary],
+            [childSummary, grandchildSummary]
+        ]
+        fixture.client.threadDetails[rootThreadID] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            threadID: rootThreadID,
+            turnID: rootTurnID,
+            status: "completed"
+        )
+        fixture.client.threadDetails[childThreadID] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            threadID: childThreadID,
+            turnID: childTurnID,
+            status: "completed",
+            parentThreadID: rootThreadID
+        )
+        fixture.client.threadDetails[grandchildThreadID] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            threadID: grandchildThreadID,
+            turnID: grandchildTurnID,
+            status: "completed",
+            parentThreadID: childThreadID
+        )
+        fixture.client.send(.threadStarted(childSummary))
+        fixture.client.send(.threadStarted(childSummary))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?
+                .runs.last(where: { $0.phase == .planning })?
+                .multiAgentDrain?.knownThreadIDs.contains(childThreadID) == true
+        }
+        fixture.client.send(.planFinal(
+            threadID: rootThreadID,
+            turnID: rootTurnID,
+            text: "Wait for the stable descendant graph"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: rootThreadID,
+            turnID: rootTurnID,
+            status: "completed",
+            error: nil
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: rootThreadID,
+            turnID: rootTurnID,
+            status: "completed",
+            error: nil
+        ))
+
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .awaitingApproval
+        }
+        let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let run = try XCTUnwrap(task.runs.last(where: { $0.phase == .planning }))
+        XCTAssertEqual(fixture.client.descendantThreadCalls.count, 3)
+        XCTAssertEqual(run.outcome, .completed)
+        XCTAssertEqual(run.multiAgentDrain?.phase, .drained)
+        XCTAssertEqual(
+            Set(run.multiAgentDrain?.knownThreadIDs ?? []),
+            Set([rootThreadID, childThreadID, grandchildThreadID])
+        )
+        XCTAssertEqual(
+            fixture.store.attentionNotices.count(where: {
+                $0.taskID == taskID && $0.kind == .planApproval
+            }),
+            1
+        )
+    }
+
     private func makeThreadDetail(
         cwd: String,
         threadID: String = "thread-1",
         turnID: String,
         status: String,
+        threadStatusType: String? = nil,
+        parentThreadID: String? = nil,
         finalText: String? = nil
     ) -> CodexThreadDetail {
-        CodexThreadDetail(
-            summary: CodexThreadSummary(
-                id: threadID,
-                sessionID: "session-1",
+        let normalizedTurnStatus = status.lowercased().filter(\.isLetter)
+        return CodexThreadDetail(
+            summary: makeThreadSummary(
                 cwd: cwd,
-                name: "Fixture",
-                createdAt: Date(),
-                updatedAt: Date(),
-                isPinned: false,
-                statusType: "active",
-                sourceKind: "appServer"
+                threadID: threadID,
+                statusType: threadStatusType
+                    ?? (normalizedTurnStatus == "inprogress" ? "active" : "idle"),
+                parentThreadID: parentThreadID
             ),
             turns: [CodexThreadTurn(
                 id: turnID,
@@ -3807,6 +4229,143 @@ final class BoardStoreWorkflowTests: XCTestCase {
                 completedAt: nil,
                 durationMilliseconds: nil
             )]
+        )
+    }
+
+    private func makeThreadSummary(
+        cwd: String,
+        threadID: String,
+        statusType: String,
+        parentThreadID: String? = nil
+    ) -> CodexThreadSummary {
+        CodexThreadSummary(
+            id: threadID,
+            sessionID: "session-\(threadID)",
+            cwd: cwd,
+            name: "Fixture \(threadID)",
+            createdAt: Date(timeIntervalSince1970: 1),
+            updatedAt: Date(timeIntervalSince1970: 2),
+            isPinned: false,
+            statusType: statusType,
+            sourceKind: parentThreadID == nil ? "appServer" : "subAgent",
+            parentThreadID: parentThreadID
+        )
+    }
+
+    private func makeSpawnCall(
+        id: String,
+        senderThreadID: String,
+        receiverThreadIDs: [String]
+    ) -> CodexCollabAgentToolCall {
+        CodexCollabAgentToolCall(
+            id: id,
+            tool: "spawnAgent",
+            status: "completed",
+            senderThreadID: senderThreadID,
+            receiverThreadIDs: receiverThreadIDs,
+            prompt: nil,
+            model: nil,
+            reasoningEffort: nil,
+            agentStates: Dictionary(uniqueKeysWithValues: receiverThreadIDs.map {
+                ($0, CodexCollabAgentState(status: "running", message: nil))
+            })
+        )
+    }
+
+    private func persistedDrainFixture() async throws -> (
+        directory: URL,
+        taskID: UUID,
+        executionRunID: UUID,
+        rootThreadID: String,
+        childThreadID: String,
+        client: MockCodexTaskClient,
+        store: BoardStore
+    ) {
+        let directory = try temporaryDirectory()
+        let rootThreadID = "thread-persisted-root"
+        let childThreadID = "thread-persisted-child"
+        let rootTurnID = "turn-persisted-root"
+        let childTurnID = "turn-persisted-child"
+        let executionRunID = UUID()
+        let observedAt = Date(timeIntervalSince1970: 10)
+        let drain = TaskRunDrainState(
+            phase: .draining,
+            rootTerminalStatus: "completed",
+            rootTerminalObservedAt: observedAt,
+            knownThreadIDs: [childThreadID, rootThreadID],
+            parentByThreadID: [childThreadID: rootThreadID],
+            startedAt: observedAt
+        )
+        let run = TaskRun(
+            id: executionRunID,
+            phase: .execution,
+            attempt: 1,
+            outcome: .running,
+            threadID: rootThreadID,
+            sessionID: "session-persisted-root",
+            turnID: rootTurnID,
+            model: "gpt-test",
+            reasoningEffort: .medium,
+            fastMode: false,
+            multiAgentDrain: drain
+        )
+        let task = BoardTask(
+            projectID: directory.path,
+            title: "Persisted multi-agent drain",
+            sourceKind: .issue,
+            sourceText: "Resume drain without duplicating execution",
+            stage: .executing,
+            autoRun: true,
+            executionApproved: true,
+            planText: "Persisted plan",
+            hasFinalPlan: true,
+            resultText: "Recovered multi-agent delivery",
+            threadID: rootThreadID,
+            sessionID: "session-persisted-root",
+            executionTurnID: rootTurnID,
+            runs: [run]
+        )
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [task],
+            hosts: [.local],
+            manualProjects: [ManualProjectReference(path: directory.path)],
+            preferences: BoardPreferences()
+        ))
+
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let childSummary = makeThreadSummary(
+            cwd: directory.path,
+            threadID: childThreadID,
+            statusType: "idle",
+            parentThreadID: rootThreadID
+        )
+        client.descendantThreadSnapshots = [[childSummary], [childSummary]]
+        client.threadDetails[rootThreadID] = makeThreadDetail(
+            cwd: directory.path,
+            threadID: rootThreadID,
+            turnID: rootTurnID,
+            status: "completed"
+        )
+        client.threadDetails[childThreadID] = makeThreadDetail(
+            cwd: directory.path,
+            threadID: childThreadID,
+            turnID: childTurnID,
+            status: "completed",
+            parentThreadID: rootThreadID
+        )
+        return (
+            directory: directory,
+            taskID: task.id,
+            executionRunID: executionRunID,
+            rootThreadID: rootThreadID,
+            childThreadID: childThreadID,
+            client: client,
+            store: BoardStore(
+                client: client,
+                persistence: persistence,
+                drainStabilityDelay: .milliseconds(10)
+            )
         )
     }
 
@@ -3875,7 +4434,11 @@ final class BoardStoreWorkflowTests: XCTestCase {
             taskID: task.id,
             executionRunID: executionRunID,
             client: client,
-            store: BoardStore(client: client, persistence: persistence)
+            store: BoardStore(
+                client: client,
+                persistence: persistence,
+                drainStabilityDelay: .milliseconds(10)
+            )
         )
     }
 
@@ -4002,6 +4565,12 @@ private actor StubWorktreeManager: WorktreeManaging {
     }
 }
 
+private enum MockRemoteOperation: Equatable {
+    case listDescendants(String)
+    case read(String)
+    case interrupt(threadID: String, turnID: String)
+}
+
 @MainActor
 private final class MockCodexTaskClient: CodexTaskClient {
     var connectionState: CodexConnectionState = .connected
@@ -4036,14 +4605,24 @@ private final class MockCodexTaskClient: CodexTaskClient {
     var interactionResponseDelayMilliseconds = 0
     var interruptCalls: [(threadID: String, turnID: String)] = []
     var interruptFailures: [MockClientError] = []
+    var interruptGate: AsyncGate?
+    var interruptHook: ((String, String) -> Void)?
     private var modelsByThreadID: [String: String] = [:]
     var disconnectCount = 0
     var listThreadsCallCount = 0
+    var descendantThreadCalls: [String] = []
+    var descendantThreadSnapshots: [[CodexThreadSummary]] = []
+    var descendantThreadFailures: [CodexClientError] = []
+    var descendantThreadListGate: AsyncGate?
     var readThreadCount = 0
+    var readThreadCalls: [String] = []
+    var readThreadGate: AsyncGate?
+    var remoteOperations: [MockRemoteOperation] = []
     var resumeThreadCount = 0
     var planningTurnError: Error?
     var listThreadsGate: AsyncGate?
     var threadDetails: [String: CodexThreadDetail] = [:]
+    var threadDetailScripts: [String: [CodexThreadDetail]] = [:]
 
     init(projectPath: String) {
         self.projectPath = projectPath
@@ -4133,8 +4712,32 @@ private final class MockCodexTaskClient: CodexTaskClient {
             nextCursor: nil
         )
     }
+    func listDescendantThreads(ancestorThreadID: String) async throws -> [CodexThreadSummary] {
+        descendantThreadCalls.append(ancestorThreadID)
+        remoteOperations.append(.listDescendants(ancestorThreadID))
+        if let descendantThreadListGate {
+            await descendantThreadListGate.wait()
+        }
+        if !descendantThreadFailures.isEmpty {
+            throw descendantThreadFailures.removeFirst()
+        }
+        if !descendantThreadSnapshots.isEmpty {
+            return descendantThreadSnapshots.removeFirst()
+        }
+        return []
+    }
     func readThread(threadID: String, includeTurns: Bool) async throws -> CodexThreadDetail {
         readThreadCount += 1
+        readThreadCalls.append(threadID)
+        remoteOperations.append(.read(threadID))
+        if let readThreadGate {
+            await readThreadGate.wait()
+        }
+        if var scripted = threadDetailScripts[threadID], !scripted.isEmpty {
+            let detail = scripted.removeFirst()
+            threadDetailScripts[threadID] = scripted
+            return detail
+        }
         guard let detail = threadDetails[threadID] else {
             throw CodexClientError.invalidResponse("Missing mock thread detail")
         }
@@ -4227,9 +4830,14 @@ private final class MockCodexTaskClient: CodexTaskClient {
     }
     func interrupt(threadID: String, turnID: String) async throws {
         interruptCalls.append((threadID, turnID))
+        remoteOperations.append(.interrupt(threadID: threadID, turnID: turnID))
+        if let interruptGate {
+            await interruptGate.wait()
+        }
         if !interruptFailures.isEmpty {
             throw interruptFailures.removeFirst()
         }
+        interruptHook?(threadID, turnID)
     }
 }
 
@@ -4294,7 +4902,8 @@ private struct Fixture {
             client: client,
             persistence: persistence,
             attachmentStorage: AttachmentStorage(rootDirectory: directory.appendingPathComponent("attachments")),
-            worktreeManager: worktreeManager
+            worktreeManager: worktreeManager,
+            drainStabilityDelay: .milliseconds(10)
         )
         store.start()
     }
