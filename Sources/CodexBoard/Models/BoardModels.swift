@@ -785,7 +785,10 @@ struct BoardSnapshot: Codable, Sendable {
         preferences: BoardPreferences,
         hiddenProjectPaths: [String] = []
     ) {
-        self.version = max(Self.currentVersion, version)
+        // An in-memory snapshot always represents the schema understood by this
+        // build. Older versions are normalized while decoding; newer versions
+        // must be rejected there instead of being silently rewritten.
+        self.version = Self.currentVersion
         self.tasks = tasks
         self.hosts = Self.normalizedHosts(
             hosts,
@@ -827,10 +830,15 @@ struct BoardSnapshot: Codable, Sendable {
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        version = max(
-            Self.currentVersion,
-            try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
-        )
+        let storedVersion = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        guard (1...Self.currentVersion).contains(storedVersion) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .version,
+                in: container,
+                debugDescription: "Unsupported CodexBoard snapshot version \(storedVersion); this build supports versions 1 through \(Self.currentVersion)."
+            )
+        }
+        version = Self.currentVersion
         tasks = try container.decode([BoardTask].self, forKey: .tasks)
         preferences = try container.decode(BoardPreferences.self, forKey: .preferences)
         hosts = Self.normalizedHosts(
@@ -877,7 +885,7 @@ struct BoardSnapshot: Codable, Sendable {
 
     func encode(to encoder: any Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(max(Self.currentVersion, version), forKey: .version)
+        try container.encode(Self.currentVersion, forKey: .version)
         try container.encode(tasks, forKey: .tasks)
         try container.encode(
             Self.normalizedHosts(

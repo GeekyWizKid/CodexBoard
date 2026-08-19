@@ -398,6 +398,81 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fixture.fileURL), corruptData)
     }
 
+    func testFutureSnapshotVersionIsRejectedAndNeverOverwritten() async throws {
+        let fixture = try TemporaryBoardFixture()
+        defer { fixture.remove() }
+
+        try FileManager.default.createDirectory(
+            at: fixture.storageDirectory,
+            withIntermediateDirectories: true
+        )
+        var object = try jsonDictionary(BoardSnapshot.empty)
+        object["version"] = BoardSnapshot.currentVersion + 1
+        let futureData = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        try futureData.write(to: fixture.fileURL)
+        let persistence = BoardPersistence(fileURL: fixture.fileURL)
+
+        do {
+            _ = try await persistence.load()
+            XCTFail("Expected a future snapshot version to be rejected")
+        } catch let BoardPersistenceError.unsupportedSnapshotVersion(_, stored, supported) {
+            XCTAssertEqual(stored, BoardSnapshot.currentVersion + 1)
+            XCTAssertEqual(supported, BoardSnapshot.currentVersion)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        do {
+            try await persistence.save(.empty)
+            XCTFail("Expected saving over a future snapshot version to fail")
+        } catch let BoardPersistenceError.unsupportedSnapshotVersion(_, stored, supported) {
+            XCTAssertEqual(stored, BoardSnapshot.currentVersion + 1)
+            XCTAssertEqual(supported, BoardSnapshot.currentVersion)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(try Data(contentsOf: fixture.fileURL), futureData)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.migrationBackupURL.path))
+    }
+
+    func testFirstMigrationSaveCreatesPrivateBackupAndNeverOverwritesIt() async throws {
+        let fixture = try TemporaryBoardFixture()
+        defer { fixture.remove() }
+
+        try FileManager.default.createDirectory(
+            at: fixture.storageDirectory,
+            withIntermediateDirectories: true
+        )
+        var object = try jsonDictionary(BoardSnapshot.empty)
+        object["version"] = BoardSnapshot.currentVersion - 1
+        let legacyData = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        try legacyData.write(to: fixture.fileURL)
+        let persistence = BoardPersistence(fileURL: fixture.fileURL)
+
+        let migrated = try await persistence.load()
+        try await persistence.save(migrated)
+
+        XCTAssertEqual(try Data(contentsOf: fixture.migrationBackupURL), legacyData)
+        XCTAssertEqual(try permissions(at: fixture.migrationBackupURL), 0o600)
+        let firstBackup = try Data(contentsOf: fixture.migrationBackupURL)
+
+        var updated = migrated
+        updated.preferences.defaultAutoRun.toggle()
+        try await persistence.save(updated)
+
+        XCTAssertEqual(try Data(contentsOf: fixture.migrationBackupURL), firstBackup)
+        let savedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fixture.fileURL)) as? [String: Any]
+        )
+        XCTAssertEqual(savedObject["version"] as? Int, BoardSnapshot.currentVersion)
+    }
+
     func testLegacyTaskDefaultsNewConfigurationAndMapsOldModel() async throws {
         let fixture = try TemporaryBoardFixture()
         defer { fixture.remove() }
@@ -614,6 +689,13 @@ private struct TemporaryBoardFixture {
     let rootDirectory: URL
     let storageDirectory: URL
     let fileURL: URL
+
+    var migrationBackupURL: URL {
+        storageDirectory.appendingPathComponent(
+            "board.pre-v\(BoardSnapshot.currentVersion).json",
+            isDirectory: false
+        )
+    }
 
     init() throws {
         rootDirectory = FileManager.default.temporaryDirectory

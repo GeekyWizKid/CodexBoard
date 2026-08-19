@@ -6,6 +6,8 @@ enum BoardPersistenceError: LocalizedError, Sendable {
     case createDirectoryFailed(path: String, reason: String)
     case readFailed(path: String, reason: String)
     case corruptFile(path: String, reason: String)
+    case unsupportedSnapshotVersion(path: String, stored: Int, supported: Int)
+    case migrationBackupFailed(path: String, reason: String)
     case encodeFailed(reason: String)
     case writeFailed(path: String, reason: String)
     case permissionsFailed(path: String, reason: String)
@@ -20,6 +22,10 @@ enum BoardPersistenceError: LocalizedError, Sendable {
             "无法读取看板数据文件 \(path)：\(reason)"
         case let .corruptFile(path, reason):
             "看板数据文件已损坏，未覆盖原文件 \(path)：\(reason)"
+        case let .unsupportedSnapshotVersion(path, stored, supported):
+            "看板数据文件版本 v\(stored) 高于当前应用支持的 v\(supported)，未修改原文件 \(path)"
+        case let .migrationBackupFailed(path, reason):
+            "无法在迁移前保存看板恢复副本 \(path)：\(reason)"
         case let .encodeFailed(reason):
             "无法编码看板数据：\(reason)"
         case let .writeFailed(path, reason):
@@ -98,6 +104,7 @@ actor BoardPersistence: BoardPersisting {
         // only recovery copy instead of silently resetting a user's board.
         if let currentData = try existingData() {
             _ = try decode(currentData)
+            try createMigrationBackupIfNeeded(from: currentData)
         }
 
         let data: Data
@@ -145,8 +152,93 @@ actor BoardPersistence: BoardPersisting {
     }
 
     private func decode(_ data: Data) throws -> BoardSnapshot {
+        let storedVersion = try snapshotVersion(in: data)
+        guard (1...BoardSnapshot.currentVersion).contains(storedVersion) else {
+            throw BoardPersistenceError.unsupportedSnapshotVersion(
+                path: fileURL.path,
+                stored: storedVersion,
+                supported: BoardSnapshot.currentVersion
+            )
+        }
+
         do {
             return try JSONDecoder().decode(BoardSnapshot.self, from: data)
+        } catch {
+            throw BoardPersistenceError.corruptFile(
+                path: fileURL.path,
+                reason: error.localizedDescription
+            )
+        }
+    }
+
+    private func createMigrationBackupIfNeeded(from data: Data) throws {
+        let storedVersion = try snapshotVersion(in: data)
+        guard storedVersion < BoardSnapshot.currentVersion else { return }
+
+        let backupURL = migrationBackupURL
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: backupURL.path, isDirectory: &isDirectory) {
+            guard !isDirectory.boolValue else {
+                throw BoardPersistenceError.migrationBackupFailed(
+                    path: backupURL.path,
+                    reason: "恢复副本路径是目录"
+                )
+            }
+            // The first pre-migration image is intentionally retained forever.
+            // A later save must never replace it with a partially migrated file.
+            try setPermissions(0o600, at: backupURL)
+            return
+        }
+
+        let temporaryURL = directoryURL.appendingPathComponent(
+            ".\(backupURL.lastPathComponent).\(UUID().uuidString).tmp",
+            isDirectory: false
+        )
+        defer {
+            try? fileManager.removeItem(at: temporaryURL)
+        }
+
+        do {
+            // Foundation does not support combining .atomic and
+            // .withoutOverwriting. Write a complete same-volume temporary
+            // file first, then claim the stable backup name with a hard link.
+            // Linking fails instead of replacing a concurrently created file.
+            try data.write(to: temporaryURL, options: .atomic)
+            try setPermissions(0o600, at: temporaryURL)
+            do {
+                try fileManager.linkItem(at: temporaryURL, to: backupURL)
+            } catch {
+                guard fileManager.fileExists(atPath: backupURL.path) else {
+                    throw error
+                }
+            }
+            try setPermissions(0o600, at: backupURL)
+        } catch let error as BoardPersistenceError {
+            throw error
+        } catch {
+            throw BoardPersistenceError.migrationBackupFailed(
+                path: backupURL.path,
+                reason: error.localizedDescription
+            )
+        }
+    }
+
+    private var migrationBackupURL: URL {
+        let extensionName = fileURL.pathExtension
+        let baseName = fileURL.deletingPathExtension().lastPathComponent
+        let backupName = extensionName.isEmpty
+            ? "\(baseName).pre-v\(BoardSnapshot.currentVersion)"
+            : "\(baseName).pre-v\(BoardSnapshot.currentVersion).\(extensionName)"
+        return directoryURL.appendingPathComponent(backupName, isDirectory: false)
+    }
+
+    private func snapshotVersion(in data: Data) throws -> Int {
+        struct VersionEnvelope: Decodable {
+            let version: Int?
+        }
+
+        do {
+            return try JSONDecoder().decode(VersionEnvelope.self, from: data).version ?? 1
         } catch {
             throw BoardPersistenceError.corruptFile(
                 path: fileURL.path,
