@@ -14,11 +14,49 @@ enum TaskWorkspaceKind: String, Codable, CaseIterable, Identifiable, Sendable {
     }
 }
 
+enum WorktreeCapability: String, Codable, Hashable, Sendable {
+    case managedV1 = "codexboard-managed-worktree-v1"
+
+    var token: String { rawValue }
+}
+
+struct TaskWorktreePreparation: Codable, Hashable, Sendable {
+    let capability: WorktreeCapability
+    let ownerTaskID: UUID
+    let repositoryPath: String
+    let sourceCommit: String
+    let baselineCommit: String
+    let dirtyBaseCaptured: Bool
+    let untrackedFilesCaptured: Int
+    let preparedAt: Date
+
+    init(
+        capability: WorktreeCapability = .managedV1,
+        ownerTaskID: UUID,
+        repositoryPath: String,
+        sourceCommit: String,
+        baselineCommit: String,
+        dirtyBaseCaptured: Bool = false,
+        untrackedFilesCaptured: Int = 0,
+        preparedAt: Date = Date()
+    ) {
+        self.capability = capability
+        self.ownerTaskID = ownerTaskID
+        self.repositoryPath = repositoryPath
+        self.sourceCommit = sourceCommit
+        self.baselineCommit = baselineCommit
+        self.dirtyBaseCaptured = dirtyBaseCaptured
+        self.untrackedFilesCaptured = untrackedFilesCaptured
+        self.preparedAt = preparedAt
+    }
+}
+
 struct TaskWorkspaceConfiguration: Codable, Hashable, Sendable {
     var kind: TaskWorkspaceKind
     var path: String?
     var branch: String?
     var baseBranch: String?
+    var preparation: TaskWorktreePreparation?
 
     static let project = TaskWorkspaceConfiguration(kind: .project)
 
@@ -26,12 +64,14 @@ struct TaskWorkspaceConfiguration: Codable, Hashable, Sendable {
         kind: TaskWorkspaceKind,
         path: String? = nil,
         branch: String? = nil,
-        baseBranch: String? = nil
+        baseBranch: String? = nil,
+        preparation: TaskWorktreePreparation? = nil
     ) {
         self.kind = kind
         self.path = path
         self.branch = branch
         self.baseBranch = baseBranch
+        self.preparation = preparation
     }
 }
 
@@ -291,17 +331,20 @@ struct TaskRunWorkspaceSnapshot: Codable, Hashable, Sendable {
     let path: String
     let branch: String?
     let baseBranch: String?
+    let preparation: TaskWorktreePreparation?
 
     init(
         kind: TaskWorkspaceKind,
         path: String,
         branch: String? = nil,
-        baseBranch: String? = nil
+        baseBranch: String? = nil,
+        preparation: TaskWorktreePreparation? = nil
     ) {
         self.kind = kind
         self.path = path
         self.branch = branch
         self.baseBranch = baseBranch
+        self.preparation = preparation
     }
 }
 

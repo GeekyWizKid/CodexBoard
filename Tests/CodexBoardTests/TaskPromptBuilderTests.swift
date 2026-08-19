@@ -274,4 +274,44 @@ final class TaskPromptBuilderTests: XCTestCase {
         }
         XCTAssertTrue(executionPrompt.contains("标记为“已阻止”的 App 不会注入本轮"))
     }
+
+    func testRemoteExecutionRemapsSkillPathsLexicallyWithoutUsingLocalFilesystemState() {
+        let task = BoardTask(
+            projectID: "ssh:worker:/srv/repo",
+            title: "Use remote skills",
+            sourceKind: .issue,
+            sourceText: "Run remotely",
+            selectedSkills: [
+                TaskSkillSelection(
+                    name: "inside",
+                    description: "Inside the remote repository",
+                    path: "/srv/repo/.agents/skills/inside/SKILL.md",
+                    scope: "repo"
+                ),
+                TaskSkillSelection(
+                    name: "sibling",
+                    description: "Outside the remote repository",
+                    path: "/srv/repo-other/SKILL.md",
+                    scope: "user"
+                )
+            ],
+            autoRun: false
+        )
+
+        let input = TaskPromptBuilder.executionInput(
+            for: task,
+            projectPath: "/srv/codexboard/worktrees/task",
+            sourceProjectPath: "/srv/repo",
+            pathSemantics: .remote
+        )
+
+        XCTAssertEqual(input[1], .skill(
+            name: "inside",
+            path: "/srv/codexboard/worktrees/task/.agents/skills/inside/SKILL.md"
+        ))
+        XCTAssertEqual(input[2], .skill(
+            name: "sibling",
+            path: "/srv/repo-other/SKILL.md"
+        ))
+    }
 }

@@ -198,7 +198,25 @@ struct TaskInspector: View {
                         metadata("工作区", task.workspace.kind.title)
                         metadata("分支", task.workspace.branch ?? "执行前自动创建")
                         if let baseBranch = task.workspace.baseBranch {
-                            metadata("基线", baseBranch)
+                            metadata("基线分支", baseBranch)
+                        }
+                        if let preparation = task.workspace.preparation {
+                            metadata(
+                                "来源提交",
+                                gitRevisionPrefix(preparation.sourceCommit),
+                                fullValue: preparation.sourceCommit
+                            )
+                            metadata(
+                                "基线提交",
+                                gitRevisionPrefix(preparation.baselineCommit),
+                                fullValue: preparation.baselineCommit
+                            )
+                            metadata(
+                                "初始状态",
+                                preparation.dirtyBaseCaptured
+                                    ? "已捕获执行前改动 · 非忽略未跟踪文件 \(preparation.untrackedFilesCaptured) 个"
+                                    : "Git 状态干净（忽略文件不计）"
+                            )
                         }
                         if let path = task.workspace.path {
                             Text(path)
@@ -207,8 +225,10 @@ struct TaskInspector: View {
                                 .textSelection(.enabled)
                                 .lineLimit(3)
                             HStack {
-                                Button("在 Finder 中显示") { store.revealWorkspace(for: task) }
-                                    .controlSize(.small)
+                                if store.isLocalHost(task.hostID) {
+                                    Button("在 Finder 中显示") { store.revealWorkspace(for: task) }
+                                        .controlSize(.small)
+                                }
                                 if !task.stage.isActive {
                                     Button("清理 Worktree", role: .destructive) {
                                         Task { await store.cleanupWorktree(taskID: task.id) }
@@ -586,20 +606,33 @@ struct TaskInspector: View {
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    private func metadata(_ label: String, _ value: String) -> some View {
-        HStack(alignment: .firstTextBaseline) {
+    private func metadata(
+        _ label: String,
+        _ value: String,
+        fullValue: String? = nil
+    ) -> some View {
+        let accessibleValue = fullValue ?? value
+        return HStack(alignment: .firstTextBaseline) {
             Text(LocalizedStringKey(label))
                 .foregroundStyle(.secondary)
             Spacer()
             Text(value)
                 .font(.caption.monospaced())
                 .textSelection(.enabled)
+                .help(accessibleValue)
         }
         .font(.caption)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue(accessibleValue)
     }
 
     private func shortID(_ value: String) -> String {
         value.count > 16 ? "\(value.prefix(8))…\(value.suffix(6))" : value
+    }
+
+    private func gitRevisionPrefix(_ value: String) -> String {
+        value.count > 12 ? String(value.prefix(12)) : value
     }
 
     private func logColor(_ level: TaskLogEntry.Level) -> Color {

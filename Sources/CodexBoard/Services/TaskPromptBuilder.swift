@@ -1,6 +1,11 @@
 import Foundation
 
 enum TaskPromptBuilder {
+    enum PathSemantics: Sendable {
+        case local
+        case remote
+    }
+
     static func planningPrompt(
         for task: BoardTask,
         projectPath: String,
@@ -77,7 +82,8 @@ enum TaskPromptBuilder {
     static func executionInput(
         for task: BoardTask,
         projectPath: String,
-        sourceProjectPath: String? = nil
+        sourceProjectPath: String? = nil,
+        pathSemantics: PathSemantics = .local
     ) -> [CodexTurnInput] {
         let sourceProjectPath = sourceProjectPath ?? projectPath
         let skills = task.selectedSkills.map { skill in
@@ -87,7 +93,8 @@ enum TaskPromptBuilder {
                 path: executionSkillPath(
                     skill.path,
                     sourceProjectPath: sourceProjectPath,
-                    executionPath: projectPath
+                    executionPath: projectPath,
+                    pathSemantics: pathSemantics
                 ),
                 scope: skill.scope
             )
@@ -226,9 +233,17 @@ enum TaskPromptBuilder {
     private static func executionSkillPath(
         _ skillPath: String,
         sourceProjectPath: String,
-        executionPath: String
+        executionPath: String,
+        pathSemantics: PathSemantics
     ) -> String {
         guard (skillPath as NSString).isAbsolutePath else { return skillPath }
+        if pathSemantics == .remote {
+            return remoteExecutionSkillPath(
+                skillPath,
+                sourceProjectPath: sourceProjectPath,
+                executionPath: executionPath
+            )
+        }
         let sourceRoot = URL(fileURLWithPath: sourceProjectPath, isDirectory: true)
             .standardizedFileURL
             .resolvingSymlinksInPath()
@@ -252,5 +267,31 @@ enum TaskPromptBuilder {
         }.standardizedFileURL
         guard FileManager.default.fileExists(atPath: candidate.path) else { return skillPath }
         return candidate.path
+    }
+
+    private static func remoteExecutionSkillPath(
+        _ skillPath: String,
+        sourceProjectPath: String,
+        executionPath: String
+    ) -> String {
+        let sourceRoot = (sourceProjectPath as NSString).standardizingPath
+        let executionRoot = (executionPath as NSString).standardizingPath
+        let sourceSkill = (skillPath as NSString).standardizingPath
+        guard (sourceRoot as NSString).isAbsolutePath,
+              (executionRoot as NSString).isAbsolutePath,
+              (sourceSkill as NSString).isAbsolutePath,
+              sourceRoot != executionRoot
+        else { return skillPath }
+
+        let rootComponents = (sourceRoot as NSString).pathComponents
+        let skillComponents = (sourceSkill as NSString).pathComponents
+        guard skillComponents.count > rootComponents.count,
+              skillComponents.prefix(rootComponents.count).elementsEqual(rootComponents)
+        else { return skillPath }
+
+        let relativeComponents = skillComponents.dropFirst(rootComponents.count)
+        return relativeComponents.reduce(executionRoot) { partial, component in
+            (partial as NSString).appendingPathComponent(component)
+        }
     }
 }

@@ -18,6 +18,12 @@ protocol CodexTaskClient: AnyObject {
     func listThreads(cursor: String?, archived: Bool) async throws -> CodexThreadPage
     func listDescendantThreads(ancestorThreadID: String) async throws -> [CodexThreadSummary]
     func inspectProjectPath(_ path: String) async throws -> CodexProjectPathInfo
+    func advertisedRemoteWorktreeCapabilities(
+        projectPath: String
+    ) async throws -> Set<WorktreeCapability>
+    func executeManagedWorktreeCommand(
+        _ command: CodexManagedWorktreeCommand
+    ) async throws -> CodexManagedWorktreeCommandResult
     func readThread(threadID: String, includeTurns: Bool) async throws -> CodexThreadDetail
     func startThread(cwd: String, model: String?, serviceTier: String) async throws -> CodexStartedThread
     func resumeThread(threadID: String, cwd: String) async throws -> CodexStartedThread
@@ -55,6 +61,20 @@ extension CodexTaskClient {
             projectPath: path,
             exists: true,
             isGitRepository: false
+        )
+    }
+
+    func advertisedRemoteWorktreeCapabilities(
+        projectPath: String
+    ) async throws -> Set<WorktreeCapability> {
+        []
+    }
+
+    func executeManagedWorktreeCommand(
+        _ command: CodexManagedWorktreeCommand
+    ) async throws -> CodexManagedWorktreeCommandResult {
+        throw RemoteWorktreeManagerError.capabilityUnsupported(
+            "对应主机没有明确确认 \(WorktreeCapability.managedV1.token)，已拒绝远端 Worktree 写操作。"
         )
     }
 

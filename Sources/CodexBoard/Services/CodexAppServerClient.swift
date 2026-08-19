@@ -539,6 +539,36 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         )
     }
 
+    func advertisedRemoteWorktreeCapabilities(
+        projectPath: String
+    ) async throws -> Set<WorktreeCapability> {
+        try await ensureConnected()
+        // The current app-server InitializeResponse has no server capability
+        // acknowledgement. Client-declared initialize extensions are not an
+        // acknowledgement and must never unlock a remote filesystem write.
+        // Keep this empty until the corresponding host app-server explicitly
+        // returns the semantic capability token.
+        return []
+    }
+
+    func executeManagedWorktreeCommand(
+        _ command: CodexManagedWorktreeCommand
+    ) async throws -> CodexManagedWorktreeCommandResult {
+        let validated = try command.validated()
+        try await ensureConnected()
+        let capabilities = try await advertisedRemoteWorktreeCapabilities(
+            projectPath: try Self.managedWorktreeCapabilityProbePath(validated)
+        )
+        guard capabilities.contains(.managedV1) else {
+            throw RemoteWorktreeManagerError.capabilityUnsupported(
+                "对应主机没有明确确认 \(WorktreeCapability.managedV1.token)，已拒绝远端 Worktree 写操作。"
+            )
+        }
+        throw RemoteWorktreeManagerError.capabilityUnsupported(
+            "远端原子 Worktree helper 尚未实现；即使主机声明能力，也不会执行 raw command/exec 写操作。"
+        )
+    }
+
     func readThread(threadID: String, includeTurns: Bool) async throws -> CodexThreadDetail {
         try await ensureConnected()
         let value = try await request(method: "thread/read", params: .object([
@@ -991,6 +1021,65 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         ])
     }
 
+    static func managedWorktreeCommandExecParams(
+        _ command: CodexManagedWorktreeCommand
+    ) throws -> JSONValue {
+        let command = try command.validated()
+        return .object([
+            "command": .array(command.arguments.map(JSONValue.string)),
+            "cwd": .string(command.cwd),
+            "timeoutMs": .integer(command.timeoutMilliseconds),
+            "outputBytesCap": .integer(Int64(command.outputBytesCap)),
+            "sandboxPolicy": .object([
+                "type": .string("workspaceWrite"),
+                "networkAccess": .bool(false),
+                "writableRoots": .array(command.writableRoots.map(JSONValue.string)),
+                "excludeSlashTmp": .bool(true),
+                "excludeTmpdirEnvVar": .bool(true)
+            ]),
+            "env": .object([
+                "GIT_OPTIONAL_LOCKS": .string("0"),
+                "GIT_TERMINAL_PROMPT": .string("0"),
+                "GIT_DIR": .null,
+                "GIT_WORK_TREE": .null,
+                "GIT_INDEX_FILE": .null,
+                "GIT_COMMON_DIR": .null,
+                "GIT_OBJECT_DIRECTORY": .null,
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": .null,
+                "GIT_CEILING_DIRECTORIES": .null
+            ])
+        ])
+    }
+
+    static func managedWorktreeCapabilityProbePath(
+        _ command: CodexManagedWorktreeCommand
+    ) throws -> String {
+        try command.validated().projectPath
+    }
+
+    static func parseManagedWorktreeCommandResult(
+        _ value: JSONValue,
+        outputBytesCap: Int
+    ) throws -> CodexManagedWorktreeCommandResult {
+        guard (1...CodexManagedWorktreeCommand.maximumOutputBytes).contains(outputBytesCap),
+              let rawExitCode = value["exitCode"]?.intValue,
+              let exitCode = Int32(exactly: rawExitCode),
+              let stdout = value["stdout"]?.stringValue,
+              let stderr = value["stderr"]?.stringValue,
+              stdout.utf8.count <= outputBytesCap,
+              stderr.utf8.count <= outputBytesCap
+        else {
+            throw RemoteWorktreeManagerError.invalidResponse(
+                "command/exec 返回了无效或超出上限的远端 Worktree 命令结果。"
+            )
+        }
+        return CodexManagedWorktreeCommandResult(
+            exitCode: exitCode,
+            stdout: stdout,
+            stderr: stderr
+        )
+    }
+
     private static func absolutePath(from output: String) -> String? {
         let path = output.trimmingCharacters(in: .newlines)
         guard !path.isEmpty,
@@ -1008,7 +1097,11 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         return pathComponents.prefix(ancestorComponents.count).elementsEqual(ancestorComponents)
     }
 
-    private func request(method: String, params: JSONValue? = nil) async throws -> JSONValue {
+    private func request(
+        method: String,
+        params: JSONValue? = nil,
+        timeout: TimeInterval? = nil
+    ) async throws -> JSONValue {
         guard let transport else { throw CodexClientError.disconnected }
         let id = nextRequestID
         nextRequestID += 1
@@ -1021,9 +1114,10 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
 
         return try await withCheckedThrowingContinuation { continuation in
             pendingRequests[id] = PendingRequest(method: method, continuation: continuation, timeoutTask: nil)
+            let timeoutSeconds = max(1, timeout ?? requestTimeout)
             let timeoutTask = Task { @MainActor [weak self] in
                 guard let self else { return }
-                try? await Task.sleep(for: .seconds(self.requestTimeout))
+                try? await Task.sleep(for: .seconds(timeoutSeconds))
                 guard !Task.isCancelled, let pending = self.pendingRequests.removeValue(forKey: id) else { return }
                 pending.continuation.resume(throwing: CodexClientError.requestTimedOut(method))
             }

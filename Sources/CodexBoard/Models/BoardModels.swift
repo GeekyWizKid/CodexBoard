@@ -783,7 +783,7 @@ struct BoardPreferences: Codable, Equatable, Sendable {
 }
 
 struct BoardSnapshot: Codable, Sendable {
-    static let currentVersion = 12
+    static let currentVersion = 13
 
     var version: Int
     var tasks: [BoardTask]

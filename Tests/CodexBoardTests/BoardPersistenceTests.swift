@@ -308,7 +308,7 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertNil(migratedRun.telemetry)
     }
 
-    func testVersionElevenSnapshotDefaultsVersionTwelveTelemetryToNil() throws {
+    func testVersionElevenSnapshotDefaultsTelemetryToNil() throws {
         let run = TaskRun(
             id: UUID(uuidString: "4C6ED146-3420-4A0F-A35F-AEAC27B95A47")!,
             phase: .execution,
@@ -351,16 +351,95 @@ final class BoardPersistenceTests: XCTestCase {
         )
 
         let migratedRun = try XCTUnwrap(migrated.tasks.first?.runs.first)
-        XCTAssertEqual(migrated.version, 12)
+        XCTAssertEqual(migrated.version, BoardSnapshot.currentVersion)
         XCTAssertNil(migratedRun.telemetry)
         XCTAssertEqual(migratedRun.threadID, "thread-v11")
         XCTAssertEqual(migratedRun.turnID, "turn-v11")
     }
 
-    func testVersionTwelveRoundTripPreservesRunMetadataTelemetryDrainAndAttention() async throws {
+    func testVersionTwelveSnapshotDefaultsVersionThirteenWorktreePreparationToNil() throws {
+        let run = TaskRun(
+            id: UUID(uuidString: "B13B93F1-C8B8-4E33-B4EE-56B500E4677C")!,
+            phase: .execution,
+            attempt: 1,
+            startedAt: Date(timeIntervalSinceReferenceDate: 300),
+            outcome: .completed,
+            threadID: "thread-v12",
+            sessionID: "session-v12",
+            turnID: "turn-v12",
+            model: "gpt-v12",
+            reasoningEffort: .high,
+            fastMode: false,
+            policySnapshot: TaskRunPolicySnapshot(
+                hostID: CodexHost.localID,
+                workspace: TaskRunWorkspaceSnapshot(
+                    kind: .worktree,
+                    path: "/tmp/worktrees/v12",
+                    branch: "codex/v12",
+                    baseBranch: "main"
+                ),
+                sandboxMode: .workspaceWrite,
+                approvalPolicy: .never,
+                networkAccess: true,
+                writableRoots: ["/tmp/worktrees/v12"],
+                serviceTier: "default"
+            )
+        )
+        let task = BoardTask(
+            projectID: "/tmp/version-twelve",
+            title: "Version twelve task",
+            sourceKind: .issue,
+            sourceText: "Migrate without synthesizing worktree provenance",
+            stage: .completed,
+            autoRun: false,
+            runs: [run],
+            workspace: TaskWorkspaceConfiguration(
+                kind: .worktree,
+                path: "/tmp/worktrees/v12",
+                branch: "codex/v12",
+                baseBranch: "main"
+            )
+        )
+        let snapshot = BoardSnapshot(
+            tasks: [task],
+            hosts: [.local],
+            manualProjects: [],
+            preferences: BoardPreferences()
+        )
+        var object = try jsonDictionary(snapshot)
+        object["version"] = 12
+        var tasks = try XCTUnwrap(object["tasks"] as? [[String: Any]])
+        var workspace = try XCTUnwrap(tasks[0]["workspace"] as? [String: Any])
+        workspace.removeValue(forKey: "preparation")
+        tasks[0]["workspace"] = workspace
+        var runs = try XCTUnwrap(tasks[0]["runs"] as? [[String: Any]])
+        var policy = try XCTUnwrap(runs[0]["policySnapshot"] as? [String: Any])
+        var runWorkspace = try XCTUnwrap(policy["workspace"] as? [String: Any])
+        runWorkspace.removeValue(forKey: "preparation")
+        policy["workspace"] = runWorkspace
+        runs[0]["policySnapshot"] = policy
+        tasks[0]["runs"] = runs
+        object["tasks"] = tasks
+
+        let migrated = try JSONDecoder().decode(
+            BoardSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        )
+
+        let migratedTask = try XCTUnwrap(migrated.tasks.first)
+        let migratedRun = try XCTUnwrap(migratedTask.runs.first)
+        XCTAssertEqual(migrated.version, 13)
+        XCTAssertNil(migratedTask.workspace.preparation)
+        XCTAssertNil(migratedRun.policySnapshot?.workspace.preparation)
+        XCTAssertEqual(migratedTask.workspace.path, "/tmp/worktrees/v12")
+        XCTAssertEqual(migratedRun.policySnapshot?.workspace.branch, "codex/v12")
+    }
+
+    func testVersionThirteenRoundTripPreservesRunTelemetryWorktreeProvenanceAndAttention() async throws {
         let fixture = try TemporaryBoardFixture()
         defer { fixture.remove() }
 
+        let ownerTaskID = UUID(uuidString: "9B1056C8-13F0-4C09-97BC-A2C7FC43BAA9")!
         let sourceRunID = UUID(uuidString: "928A67C4-8FB2-4FB2-90FA-0B17A81F59CB")!
         let runID = UUID(uuidString: "C87A3084-FD66-49F4-B0EA-4C5B732E4CC5")!
         let failureDate = Date(timeIntervalSinceReferenceDate: 1_234)
@@ -376,13 +455,24 @@ final class BoardPersistenceTests: XCTestCase {
             mode: .reusedThread,
             sourceRunID: sourceRunID
         )
+        let preparation = TaskWorktreePreparation(
+            capability: .managedV1,
+            ownerTaskID: ownerTaskID,
+            repositoryPath: "/tmp/project",
+            sourceCommit: "1111111111111111111111111111111111111111",
+            baselineCommit: "2222222222222222222222222222222222222222",
+            dirtyBaseCaptured: true,
+            untrackedFilesCaptured: 2,
+            preparedAt: Date(timeIntervalSinceReferenceDate: 1_205)
+        )
         let policy = TaskRunPolicySnapshot(
             hostID: "build-server",
             workspace: TaskRunWorkspaceSnapshot(
                 kind: .worktree,
                 path: "/tmp/worktrees/task",
                 branch: "codex/task",
-                baseBranch: "main"
+                baseBranch: "main",
+                preparation: preparation
             ),
             sandboxMode: .workspaceWrite,
             approvalPolicy: .onRequest,
@@ -487,6 +577,7 @@ final class BoardPersistenceTests: XCTestCase {
             error: failure.message
         )
         let task = BoardTask(
+            id: ownerTaskID,
             projectID: "/tmp/project",
             hostID: "build-server",
             title: "Persist v11 metadata",
@@ -507,7 +598,8 @@ final class BoardPersistenceTests: XCTestCase {
                 kind: .worktree,
                 path: "/tmp/worktrees/task",
                 branch: "codex/task",
-                baseBranch: "main"
+                baseBranch: "main",
+                preparation: preparation
             ),
             failureState: TaskFailureState(
                 kind: .connection,
@@ -540,7 +632,7 @@ final class BoardPersistenceTests: XCTestCase {
         let restoredTask = try XCTUnwrap(restored.tasks.first)
         let restoredRun = try XCTUnwrap(restoredTask.runs.first)
 
-        XCTAssertEqual(restored.version, 12)
+        XCTAssertEqual(restored.version, 13)
         XCTAssertEqual(restoredRun.continuation, continuation)
         XCTAssertEqual(restoredRun.policySnapshot, policy)
         XCTAssertEqual(restoredRun.failure, failure)
@@ -564,6 +656,28 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertEqual(restoredRun.telemetry?.tokenUsageByThread.first?.total, totalUsage)
         XCTAssertEqual(restoredRun.telemetry?.tokenUsageByThread.first?.last, lastUsage)
         XCTAssertEqual(restoredRun.telemetry?.tokenUsageByThread.first?.modelContextWindow, 200_000)
+        XCTAssertEqual(restoredTask.workspace.preparation, preparation)
+        XCTAssertEqual(restoredRun.policySnapshot?.workspace.preparation, preparation)
+        XCTAssertEqual(restoredTask.workspace.preparation?.capability.token, "codexboard-managed-worktree-v1")
+        XCTAssertEqual(restoredTask.workspace.preparation?.ownerTaskID, ownerTaskID)
+        XCTAssertEqual(restoredTask.workspace.preparation?.repositoryPath, "/tmp/project")
+        XCTAssertEqual(
+            restoredTask.workspace.preparation?.sourceCommit,
+            "1111111111111111111111111111111111111111"
+        )
+        XCTAssertEqual(
+            restoredTask.workspace.preparation?.baselineCommit,
+            "2222222222222222222222222222222222222222"
+        )
+        XCTAssertEqual(restoredTask.workspace.preparation?.dirtyBaseCaptured, true)
+        XCTAssertEqual(
+            restoredTask.workspace.preparation?.untrackedFilesCaptured,
+            2
+        )
+        XCTAssertEqual(
+            restoredTask.workspace.preparation?.preparedAt,
+            Date(timeIntervalSinceReferenceDate: 1_205)
+        )
         XCTAssertEqual(restoredRun.threadID, "thread-10")
         XCTAssertEqual(restoredRun.turnID, "turn-10")
         XCTAssertEqual(restoredTask.attention, attention)
@@ -842,7 +956,7 @@ final class BoardPersistenceTests: XCTestCase {
         try legacyData.write(to: fixture.fileURL)
         let persistence = BoardPersistence(fileURL: fixture.fileURL)
 
-        XCTAssertEqual(fixture.migrationBackupURL.lastPathComponent, "board.pre-v12.json")
+        XCTAssertEqual(fixture.migrationBackupURL.lastPathComponent, "board.pre-v13.json")
 
         let migrated = try await persistence.load()
         try await persistence.save(migrated)

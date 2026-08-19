@@ -8,7 +8,6 @@ enum BoardStoreError: LocalizedError {
     case worktreeRequiresGit
     case invalidDependencies
     case remoteAttachmentsUnsupported
-    case remoteWorktreeUnsupported
 
     var errorDescription: String? {
         switch self {
@@ -18,13 +17,12 @@ enum BoardStoreError: LocalizedError {
         case .invalidDependencies: "前置任务必须存在于同一个项目中。"
         case .remoteAttachmentsUnsupported:
             "远程任务不能直接使用这台 Mac 上的附件；请先把文件上传到远程项目，再在任务描述中填写远程路径。"
-        case .remoteWorktreeUnsupported:
-            "远程任务暂不支持由 CodexBoard 创建本地 Worktree；请选择项目主目录。"
         }
     }
 }
 
 typealias CodexTaskClientFactory = @MainActor (CodexHost) -> any CodexTaskClient
+typealias WorktreeManagerFactory = @MainActor (CodexHost, any CodexTaskClient) -> any WorktreeManaging
 
 private enum BoardStoreOAuthError: LocalizedError {
     case cannotOpenBrowser
@@ -69,6 +67,38 @@ private struct ExecutionSchedulingDemand {
     let taskIndex: Int
     let isReady: Bool
     let orderDate: Date
+}
+
+private struct WorktreeCapabilityTaskSnapshot {
+    let id: UUID
+    let projectID: String
+    let hostID: String
+    let stage: TaskStage
+    let workspace: TaskWorkspaceConfiguration
+    let executionRunID: UUID
+
+    init?(task: BoardTask, executionRunID: UUID) {
+        guard task.runs.contains(where: {
+            $0.id == executionRunID && $0.phase == .execution && $0.outcome.isActive
+        }) else { return nil }
+        id = task.id
+        projectID = task.projectID
+        hostID = task.hostID
+        stage = task.stage
+        workspace = task.workspace
+        self.executionRunID = executionRunID
+    }
+
+    func matches(_ task: BoardTask) -> Bool {
+        task.id == id
+            && task.projectID == projectID
+            && task.hostID == hostID
+            && task.stage == stage
+            && task.workspace == workspace
+            && task.runs.contains(where: {
+                $0.id == executionRunID && $0.phase == .execution && $0.outcome.isActive
+            })
+    }
 }
 
 @MainActor
@@ -143,6 +173,8 @@ final class BoardStore {
     private(set) var isLoadingMCPServers = false
     private(set) var mcpServerError: String?
     private(set) var oauthServersInProgress = Set<String>()
+    private(set) var worktreeCapabilityAvailabilityByProjectID: [String: WorktreeCapabilityAvailability] = [:]
+    private(set) var worktreeCapabilityProbingProjectIDs = Set<String>()
 
     @ObservationIgnored
     // Kept as the local client for source compatibility with existing tests and
@@ -156,6 +188,12 @@ final class BoardStore {
     private let attachmentStorage: AttachmentStorage
     @ObservationIgnored
     private let worktreeManager: any WorktreeManaging
+    @ObservationIgnored
+    private let worktreeManagerFactory: WorktreeManagerFactory
+    @ObservationIgnored
+    private var worktreeManagers: [String: any WorktreeManaging]
+    @ObservationIgnored
+    private var worktreeCapabilityProbeGenerationByProjectID: [String: UInt64] = [:]
     @ObservationIgnored
     private let externalURLOpener: (URL) -> Bool
     @ObservationIgnored
@@ -223,6 +261,8 @@ final class BoardStore {
     @ObservationIgnored
     private var cancellationRequestInFlightTaskIDs = Set<UUID>()
     @ObservationIgnored
+    private var worktreeCleanupInFlightTaskIDs = Set<UUID>()
+    @ObservationIgnored
     private var interactionAttentionIDs: [InteractionAttentionKey: UUID] = [:]
     @ObservationIgnored
     private var respondingRequests = Set<HostRequestKey>()
@@ -241,6 +281,7 @@ final class BoardStore {
         discovery: ProjectDiscoveryService = ProjectDiscoveryService(),
         attachmentStorage: AttachmentStorage = AttachmentStorage(),
         worktreeManager: any WorktreeManaging = WorktreeManager(),
+        worktreeManagerFactory: WorktreeManagerFactory? = nil,
         externalURLOpener: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
         sshDiscovery: SSHHostDiscoveryService = SSHHostDiscoveryService(),
         clientFactory: CodexTaskClientFactory? = nil,
@@ -251,6 +292,10 @@ final class BoardStore {
         self.discovery = discovery
         self.attachmentStorage = attachmentStorage
         self.worktreeManager = worktreeManager
+        self.worktreeManagerFactory = worktreeManagerFactory ?? { _, client in
+            RemoteWorktreeManager(client: client)
+        }
+        self.worktreeManagers = [CodexHost.localID: worktreeManager]
         self.externalURLOpener = externalURLOpener
         self.sshDiscovery = sshDiscovery
         self.drainStabilityDelay = drainStabilityDelay
@@ -374,6 +419,106 @@ final class BoardStore {
         project.path != "/"
             && project.existsOnDisk
             && host(for: project.hostID)?.isEnabled == true
+    }
+
+    func worktreeCapabilityAvailability(
+        for projectID: String
+    ) -> WorktreeCapabilityAvailability {
+        guard let project = projects.first(where: { $0.id == projectID }) else {
+            return .unavailable(reason: "项目尚未载入。")
+        }
+        guard let projectHost = host(for: project.hostID) else {
+            return .unavailable(reason: "项目所属主机已不存在。")
+        }
+        guard projectHost.isEnabled else {
+            return .unavailable(reason: "项目所属主机已停用。")
+        }
+        guard project.path != "/", project.existsOnDisk else {
+            return .unavailable(reason: "项目路径尚未在对应主机验证。")
+        }
+        guard project.isGitRepository else {
+            return .unsupported(reason: "所选项目不是 Git 仓库。")
+        }
+        if let cached = worktreeCapabilityAvailabilityByProjectID[projectID] {
+            return cached
+        }
+        if isLocalHost(project.hostID) {
+            return .unavailable(reason: "尚未完成本机 Git HEAD 与 Worktree 能力探测。")
+        }
+        return .unavailable(reason: "尚未从对应主机确认 Worktree 能力。")
+    }
+
+    func isProbingWorktreeCapability(for projectID: String) -> Bool {
+        worktreeCapabilityProbingProjectIDs.contains(projectID)
+    }
+
+    func hasResolvedWorktreeCapability(for projectID: String) -> Bool {
+        worktreeCapabilityAvailabilityByProjectID[projectID] != nil
+    }
+
+    @discardableResult
+    func refreshWorktreeCapability(
+        projectID: String
+    ) async -> WorktreeCapabilityAvailability? {
+        let generation = beginWorktreeCapabilityProbe(projectID: projectID)
+        defer {
+            finishWorktreeCapabilityProbe(projectID: projectID, generation: generation)
+        }
+        guard !Task.isCancelled else { return nil }
+        guard let project = projects.first(where: { $0.id == projectID }) else {
+            return publishWorktreeCapability(
+                .unavailable(reason: "项目尚未载入。"),
+                projectID: projectID,
+                generation: generation
+            )
+        }
+        guard let projectHost = host(for: project.hostID) else {
+            return publishWorktreeCapability(
+                .unavailable(reason: "项目所属主机已不存在。"),
+                projectID: projectID,
+                generation: generation
+            )
+        }
+        guard projectHost.isEnabled else {
+            return publishWorktreeCapability(
+                .unavailable(reason: "项目所属主机已停用。"),
+                projectID: projectID,
+                generation: generation
+            )
+        }
+        guard project.path != "/", project.existsOnDisk else {
+            return publishWorktreeCapability(
+                .unavailable(reason: "项目路径尚未在对应主机验证。"),
+                projectID: projectID,
+                generation: generation
+            )
+        }
+        guard project.isGitRepository else {
+            return publishWorktreeCapability(
+                .unsupported(reason: "所选项目不是 Git 仓库。"),
+                projectID: projectID,
+                generation: generation
+            )
+        }
+        let availability = await worktreeManager(for: projectHost).capability(
+            projectPath: project.path,
+            requiredCapability: .managedV1
+        )
+        guard !Task.isCancelled,
+              worktreeCapabilityProbeGenerationByProjectID[projectID] == generation,
+              let current = projects.first(where: { $0.id == projectID }),
+              current.hostID == project.hostID,
+              current.path == project.path,
+              current.existsOnDisk,
+              current.isGitRepository,
+              let currentHost = host(for: current.hostID),
+              currentHost.isEnabled
+        else { return nil }
+        return publishWorktreeCapability(
+            availability,
+            projectID: projectID,
+            generation: generation
+        )
     }
 
     func dependencyCandidates(for projectID: String) -> [BoardTask] {
@@ -503,6 +648,7 @@ final class BoardStore {
         let hostSnapshot = hosts
         let manualProjectSnapshot = manualProjects
         for host in hostSnapshot {
+            invalidateWorktreeCapabilities(for: host.id)
             hostConnectionStates[host.id] = host.isEnabled ? .connecting : .disconnected
         }
         let operations = hostSnapshot.map { host in
@@ -542,6 +688,10 @@ final class BoardStore {
             }
         }
         projects = refreshedProjects.sorted(by: projectSortOrder)
+        let refreshedProjectIDs = Set(projects.map(\.id))
+        worktreeCapabilityAvailabilityByProjectID = worktreeCapabilityAvailabilityByProjectID.filter {
+            refreshedProjectIDs.contains($0.key)
+        }
         accountReady = connectedHostCount > 0
         selectInitialProjectIfNeeded()
         if errors.isEmpty {
@@ -554,6 +704,13 @@ final class BoardStore {
         reconcileManualProjectVisibility()
         if let selectedProjectID {
             scheduleCapabilityRefresh(projectID: selectedProjectID, forceRefresh: false)
+            if projects.first(where: { $0.id == selectedProjectID }).map({
+                !isLocalHost($0.hostID)
+            }) == true {
+                Task { @MainActor [weak self] in
+                    await self?.refreshWorktreeCapability(projectID: selectedProjectID)
+                }
+            }
         }
     }
 
@@ -829,6 +986,7 @@ final class BoardStore {
         }
         hosts[index].isEnabled = enabled
         hostConfigurationGeneration += 1
+        invalidateWorktreeCapabilities(for: hostID)
         if !enabled {
             clients[hostID]?.disconnect()
             hostConnectionStates[hostID] = .disconnected
@@ -855,6 +1013,7 @@ final class BoardStore {
 
         hosts.removeAll { $0.id == hostID }
         hostConfigurationGeneration += 1
+        invalidateWorktreeCapabilities(for: hostID)
         hostConnectionStates.removeValue(forKey: hostID)
         eventTasks.removeValue(forKey: hostID)?.cancel()
         clients[hostID]?.disconnect()
@@ -867,6 +1026,7 @@ final class BoardStore {
     func testHost(id hostID: String) async {
         guard let host = host(for: hostID), host.isEnabled else { return }
         let generation = hostConfigurationGeneration
+        invalidateWorktreeCapabilities(for: hostID)
         hostConnectionStates[hostID] = .connecting
         let hostClient = clientForHost(host)
         do {
@@ -930,12 +1090,12 @@ final class BoardStore {
             guard attachmentDrafts.isEmpty else {
                 throw BoardStoreError.remoteAttachmentsUnsupported
             }
-            guard workspaceKind != .worktree else {
-                throw BoardStoreError.remoteWorktreeUnsupported
-            }
         }
         guard workspaceKind != .worktree || project.isGitRepository else {
             throw BoardStoreError.worktreeRequiresGit
+        }
+        if workspaceKind == .worktree {
+            _ = try await requireWorktreeCapability(project: project, host: projectHost)
         }
         let uniqueDependencyIDs = dependencyIDs.reduce(into: [UUID]()) { result, id in
             if !result.contains(id) { result.append(id) }
@@ -1059,7 +1219,9 @@ final class BoardStore {
 
     private func performPlanningStart(taskID: UUID) async {
         guard let initialIndex = taskIndex(taskID), let project = project(forTaskAt: initialIndex) else { return }
-        guard tasks[initialIndex].stage == .inbox else { return }
+        guard tasks[initialIndex].stage == .inbox,
+              !worktreeCleanupInFlightTaskIDs.contains(taskID)
+        else { return }
         guard let host = host(for: tasks[initialIndex].hostID), host.isEnabled else {
             failTask(at: initialIndex, message: "任务主机已停用或不再存在。")
             return
@@ -1085,14 +1247,6 @@ final class BoardStore {
             failTask(
                 at: initialIndex,
                 message: BoardStoreError.remoteAttachmentsUnsupported.localizedDescription,
-                kind: .workspace
-            )
-            return
-        }
-        if host.kind == .ssh, tasks[initialIndex].workspace.kind == .worktree {
-            failTask(
-                at: initialIndex,
-                message: BoardStoreError.remoteWorktreeUnsupported.localizedDescription,
                 kind: .workspace
             )
             return
@@ -1246,6 +1400,15 @@ final class BoardStore {
                       $0.id == planningRunID && $0.outcome.isActive
                   })
             else { return }
+            if cancellationIntentTaskIDs.contains(taskID) {
+                failTask(
+                    at: persistedIndex,
+                    message: "任务已停止。",
+                    runOutcome: .interrupted,
+                    kind: .interrupted
+                )
+                return
+            }
             let turn = try await hostClient.startPlanningTurn(
                 threadID: startedThread.threadID,
                 cwd: project.path,
@@ -1350,6 +1513,7 @@ final class BoardStore {
     }
 
     func continueExecution(taskID: UUID) {
+        guard !worktreeCleanupInFlightTaskIDs.contains(taskID) else { return }
         Task { @MainActor [weak self] in
             await self?.reconcileAndContinueExecution(taskID: taskID)
         }
@@ -1358,6 +1522,7 @@ final class BoardStore {
     private func reconcileAndContinueExecution(taskID: UUID) async {
         guard let index = taskIndex(taskID),
               !tasks[index].stage.isActive,
+              !worktreeCleanupInFlightTaskIDs.contains(taskID),
               tasks[index].hasFinalPlan,
               !tasks[index].planText.isEmpty
         else { return }
@@ -1375,11 +1540,14 @@ final class BoardStore {
             do {
                 let hostClient = clientForHost(host)
                 try await hostClient.connect()
+                guard !worktreeCleanupInFlightTaskIDs.contains(taskID) else { return }
                 let detail = try await hostClient.readThread(
                     threadID: threadID,
                     includeTurns: true
                 )
-                guard let currentIndex = taskIndex(taskID) else { return }
+                guard let currentIndex = taskIndex(taskID),
+                      !worktreeCleanupInFlightTaskIDs.contains(taskID)
+                else { return }
                 let knownTurnID = taskSnapshot.executionTurnID
                 let candidateTurn = knownTurnID.flatMap { turnID in
                     detail.turns.first(where: { $0.id == turnID })
@@ -1488,7 +1656,8 @@ final class BoardStore {
                     }
                 }
             } catch {
-                if let failureIndex = taskIndex(taskID) {
+                if !worktreeCleanupInFlightTaskIDs.contains(taskID),
+                   let failureIndex = taskIndex(taskID) {
                     failTask(
                         at: failureIndex,
                         message: "无法读取远端 thread 以确认上次执行状态：\(error.localizedDescription) 未启动新 Turn。"
@@ -1503,6 +1672,7 @@ final class BoardStore {
     }
 
     private func enqueueContinuedExecution(at index: Int) {
+        guard !worktreeCleanupInFlightTaskIDs.contains(tasks[index].id) else { return }
         resolveFailureAttention(taskID: tasks[index].id)
         tasks[index].executionTurnID = nil
         tasks[index].failureState = nil
@@ -1544,6 +1714,7 @@ final class BoardStore {
         let cleanFeedback = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanFeedback.isEmpty,
               let index = taskIndex(taskID),
+              !worktreeCleanupInFlightTaskIDs.contains(taskID),
               tasks[index].stage == .review
         else { return false }
 
@@ -1647,6 +1818,10 @@ final class BoardStore {
     func deleteTask(taskID: UUID) {
         discardPendingStreamUpdate(for: taskID)
         guard let index = taskIndex(taskID), !tasks[index].stage.isActive else { return }
+        guard tasks[index].workspace.path == nil else {
+            lastError = "这张任务卡仍管理着独立 Worktree；请先在任务详情中安全清理，再删除卡片。"
+            return
+        }
         let dependentCount = dependents(of: taskID).count
         guard dependentCount == 0 else {
             lastError = "仍有 \(dependentCount) 个任务依赖这张卡片，请先解除依赖。"
@@ -1757,21 +1932,44 @@ final class BoardStore {
     func cleanupWorktree(taskID: UUID) async {
         guard let index = taskIndex(taskID),
               !tasks[index].stage.isActive,
-              isLocalHost(tasks[index].hostID),
               tasks[index].workspace.kind == .worktree,
-              let project = project(forTaskAt: index)
+              let project = project(forTaskAt: index),
+              let projectHost = host(for: tasks[index].hostID),
+              worktreeCleanupInFlightTaskIDs.insert(taskID).inserted
         else { return }
+        let configuration = tasks[index].workspace
+        defer {
+            worktreeCleanupInFlightTaskIDs.remove(taskID)
+            schedulePlanningStartupWorker()
+            scheduleExecutionQueue()
+        }
         do {
-            let cleaned = try await worktreeManager.cleanup(
+            let cleaned = try await worktreeManager(for: projectHost).cleanup(
+                taskID: taskID,
                 projectPath: project.path,
-                configuration: tasks[index].workspace
+                configuration: configuration,
+                requiredCapability: .managedV1
             )
-            guard let currentIndex = taskIndex(taskID) else { return }
+            guard let currentIndex = taskIndex(taskID),
+                  !tasks[currentIndex].stage.isActive,
+                  tasks[currentIndex].workspace == configuration
+            else { return }
             tasks[currentIndex].workspace = cleaned
             appendLog(at: currentIndex, "独立 Worktree 已清理；任务分支仍保留。", level: .success)
-            scheduleSave(immediate: true)
+            guard await saveImmediately() else {
+                guard let failureIndex = taskIndex(taskID),
+                      !tasks[failureIndex].stage.isActive,
+                      tasks[failureIndex].workspace == cleaned
+                else { return }
+                tasks[failureIndex].lastError = "Worktree 已清理，但无法持久化清理结果；请勿立即退出应用。"
+                appendLog(at: failureIndex, tasks[failureIndex].lastError ?? "持久化失败", level: .error)
+                return
+            }
         } catch {
-            guard let currentIndex = taskIndex(taskID) else { return }
+            guard let currentIndex = taskIndex(taskID),
+                  !tasks[currentIndex].stage.isActive,
+                  tasks[currentIndex].workspace == configuration
+            else { return }
             tasks[currentIndex].lastError = error.localizedDescription
             appendLog(at: currentIndex, error.localizedDescription, level: .error)
             scheduleSave(immediate: true)
@@ -1833,11 +2031,18 @@ final class BoardStore {
     }
 
     private func schedulePlanningStartupWorker() {
-        guard planningStartupWorker == nil, !planningStartupQueue.isEmpty else { return }
+        guard planningStartupWorker == nil,
+              planningStartupQueue.contains(where: {
+                  !worktreeCleanupInFlightTaskIDs.contains($0)
+              })
+        else { return }
         planningStartupWorker = Task { @MainActor [weak self] in
             guard let self else { return }
-            while !Task.isCancelled, let taskID = self.planningStartupQueue.first {
-                self.planningStartupQueue.removeFirst()
+            while !Task.isCancelled,
+                  let queueIndex = self.planningStartupQueue.firstIndex(where: {
+                      !self.worktreeCleanupInFlightTaskIDs.contains($0)
+                  }) {
+                let taskID = self.planningStartupQueue.remove(at: queueIndex)
                 await self.performPlanningStart(taskID: taskID)
                 self.pendingPlanningTaskIDs.remove(taskID)
                 let waiters = self.planningStartupWaiters.removeValue(forKey: taskID) ?? []
@@ -1853,7 +2058,9 @@ final class BoardStore {
                 }
             }
             self.planningStartupWorker = nil
-            if !self.planningStartupQueue.isEmpty {
+            if self.planningStartupQueue.contains(where: {
+                !self.worktreeCleanupInFlightTaskIDs.contains($0)
+            }) {
                 self.schedulePlanningStartupWorker()
             }
         }
@@ -2073,6 +2280,144 @@ final class BoardStore {
         return newClient
     }
 
+    private func worktreeManager(for host: CodexHost) -> any WorktreeManaging {
+        if let existing = worktreeManagers[host.id] { return existing }
+        let manager = worktreeManagerFactory(host, clientForHost(host))
+        worktreeManagers[host.id] = manager
+        return manager
+    }
+
+    @discardableResult
+    private func requireWorktreeCapability(
+        taskID: UUID? = nil,
+        executionRunID: UUID? = nil,
+        project: ProjectRecord,
+        host: CodexHost
+    ) async throws -> WorktreeCapability {
+        let taskSnapshot: WorktreeCapabilityTaskSnapshot?
+        if let taskID, let executionRunID,
+           let task = tasks.first(where: { $0.id == taskID }),
+           let snapshot = WorktreeCapabilityTaskSnapshot(
+               task: task,
+               executionRunID: executionRunID
+           ) {
+            taskSnapshot = snapshot
+        } else if taskID == nil, executionRunID == nil {
+            taskSnapshot = nil
+        } else {
+            throw WorktreeManagerError.capabilityUnavailable(
+                "能力探测已取消、过期，或项目归属已经变化。"
+            )
+        }
+
+        guard isCurrentWorktreeCapabilityContext(
+            project: project,
+            host: host,
+            taskSnapshot: taskSnapshot
+        ) else {
+            throw WorktreeManagerError.capabilityUnavailable(
+                "能力探测已取消、过期，或项目归属已经变化。"
+            )
+        }
+        let manager = worktreeManager(for: host)
+        let availability = await manager.capability(
+            projectPath: project.path,
+            requiredCapability: .managedV1
+        )
+        guard !Task.isCancelled,
+              isCurrentWorktreeCapabilityContext(
+                  project: project,
+                  host: host,
+                  taskSnapshot: taskSnapshot
+              )
+        else {
+            throw WorktreeManagerError.capabilityUnavailable(
+                "能力探测已取消、过期，或项目归属已经变化。"
+            )
+        }
+        switch availability {
+        case let .supported(capability) where capability == .managedV1:
+            return capability
+        case let .supported(capability):
+            throw WorktreeManagerError.capabilityMismatch(
+                required: .managedV1,
+                actual: capability
+            )
+        case let .unsupported(reason):
+            throw WorktreeManagerError.capabilityUnsupported(reason)
+        case let .unavailable(reason):
+            throw WorktreeManagerError.capabilityUnavailable(reason)
+        }
+    }
+
+    private func isCurrentWorktreeCapabilityContext(
+        project: ProjectRecord,
+        host: CodexHost,
+        taskSnapshot: WorktreeCapabilityTaskSnapshot?
+    ) -> Bool {
+        guard host.id == project.hostID,
+              host.isEnabled,
+              project.path != "/",
+              project.existsOnDisk,
+              project.isGitRepository,
+              let currentProject = projects.first(where: { $0.id == project.id }),
+              currentProject.hostID == project.hostID,
+              currentProject.path == project.path,
+              currentProject.existsOnDisk,
+              currentProject.isGitRepository,
+              let currentHost = self.host(for: host.id),
+              currentHost.isEnabled,
+              currentHost.kind == host.kind,
+              currentHost.sshAlias == host.sshAlias
+        else { return false }
+
+        guard let taskSnapshot else { return true }
+        guard taskSnapshot.projectID == project.id,
+              taskSnapshot.hostID == host.id,
+              let currentTask = tasks.first(where: { $0.id == taskSnapshot.id })
+        else { return false }
+        return taskSnapshot.matches(currentTask)
+    }
+
+    private func beginWorktreeCapabilityProbe(projectID: String) -> UInt64 {
+        let generation = (worktreeCapabilityProbeGenerationByProjectID[projectID] ?? 0) &+ 1
+        worktreeCapabilityProbeGenerationByProjectID[projectID] = generation
+        worktreeCapabilityProbingProjectIDs.insert(projectID)
+        return generation
+    }
+
+    private func finishWorktreeCapabilityProbe(projectID: String, generation: UInt64) {
+        guard worktreeCapabilityProbeGenerationByProjectID[projectID] == generation else { return }
+        worktreeCapabilityProbingProjectIDs.remove(projectID)
+    }
+
+    private func publishWorktreeCapability(
+        _ availability: WorktreeCapabilityAvailability,
+        projectID: String,
+        generation: UInt64
+    ) -> WorktreeCapabilityAvailability? {
+        guard !Task.isCancelled,
+              worktreeCapabilityProbeGenerationByProjectID[projectID] == generation
+        else { return nil }
+        worktreeCapabilityAvailabilityByProjectID[projectID] = availability
+        return availability
+    }
+
+    private func invalidateWorktreeCapabilities(for hostID: String) {
+        let projectIDs = Set(projects.lazy.filter { $0.hostID == hostID }.map(\.id))
+        for projectID in projectIDs {
+            worktreeCapabilityProbeGenerationByProjectID[projectID, default: 0] &+= 1
+        }
+        worktreeCapabilityProbingProjectIDs.subtract(projectIDs)
+        worktreeCapabilityAvailabilityByProjectID = worktreeCapabilityAvailabilityByProjectID.filter {
+            !projectIDs.contains($0.key)
+        }
+        worktreeManagers.removeValue(forKey: hostID)
+        if hostID == CodexHost.localID {
+            worktreeManagers[hostID] = worktreeManager
+        }
+    }
+
     private func reflectTransportState(
         of client: any CodexTaskClient,
         for host: CodexHost,
@@ -2285,6 +2630,7 @@ final class BoardStore {
                 tasks[$0].stage == .awaitingApproval
                     && tasks[$0].executionApproved
                     && !cancellationIntentTaskIDs.contains(tasks[$0].id)
+                    && !worktreeCleanupInFlightTaskIDs.contains(tasks[$0].id)
                     && tasks[$0].hasFinalPlan
                     && !tasks[$0].planText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
@@ -2299,6 +2645,7 @@ final class BoardStore {
             guard tasks[index].stage == .planning,
                   tasks[index].autoRun,
                   !cancellationIntentTaskIDs.contains(tasks[index].id),
+                  !worktreeCleanupInFlightTaskIDs.contains(tasks[index].id),
                   let run = tasks[index].runs.last(where: {
                       $0.phase == .planning && $0.outcome.isActive
                   }),
@@ -2401,36 +2748,100 @@ final class BoardStore {
         }
         let hostClient = clientForHost(host)
         do {
-            let executionPath: String
-            if host.kind == .ssh {
-                guard taskSnapshot.attachments.isEmpty else {
-                    throw BoardStoreError.remoteAttachmentsUnsupported
-                }
-                guard taskSnapshot.workspace.kind != .worktree else {
-                    throw BoardStoreError.remoteWorktreeUnsupported
-                }
-                executionPath = project.path
-            } else {
-                let preparedWorkspace = try await worktreeManager.prepare(
-                    taskID: taskID,
-                    projectPath: project.path,
-                    configuration: taskSnapshot.workspace
-                )
-                guard let preparedIndex = taskIndex(taskID) else { return }
-                tasks[preparedIndex].workspace = preparedWorkspace
-                executionPath = preparedWorkspace.path ?? project.path
-                if preparedWorkspace.kind == .worktree, preparedWorkspace.path != nil {
-                    appendLog(
-                        at: preparedIndex,
-                        "使用独立 Worktree：\(preparedWorkspace.branch ?? executionPath)",
-                        level: .success
-                    )
-                }
-                let executionAttachments = tasks[preparedIndex].attachments
-                try await attachmentStorage.validate(executionAttachments)
+            if host.kind == .ssh, !taskSnapshot.attachments.isEmpty {
+                throw BoardStoreError.remoteAttachmentsUnsupported
             }
             try await hostClient.connect()
             hostConnectionStates[host.id] = .connected
+            guard let workspaceIndex = taskIndex(taskID),
+                  tasks[workspaceIndex].stage == .executing,
+                  tasks[workspaceIndex].runs.contains(where: {
+                      $0.id == runID && $0.outcome.isActive
+                  })
+            else { return }
+
+            if host.kind == .local {
+                let executionAttachments = tasks[workspaceIndex].attachments
+                try await attachmentStorage.validate(executionAttachments)
+            }
+            guard let preparationIndex = taskIndex(taskID),
+                  tasks[preparationIndex].stage == .executing
+            else { return }
+
+            let executionPath: String
+            if tasks[preparationIndex].workspace.kind == .worktree {
+                let requiredCapability = try await requireWorktreeCapability(
+                    taskID: taskID,
+                    executionRunID: runID,
+                    project: project,
+                    host: host
+                )
+                guard let capabilityIndex = taskIndex(taskID),
+                      tasks[capabilityIndex].stage == .executing
+                else { return }
+                let manager = worktreeManager(for: host)
+                let preparedWorkspace = try await manager.prepare(
+                    taskID: taskID,
+                    projectPath: project.path,
+                    configuration: tasks[capabilityIndex].workspace,
+                    requiredCapability: requiredCapability
+                )
+                let preparedPath = try validatedPreparedWorktreePath(
+                    preparedWorkspace,
+                    taskID: taskID,
+                    project: project,
+                    host: host,
+                    requiredCapability: requiredCapability
+                )
+                guard let preparedIndex = taskIndex(taskID) else { return }
+                var canonicalWorkspace = preparedWorkspace
+                canonicalWorkspace.path = preparedPath
+                tasks[preparedIndex].workspace = canonicalWorkspace
+                executionPath = preparedPath
+                let preparedPolicy = taskRunPolicySnapshot(
+                    for: tasks[preparedIndex],
+                    phase: .execution,
+                    cwd: preparedPath
+                )
+                updateRun(at: preparedIndex, runID: runID) { run in
+                    run.policySnapshot = preparedPolicy
+                }
+                appendLog(
+                    at: preparedIndex,
+                    "使用独立 Worktree：\(preparedWorkspace.branch ?? executionPath)",
+                    level: .success
+                )
+                guard await saveImmediately() else {
+                    if let failureIndex = taskIndex(taskID) {
+                        failTask(
+                            at: failureIndex,
+                            message: "Worktree 已创建但无法持久化其路径和来源证据；未恢复执行 thread。",
+                            kind: .workspace
+                        )
+                        scheduleExecutionQueue()
+                    }
+                    return
+                }
+            } else {
+                executionPath = project.path
+            }
+
+            guard let resumeIndex = taskIndex(taskID),
+                  tasks[resumeIndex].stage == .executing,
+                  tasks[resumeIndex].runs.contains(where: {
+                      $0.id == runID && $0.outcome.isActive
+                  })
+            else { return }
+            if cancellationIntentTaskIDs.contains(taskID) {
+                failTask(
+                    at: resumeIndex,
+                    message: "任务已停止。",
+                    runOutcome: .interrupted,
+                    kind: .interrupted
+                )
+                scheduleExecutionQueue()
+                return
+            }
             let resumed = try await hostClient.resumeThread(threadID: threadID, cwd: executionPath)
             guard let currentIndex = taskIndex(taskID) else { return }
             tasks[currentIndex].sessionID = resumed.sessionID
@@ -2478,27 +2889,33 @@ final class BoardStore {
                 scheduleExecutionQueue()
                 return
             }
-            let executionPolicy = taskRunPolicySnapshot(
+            let existingPolicy = tasks[inputIndex].runs
+                .first(where: { $0.id == runID })?
+                .policySnapshot
+            let executionPolicy = existingPolicy ?? taskRunPolicySnapshot(
                 for: tasks[inputIndex],
                 phase: .execution,
                 cwd: executionPath
             )
-            updateRun(at: inputIndex, runID: runID) { run in
-                run.policySnapshot = executionPolicy
+            if existingPolicy == nil {
+                updateRun(at: inputIndex, runID: runID) { run in
+                    run.policySnapshot = executionPolicy
+                }
             }
             var runtimeTask = tasks[inputIndex]
             runtimeTask.selectedApps = runtimeSafeApps
             let input = TaskPromptBuilder.executionInput(
                 for: runtimeTask,
                 projectPath: executionPath,
-                sourceProjectPath: project.path
+                sourceProjectPath: project.path,
+                pathSemantics: host.kind == .ssh ? .remote : .local
             )
             let executionModel = tasks[inputIndex].requestedModel
             let executionEffort = tasks[inputIndex].reasoningEffort
             let executionServiceTier = tasks[inputIndex].fastMode
                 ? CodexServiceTier.fast
                 : CodexServiceTier.standard
-            let executionAllowsNetwork = preferences.allowNetworkAccess
+            let executionAllowsNetwork = executionPolicy.networkAccess
             guard await saveImmediately() else {
                 if let failureIndex = taskIndex(taskID) {
                     failTask(
@@ -2515,6 +2932,16 @@ final class BoardStore {
                       $0.id == runID && $0.outcome.isActive
                   })
             else { return }
+            if cancellationIntentTaskIDs.contains(taskID) {
+                failTask(
+                    at: persistedIndex,
+                    message: "任务已停止。",
+                    runOutcome: .interrupted,
+                    kind: .interrupted
+                )
+                scheduleExecutionQueue()
+                return
+            }
             let turn = try await hostClient.startExecutionTurn(
                 threadID: threadID,
                 cwd: executionPath,
@@ -2560,7 +2987,21 @@ final class BoardStore {
         } catch {
             reflectTransportState(of: hostClient, for: host, fallbackError: error)
             if let failureIndex = taskIndex(taskID) {
-                let kind: TaskFailureKind = error is WorktreeManagerError ? .workspace : classifyFailure(error.localizedDescription)
+                if let worktreeError = error as? WorktreeManagerError,
+                   case let .capturedStatePreserved(path, branch, _) = worktreeError,
+                   tasks[failureIndex].workspace.kind == .worktree,
+                   isOwnedWorktreeBranch(branch, taskID: taskID),
+                   let normalizedPath = safeNormalizedWorktreePath(
+                    path,
+                    projectPath: project.path,
+                    host: host
+                   ) {
+                    tasks[failureIndex].workspace.path = normalizedPath
+                    tasks[failureIndex].workspace.branch = branch
+                }
+                let kind: TaskFailureKind = (error is WorktreeManagerError || error is BoardStoreError)
+                    ? .workspace
+                    : classifyFailure(error.localizedDescription)
                 failTask(
                     at: failureIndex,
                     message: error.localizedDescription,
@@ -2571,6 +3012,112 @@ final class BoardStore {
                 scheduleExecutionQueue()
             }
         }
+    }
+
+    private func validatedPreparedWorktreePath(
+        _ workspace: TaskWorkspaceConfiguration,
+        taskID: UUID,
+        project: ProjectRecord,
+        host: CodexHost,
+        requiredCapability: WorktreeCapability
+    ) throws -> String {
+        guard workspace.kind == .worktree,
+              let path = workspace.path,
+              let branch = workspace.branch,
+              let preparation = workspace.preparation,
+              preparation.ownerTaskID == taskID,
+              preparation.capability == requiredCapability,
+              isGitObjectID(preparation.sourceCommit),
+              isGitObjectID(preparation.baselineCommit),
+              preparation.untrackedFilesCaptured >= 0
+        else {
+            throw WorktreeManagerError.invalidPreparationEvidence(
+                "管理器未返回完整的 Worktree 路径、分支、所有权、能力或提交证据。"
+            )
+        }
+        guard isOwnedWorktreeBranch(branch, taskID: taskID) else {
+            throw WorktreeManagerError.invalidPreparationEvidence("管理器返回了不属于当前任务的分支。")
+        }
+        guard let normalizedRepository = normalizedWorkspacePath(
+            preparation.repositoryPath,
+            host: host
+        ),
+        let normalizedProject = normalizedWorkspacePath(project.path, host: host),
+        normalizedRepository == normalizedProject else {
+            throw WorktreeManagerError.invalidPreparationEvidence("管理器返回的源仓库证据不匹配。")
+        }
+        guard let normalizedPath = safeNormalizedWorktreePath(
+            path,
+            projectPath: project.path,
+            host: host
+        ) else {
+            throw WorktreeManagerError.invalidManagedPath(path)
+        }
+        return normalizedPath
+    }
+
+    private func safeNormalizedWorktreePath(
+        _ path: String,
+        projectPath: String,
+        host: CodexHost
+    ) -> String? {
+        guard !path.isEmpty,
+              !path.contains("\0"),
+              !path.unicodeScalars.contains(where: CharacterSet.newlines.contains),
+              (path as NSString).isAbsolutePath,
+              let normalizedPath = normalizedWorkspacePath(path, host: host),
+              let normalizedProject = normalizedWorkspacePath(projectPath, host: host)
+        else { return nil }
+        let pathComponents = (normalizedPath as NSString).pathComponents
+        let projectComponents = (normalizedProject as NSString).pathComponents
+        let pathContainsProject = pathComponents.count <= projectComponents.count
+            && projectComponents.prefix(pathComponents.count).elementsEqual(pathComponents)
+        let projectContainsPath = projectComponents.count <= pathComponents.count
+            && pathComponents.prefix(projectComponents.count).elementsEqual(projectComponents)
+        guard normalizedPath != "/", !pathContainsProject, !projectContainsPath else {
+            return nil
+        }
+        return normalizedPath
+    }
+
+    private func normalizedWorkspacePath(_ path: String, host: CodexHost) -> String? {
+        guard !path.isEmpty,
+              !path.contains("\0"),
+              !path.unicodeScalars.contains(where: CharacterSet.newlines.contains),
+              (path as NSString).isAbsolutePath
+        else { return nil }
+        if host.kind == .local {
+            return URL(fileURLWithPath: path, isDirectory: true)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+        }
+        return (path as NSString).standardizingPath
+    }
+
+    private func ownedWorktreeBranch(taskID: UUID) -> String {
+        "codex/task-\(taskID.uuidString.lowercased())"
+    }
+
+    private func isOwnedWorktreeBranch(_ branch: String, taskID: UUID) -> Bool {
+        let fullBranch = ownedWorktreeBranch(taskID: taskID)
+        let legacyBranch = "codex/task-\(taskID.uuidString.prefix(8).lowercased())"
+        if branch == fullBranch || branch == legacyBranch { return true }
+        let attemptPrefix = "\(fullBranch)-attempt-"
+        guard branch.hasPrefix(attemptPrefix),
+              let attempt = Int(branch.dropFirst(attemptPrefix.count)),
+              attempt >= 2
+        else { return false }
+        return branch == "\(attemptPrefix)\(attempt)"
+    }
+
+    private func isGitObjectID(_ value: String) -> Bool {
+        (value.count == 40 || value.count == 64)
+            && value.unicodeScalars.allSatisfy { scalar in
+                ("0" ... "9").contains(Character(scalar))
+                    || ("a" ... "f").contains(Character(scalar))
+                    || ("A" ... "F").contains(Character(scalar))
+            }
     }
 
     private func handle(_ event: CodexEvent, hostID: String) {
@@ -2748,6 +3295,7 @@ final class BoardStore {
             }
         case let .connectionLost(message):
             flushPendingStreamUpdates()
+            invalidateWorktreeCapabilities(for: hostID)
             hostConnectionStates[hostID] = .failed(message)
             accountReady = connectedHostCount > 0
             let affectedTaskIDs = Set(tasks.lazy.filter { $0.hostID == hostID }.map(\.id))
@@ -4311,7 +4859,8 @@ final class BoardStore {
                 kind: isPlanning ? .project : task.workspace.kind,
                 path: cwd,
                 branch: isPlanning ? nil : task.workspace.branch,
-                baseBranch: isPlanning ? nil : task.workspace.baseBranch
+                baseBranch: isPlanning ? nil : task.workspace.baseBranch,
+                preparation: isPlanning ? nil : task.workspace.preparation
             ),
             sandboxMode: isPlanning ? .readOnly : .workspaceWrite,
             approvalPolicy: isPlanning ? .never : .onRequest,

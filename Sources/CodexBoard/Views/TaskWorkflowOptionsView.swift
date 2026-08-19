@@ -7,6 +7,7 @@ struct TaskWorkflowOptionsView: View {
     @Binding var dependencyIDs: Set<UUID>
 
     @State private var dependenciesExpanded = false
+    @State private var capabilityProbeRequestID: UUID?
 
     private var project: ProjectRecord? {
         store.visibleProjects.first(where: { $0.id == projectID })
@@ -20,8 +21,29 @@ struct TaskWorkflowOptionsView: View {
         project.map { !store.isLocalHost($0.hostID) } == true
     }
 
+    private var worktreeAvailability: WorktreeCapabilityAvailability {
+        store.worktreeCapabilityAvailability(for: projectID)
+    }
+
+    private var isWorktreeSupported: Bool {
+        if case .supported(.managedV1) = worktreeAvailability { return true }
+        return false
+    }
+
+    private var isWorktreeProbing: Bool {
+        store.isProbingWorktreeCapability(for: projectID)
+    }
+
+    private var hasResolvedWorktreeCapability: Bool {
+        store.hasResolvedWorktreeCapability(for: projectID)
+    }
+
     private var availableWorkspaceKinds: [TaskWorkspaceKind] {
-        project?.isGitRepository == true && !isRemoteProject ? TaskWorkspaceKind.allCases : [.project]
+        let preservesPendingSelection = workspaceKind == .worktree
+            && (!hasResolvedWorktreeCapability || isWorktreeProbing)
+        return project?.isGitRepository == true && (isWorktreeSupported || preservesPendingSelection)
+            ? TaskWorkspaceKind.allCases
+            : [.project]
     }
 
     var body: some View {
@@ -33,9 +55,7 @@ struct TaskWorkflowOptionsView: View {
             }
             .pickerStyle(.segmented)
 
-            Text(workspaceDescription)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            workspaceStatus
 
             DisclosureGroup(isExpanded: $dependenciesExpanded) {
                 dependencyList
@@ -53,8 +73,35 @@ struct TaskWorkflowOptionsView: View {
             }
         }
         .onChange(of: projectID) { _, _ in
+            capabilityProbeRequestID = nil
             dependencyIDs.removeAll()
-            if project?.isGitRepository != true || isRemoteProject {
+            if project?.isGitRepository != true || !isWorktreeSupported {
+                workspaceKind = .project
+            }
+        }
+        .onChange(of: worktreeAvailability) { _, availability in
+            guard hasResolvedWorktreeCapability, !isWorktreeProbing else { return }
+            if case .supported(.managedV1) = availability {
+                return
+            }
+            workspaceKind = .project
+        }
+        .task(id: projectID) {
+            let requestID = UUID()
+            capabilityProbeRequestID = requestID
+            defer {
+                if capabilityProbeRequestID == requestID {
+                    capabilityProbeRequestID = nil
+                }
+            }
+            let availability = await store.refreshWorktreeCapability(projectID: projectID)
+            guard !Task.isCancelled,
+                  capabilityProbeRequestID == requestID,
+                  let availability
+            else { return }
+            if case .supported(.managedV1) = availability {
+                return
+            } else {
                 workspaceKind = .project
             }
         }
@@ -93,29 +140,79 @@ struct TaskWorkflowOptionsView: View {
         }
     }
 
+    @ViewBuilder
+    private var workspaceStatus: some View {
+        if isWorktreeProbing {
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(workspaceDescription)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("执行工作区状态")
+            .accessibilityValue(workspaceDescription)
+        } else {
+            Label(workspaceDescription, systemImage: workspaceStatusSystemImage)
+                .font(.caption)
+                .foregroundStyle(workspaceStatusColor)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("执行工作区状态")
+                .accessibilityValue(workspaceDescription)
+        }
+    }
+
     private var workspaceDescription: String {
-        if isRemoteProject {
+        if isWorktreeProbing {
+            return isRemoteProject
+                ? "正在向对应远程主机确认完整 Worktree 能力…"
+                : "正在验证本机 Git HEAD 与 Worktree 能力…"
+        }
+        if workspaceKind == .worktree, project?.isGitRepository == true, isWorktreeSupported {
             return L10n.text(
-                "远程项目直接在服务器上的项目目录执行；本机不会为它创建 Worktree。",
-                fallback: "远程项目直接在服务器上的项目目录执行；本机不会为它创建 Worktree。"
+                "执行前会在独立任务分支创建真实的基线提交，包含已跟踪文件的暂存与未暂存改动，以及非忽略的未跟踪文件；Git ignored 文件不纳入，源目录和索引保持不变。规划仍在原项目只读进行。",
+                fallback: "执行前会在独立任务分支创建真实的基线提交，包含已跟踪文件的暂存与未暂存改动，以及非忽略的未跟踪文件；Git ignored 文件不纳入，源目录和索引保持不变。规划仍在原项目只读进行。"
             )
         }
-        if workspaceKind == .worktree {
-            if project?.isGitRepository == true {
-                return L10n.text(
-                    "执行前自动创建 codex/task-* 分支和隔离目录；规划仍在原项目只读进行。",
-                    fallback: "执行前自动创建 codex/task-* 分支和隔离目录；规划仍在原项目只读进行。"
-                )
-            }
-            return L10n.text(
-                "所选项目不是 Git 仓库，无法使用独立 Worktree。",
-                fallback: "所选项目不是 Git 仓库，无法使用独立 Worktree。"
-            )
+        switch worktreeAvailability {
+        case .supported:
+            break
+        case let .unsupported(reason):
+            return isRemoteProject
+                ? "该远程主机当前不支持由 CodexBoard 管理的独立 Worktree：\(reason) 当前选择将直接在服务器项目目录执行。"
+                : "该项目当前不支持独立 Worktree：\(reason) 当前选择将直接在项目目录执行。"
+        case let .unavailable(reason):
+            return isRemoteProject
+                ? "暂时无法确认该远程主机的完整 Worktree 能力：\(reason) 当前选择将直接在服务器项目目录执行。"
+                : "暂时无法确认该项目的 Worktree 能力：\(reason) 当前选择将直接在项目目录执行。"
         }
         return L10n.text(
             "直接在当前项目目录执行；主目录任务彼此串行，独立 Worktree 仍可并行。",
             fallback: "直接在当前项目目录执行；主目录任务彼此串行，独立 Worktree 仍可并行。"
         )
+    }
+
+    private var workspaceStatusSystemImage: String {
+        switch worktreeAvailability {
+        case .supported:
+            workspaceKind == .worktree ? "point.3.connected.trianglepath.dotted" : "folder"
+        case .unsupported:
+            "nosign"
+        case .unavailable:
+            "exclamationmark.triangle"
+        }
+    }
+
+    private var workspaceStatusColor: Color {
+        switch worktreeAvailability {
+        case .supported:
+            .secondary
+        case .unsupported:
+            BoardTheme.danger
+        case .unavailable:
+            BoardTheme.approval
+        }
     }
 
     private func dependencyBinding(_ id: UUID) -> Binding<Bool> {

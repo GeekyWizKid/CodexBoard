@@ -256,6 +256,126 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertNil(settled.failureState?.nextRetryAt)
     }
 
+    func testCancellationDuringPlanningPolicySavePreventsTurnStart() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = AsyncGate()
+        let persistence = PolicySaveGatePersistence(
+            initialSnapshot: BoardSnapshot(
+                version: BoardSnapshot.currentVersion,
+                tasks: [],
+                manualProjectPaths: [directory.path],
+                preferences: BoardPreferences()
+            ),
+            phase: .planning,
+            gate: gate
+        )
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let store = BoardStore(
+            client: client,
+            persistence: persistence,
+            attachmentStorage: AttachmentStorage(
+                rootDirectory: directory.appendingPathComponent("attachments")
+            ),
+            drainStabilityDelay: .milliseconds(10)
+        )
+        store.start()
+        try await eventually { store.projects.contains(where: { $0.id == directory.path }) }
+
+        let taskID = try await store.createTask(
+            projectID: directory.path,
+            title: "Cancel before planning RPC",
+            sourceKind: .issue,
+            sourceText: "Do not start a turn after persisted cancellation",
+            autoRun: true
+        )
+        try await eventuallyPolicySaveBlocked(persistence)
+        let cancellation = Task { @MainActor in
+            await store.cancel(taskID: taskID)
+        }
+        try await eventually {
+            store.tasks.first(where: { $0.id == taskID })?.liveMessage
+                == "正在持久化停止意图…"
+        }
+        await gate.open()
+        await cancellation.value
+
+        try await eventually {
+            store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+        XCTAssertEqual(client.planningTurnCount, 0)
+        XCTAssertEqual(
+            store.tasks.first(where: { $0.id == taskID })?.runs.last?.outcome,
+            .interrupted
+        )
+    }
+
+    func testCancellationDuringExecutionPolicySavePreventsTurnStart() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = AsyncGate()
+        let persistence = PolicySaveGatePersistence(
+            initialSnapshot: BoardSnapshot(
+                version: BoardSnapshot.currentVersion,
+                tasks: [],
+                manualProjectPaths: [directory.path],
+                preferences: BoardPreferences()
+            ),
+            phase: .execution,
+            gate: gate
+        )
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let store = BoardStore(
+            client: client,
+            persistence: persistence,
+            attachmentStorage: AttachmentStorage(
+                rootDirectory: directory.appendingPathComponent("attachments")
+            ),
+            drainStabilityDelay: .milliseconds(10)
+        )
+        store.start()
+        try await eventually { store.projects.contains(where: { $0.id == directory.path }) }
+
+        let taskID = try await store.createTask(
+            projectID: directory.path,
+            title: "Cancel before execution RPC",
+            sourceKind: .issue,
+            sourceText: "Do not start execution after persisted cancellation",
+            autoRun: true
+        )
+        try await eventually { client.planningTurnCount == 1 }
+        client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Execute directly"
+        ))
+        client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventuallyPolicySaveBlocked(persistence)
+        let cancellation = Task { @MainActor in
+            await store.cancel(taskID: taskID)
+        }
+        try await eventually {
+            store.tasks.first(where: { $0.id == taskID })?.liveMessage
+                == "正在持久化停止意图…"
+        }
+        await gate.open()
+        await cancellation.value
+
+        try await eventually {
+            store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+        XCTAssertEqual(client.executionTurnCount, 0)
+        XCTAssertEqual(
+            store.tasks.first(where: { $0.id == taskID })?.runs.last?.outcome,
+            .interrupted
+        )
+    }
+
     func testImageTaskThreadStartTimeoutDoesNotCreateAutomaticRetry() async throws {
         let fixture = try Fixture(autoRunDefault: true)
         defer { fixture.cleanup() }
@@ -340,9 +460,10 @@ final class BoardStoreWorkflowTests: XCTestCase {
             status: "completed",
             error: nil
         ))
-        try await eventually { client.executionCalls.count == 1 }
+        try await eventually(timeout: 10) { client.executionCalls.count == 1 }
 
         let executing = try XCTUnwrap(store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertNil(executing.lastError, executing.lastError ?? "")
         let worktreePath = try XCTUnwrap(executing.workspace.path)
         XCTAssertNotEqual(worktreePath, projectURL.path)
         XCTAssertEqual(client.executionCalls[0].cwd, worktreePath)
@@ -379,12 +500,591 @@ final class BoardStoreWorkflowTests: XCTestCase {
             error: nil
         ))
         try await eventually { store.tasks.first(where: { $0.id == taskID })?.stage == .review }
+        store.deleteTask(taskID: taskID)
+        XCTAssertNotNil(store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertTrue(store.lastError?.contains("先在任务详情中安全清理") == true)
+
         await store.cleanupWorktree(taskID: taskID)
 
         let cleaned = try XCTUnwrap(store.tasks.first(where: { $0.id == taskID }))
         XCTAssertNil(cleaned.workspace.path)
         XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath))
         XCTAssertTrue(FileManager.default.fileExists(atPath: projectURL.path))
+    }
+
+    func testCleanupWorktreeSerializesCallsAndDefersTaskRestartUntilCleanupFinishes() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let taskID = UUID()
+        let cleanupGate = AsyncGate()
+        let manager = SuspendedCleanupWorktreeManager(gate: cleanupGate)
+        let workspace = TaskWorkspaceConfiguration(
+            kind: .worktree,
+            path: directory.appendingPathComponent("managed-worktree", isDirectory: true).path,
+            branch: "codex/task-\(taskID.uuidString.lowercased())",
+            baseBranch: "main",
+            preparation: TaskWorktreePreparation(
+                ownerTaskID: taskID,
+                repositoryPath: directory.path,
+                sourceCommit: "1111111111111111111111111111111111111111",
+                baselineCommit: "2222222222222222222222222222222222222222"
+            )
+        )
+        let task = BoardTask(
+            id: taskID,
+            projectID: directory.path,
+            title: "Cleanup race",
+            sourceKind: .issue,
+            sourceText: "Do not restart while cleanup is suspended",
+            stage: .review,
+            autoRun: false,
+            planText: "Preserve the isolated execution boundary",
+            hasFinalPlan: true,
+            threadID: "thread-cleanup-race",
+            workspace: workspace
+        )
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [task],
+            hosts: [.local],
+            manualProjects: [ManualProjectReference(path: directory.path)],
+            preferences: BoardPreferences()
+        ))
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let store = BoardStore(
+            client: client,
+            persistence: persistence,
+            worktreeManager: manager
+        )
+        store.start()
+        try await eventually { store.projects.contains(where: { $0.id == directory.path }) }
+        let loadedWorkspace = try XCTUnwrap(
+            store.tasks.first(where: { $0.id == taskID })?.workspace
+        )
+
+        let cleanupTask = Task { @MainActor in
+            await store.cleanupWorktree(taskID: taskID)
+        }
+        try await eventuallyCleanupCalls(manager, expected: 1)
+        let duplicateCleanupTask = Task { @MainActor in
+            await store.cleanupWorktree(taskID: taskID)
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        let cleanupCallCountWhileSuspended = await manager.cleanupCallCount()
+        XCTAssertEqual(cleanupCallCountWhileSuspended, 1)
+
+        XCTAssertFalse(store.requestChanges(taskID: taskID, feedback: "Restart immediately"))
+        store.continueExecution(taskID: taskID)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(client.readThreadCount, 0)
+        XCTAssertEqual(client.executionTurnCount, 0)
+
+        XCTAssertTrue(store.moveTask(taskID: taskID, to: .completed))
+        store.revisePlan(taskID: taskID)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(store.tasks.first(where: { $0.id == taskID })?.stage, .inbox)
+        XCTAssertEqual(client.planningTurnCount, 0)
+        XCTAssertEqual(store.tasks.first(where: { $0.id == taskID })?.workspace, loadedWorkspace)
+
+        await cleanupGate.open()
+        await cleanupTask.value
+        await duplicateCleanupTask.value
+
+        XCTAssertNil(store.tasks.first(where: { $0.id == taskID })?.workspace.path)
+        try await eventually { client.planningTurnCount == 1 }
+        XCTAssertNil(store.tasks.first(where: { $0.id == taskID })?.workspace.path)
+        let finalCleanupCallCount = await manager.cleanupCallCount()
+        XCTAssertEqual(finalCleanupCallCount, 1)
+    }
+
+    func testUnsupportedAndUnavailableWorktreeCapabilitiesRejectCreationWithoutStartingCodex() async throws {
+        let manager = ScriptedWorktreeManager(
+            capabilityScript: [
+                .unsupported(reason: "unsupported-worktree-sentinel"),
+                .unavailable(reason: "unavailable-worktree-sentinel")
+            ]
+        )
+        let fixture = try Fixture(
+            autoRunDefault: true,
+            isGitRepository: true,
+            worktreeManager: manager
+        )
+        defer { fixture.cleanup() }
+        try await eventually {
+            fixture.store.projects.first(where: { $0.id == fixture.projectPath })?.isGitRepository == true
+        }
+
+        for reason in ["unsupported-worktree-sentinel", "unavailable-worktree-sentinel"] {
+            do {
+                _ = try await fixture.store.createTask(
+                    projectID: fixture.projectPath,
+                    title: "Unavailable worktree",
+                    sourceKind: .issue,
+                    sourceText: "Must not fall back to the project checkout",
+                    autoRun: true,
+                    workspaceKind: .worktree
+                )
+                XCTFail("Worktree creation must fail closed when the required capability is not available")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains(reason))
+            }
+        }
+
+        let calls = await manager.callCounts()
+        XCTAssertEqual(calls.capability, 2)
+        XCTAssertEqual(calls.prepare, 0)
+        XCTAssertTrue(fixture.store.tasks.isEmpty)
+        XCTAssertEqual(fixture.client.threadStartCount, 0)
+        XCTAssertEqual(fixture.client.planningTurnCount, 0)
+        XCTAssertEqual(fixture.client.resumeThreadCount, 0)
+        XCTAssertEqual(fixture.client.executionTurnCount, 0)
+        XCTAssertTrue(fixture.client.executionCalls.isEmpty)
+    }
+
+    func testWorktreeCapabilityStatusIsNotOptimisticallySupportedBeforeProbe() async throws {
+        let manager = ScriptedWorktreeManager(
+            capabilityScript: [.supported(.managedV1)]
+        )
+        let gitFixture = try Fixture(
+            autoRunDefault: false,
+            isGitRepository: true,
+            worktreeManager: manager
+        )
+        defer { gitFixture.cleanup() }
+        try await eventually {
+            gitFixture.store.projects.first(where: { $0.id == gitFixture.projectPath })?
+                .isGitRepository == true
+        }
+
+        XCTAssertEqual(
+            gitFixture.store.worktreeCapabilityAvailability(for: gitFixture.projectPath),
+            .unavailable(reason: "尚未完成本机 Git HEAD 与 Worktree 能力探测。")
+        )
+        XCTAssertFalse(gitFixture.store.isProbingWorktreeCapability(for: gitFixture.projectPath))
+
+        let probed = await gitFixture.store.refreshWorktreeCapability(
+            projectID: gitFixture.projectPath
+        )
+
+        XCTAssertEqual(probed, .supported(.managedV1))
+        XCTAssertEqual(
+            gitFixture.store.worktreeCapabilityAvailability(for: gitFixture.projectPath),
+            .supported(.managedV1)
+        )
+        XCTAssertFalse(gitFixture.store.isProbingWorktreeCapability(for: gitFixture.projectPath))
+        let missingProject = await gitFixture.store.refreshWorktreeCapability(
+            projectID: "missing-project"
+        )
+        XCTAssertEqual(missingProject, .unavailable(reason: "项目尚未载入。"))
+        XCTAssertTrue(gitFixture.store.setHostEnabled(id: CodexHost.localID, enabled: false))
+        XCTAssertEqual(
+            gitFixture.store.worktreeCapabilityAvailability(for: gitFixture.projectPath),
+            .unavailable(reason: "项目所属主机已停用。")
+        )
+
+        let nonGitFixture = try Fixture(autoRunDefault: false)
+        defer { nonGitFixture.cleanup() }
+        try await eventually {
+            nonGitFixture.store.projects.contains(where: { $0.id == nonGitFixture.projectPath })
+        }
+        XCTAssertEqual(
+            nonGitFixture.store.worktreeCapabilityAvailability(for: nonGitFixture.projectPath),
+            .unsupported(reason: "所选项目不是 Git 仓库。")
+        )
+    }
+
+    func testNewerWorktreeCapabilityProbeAndCancellationRejectStaleResults() async throws {
+        let firstGate = AsyncGate()
+        let secondGate = AsyncGate()
+        let cancelledGate = AsyncGate()
+        let manager = ScriptedWorktreeManager(
+            capabilityScript: [
+                .unsupported(reason: "stale-probe-must-not-win"),
+                .supported(.managedV1),
+                .unsupported(reason: "cancelled-probe-must-not-win")
+            ],
+            capabilityGates: [firstGate, secondGate, cancelledGate]
+        )
+        let fixture = try Fixture(
+            autoRunDefault: false,
+            isGitRepository: true,
+            worktreeManager: manager
+        )
+        defer { fixture.cleanup() }
+        try await eventually {
+            fixture.store.projects.first(where: { $0.id == fixture.projectPath })?
+                .isGitRepository == true
+        }
+
+        let staleProbe = Task {
+            await fixture.store.refreshWorktreeCapability(projectID: fixture.projectPath)
+        }
+        try await eventuallyCapabilityCalls(manager, expected: 1)
+        XCTAssertTrue(fixture.store.isProbingWorktreeCapability(for: fixture.projectPath))
+        let currentProbe = Task {
+            await fixture.store.refreshWorktreeCapability(projectID: fixture.projectPath)
+        }
+        try await eventuallyCapabilityCalls(manager, expected: 2)
+        await secondGate.open()
+
+        let currentResult = await currentProbe.value
+        XCTAssertEqual(currentResult, .supported(.managedV1))
+        XCTAssertEqual(
+            fixture.store.worktreeCapabilityAvailability(for: fixture.projectPath),
+            .supported(.managedV1)
+        )
+        XCTAssertFalse(fixture.store.isProbingWorktreeCapability(for: fixture.projectPath))
+
+        await firstGate.open()
+        let staleResult = await staleProbe.value
+        XCTAssertNil(staleResult)
+        XCTAssertEqual(
+            fixture.store.worktreeCapabilityAvailability(for: fixture.projectPath),
+            .supported(.managedV1)
+        )
+
+        let cancelledProbe = Task {
+            await fixture.store.refreshWorktreeCapability(projectID: fixture.projectPath)
+        }
+        try await eventuallyCapabilityCalls(manager, expected: 3)
+        XCTAssertTrue(fixture.store.isProbingWorktreeCapability(for: fixture.projectPath))
+        cancelledProbe.cancel()
+        await cancelledGate.open()
+
+        let cancelledResult = await cancelledProbe.value
+        XCTAssertNil(cancelledResult)
+        XCTAssertEqual(
+            fixture.store.worktreeCapabilityAvailability(for: fixture.projectPath),
+            .supported(.managedV1)
+        )
+        XCTAssertFalse(fixture.store.isProbingWorktreeCapability(for: fixture.projectPath))
+    }
+
+    func testFreshWorktreeCapabilityDowngradeBlocksExecutionWithoutProjectFallback() async throws {
+        let manager = ScriptedWorktreeManager(
+            capabilityScript: [
+                .supported(.managedV1),
+                .unavailable(reason: "fresh-probe-downgrade-sentinel")
+            ]
+        )
+        let fixture = try Fixture(
+            autoRunDefault: true,
+            isGitRepository: true,
+            worktreeManager: manager
+        )
+        defer { fixture.cleanup() }
+        try await eventually {
+            fixture.store.projects.first(where: { $0.id == fixture.projectPath })?.isGitRepository == true
+        }
+
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Capability downgrade",
+            sourceKind: .issue,
+            sourceText: "Execute only in a verified worktree",
+            autoRun: true,
+            workspaceKind: .worktree
+        )
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Use the isolated workspace"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+        let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let calls = await manager.callCounts()
+        XCTAssertEqual(calls.capability, 2)
+        XCTAssertEqual(calls.prepare, 0)
+        XCTAssertTrue(task.lastError?.contains("fresh-probe-downgrade-sentinel") == true)
+        XCTAssertNil(task.workspace.path)
+        XCTAssertEqual(fixture.client.resumeThreadCount, 0)
+        XCTAssertEqual(fixture.client.executionTurnCount, 0)
+        XCTAssertTrue(fixture.client.executionCalls.isEmpty)
+    }
+
+    func testConcurrentWorktreeExecutionCapabilityProbesDoNotInvalidateEachOther() async throws {
+        let firstExecutionProbeGate = AsyncGate()
+        let secondExecutionProbeGate = AsyncGate()
+        let manager = ScriptedWorktreeManager(
+            capabilityScript: Array(
+                repeating: .supported(.managedV1),
+                count: 6
+            ),
+            capabilityGates: [
+                nil,
+                nil,
+                firstExecutionProbeGate,
+                secondExecutionProbeGate,
+                nil,
+                nil
+            ],
+            preparedRoot: FileManager.default.temporaryDirectory.appendingPathComponent(
+                "codexboard-concurrent-probes-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        )
+        let fixture = try Fixture(
+            autoRunDefault: true,
+            isGitRepository: true,
+            worktreeManager: manager
+        )
+        defer { fixture.cleanup() }
+        fixture.store.updatePreferences { $0.maxConcurrentExecutions = 2 }
+        try await eventually {
+            fixture.store.projects.first(where: { $0.id == fixture.projectPath })?
+                .isGitRepository == true
+        }
+
+        let firstTaskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "First isolated task",
+            sourceKind: .issue,
+            sourceText: "Execute the first change in a worktree",
+            autoRun: true,
+            workspaceKind: .worktree
+        )
+        let secondTaskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Second isolated task",
+            sourceKind: .issue,
+            sourceText: "Execute the second change in a worktree",
+            autoRun: true,
+            workspaceKind: .worktree
+        )
+        try await eventually { fixture.client.planningTurnCount == 2 }
+
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Prepare the first isolated workspace"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        fixture.client.send(.planFinal(
+            threadID: "thread-2",
+            turnID: "plan-2",
+            text: "Prepare the second isolated workspace"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-2",
+            turnID: "plan-2",
+            status: "completed",
+            error: nil
+        ))
+
+        try await eventuallyCapabilityCalls(manager, expected: 4)
+        let suspendedCalls = await manager.callCounts()
+        XCTAssertEqual(suspendedCalls.prepare, 0)
+        XCTAssertEqual(fixture.client.executionTurnCount, 0)
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == firstTaskID })?.stage,
+            .executing
+        )
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == secondTaskID })?.stage,
+            .executing
+        )
+
+        await firstExecutionProbeGate.open()
+        await secondExecutionProbeGate.open()
+
+        try await eventuallyWorktreeManagerCalls(
+            manager,
+            capability: 6,
+            prepare: 2
+        )
+        try await eventually { fixture.client.executionTurnCount == 2 }
+
+        let executedTasks = fixture.store.tasks.filter {
+            $0.id == firstTaskID || $0.id == secondTaskID
+        }
+        XCTAssertEqual(executedTasks.count, 2)
+        XCTAssertTrue(executedTasks.allSatisfy { $0.stage == .executing })
+        XCTAssertTrue(executedTasks.allSatisfy { $0.lastError == nil })
+        XCTAssertTrue(executedTasks.allSatisfy { $0.workspace.path != nil })
+        XCTAssertEqual(Set(fixture.client.executionCalls.map(\.cwd)).count, 2)
+        XCTAssertFalse(fixture.client.executionCalls.contains(where: {
+            $0.cwd == fixture.projectPath
+        }))
+    }
+
+    func testMalformedWorktreeManagerCannotFallBackToSourceProjectPath() async throws {
+        let manager = SourceFallbackWorktreeManager()
+        let fixture = try Fixture(
+            autoRunDefault: true,
+            isGitRepository: true,
+            worktreeManager: manager
+        )
+        defer { fixture.cleanup() }
+        try await eventually {
+            fixture.store.projects.first(where: { $0.id == fixture.projectPath })?
+                .isGitRepository == true
+        }
+
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Reject source fallback",
+            sourceKind: .issue,
+            sourceText: "Execution must remain isolated",
+            autoRun: true,
+            workspaceKind: .worktree
+        )
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Use a verified worktree"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
+        }
+        let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        XCTAssertNil(task.workspace.path)
+        XCTAssertTrue(task.lastError?.contains("不受 CodexBoard 管理") == true)
+        XCTAssertEqual(fixture.client.resumeThreadCount, 0)
+        XCTAssertEqual(fixture.client.executionTurnCount, 0)
+        XCTAssertTrue(fixture.client.executionCalls.isEmpty)
+    }
+
+    func testPreparedWorktreeDescriptorIsPersistedBeforeExecutionThreadResumeGateOpens() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try runGit(["-C", directory.path, "init", "-b", "main"])
+        let manager = ScriptedWorktreeManager(
+            capabilityScript: [
+                .supported(.managedV1),
+                .supported(.managedV1),
+                .supported(.managedV1)
+            ],
+            preparedRoot: directory.deletingLastPathComponent().appendingPathComponent(
+                "\(directory.lastPathComponent)-managed-worktrees",
+                isDirectory: true
+            )
+        )
+        let persistence = RecordingBoardPersistence(initialSnapshot: BoardSnapshot(
+            version: BoardSnapshot.currentVersion,
+            tasks: [],
+            manualProjectPaths: [directory.path],
+            preferences: BoardPreferences()
+        ))
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let resumeGate = AsyncGate()
+        client.resumeThreadGate = resumeGate
+        let store = BoardStore(
+            client: client,
+            persistence: persistence,
+            attachmentStorage: AttachmentStorage(rootDirectory: directory.appendingPathComponent("attachments")),
+            worktreeManager: manager,
+            drainStabilityDelay: .milliseconds(10)
+        )
+        store.start()
+        try await eventually {
+            store.projects.first(where: { $0.id == directory.path })?.isGitRepository == true
+        }
+
+        let taskID = try await store.createTask(
+            projectID: directory.path,
+            title: "Persist prepared descriptor",
+            sourceKind: .issue,
+            sourceText: "Resume only after the prepared workspace is durable",
+            autoRun: true,
+            workspaceKind: .worktree
+        )
+        try await eventually { client.planningTurnCount == 1 }
+        client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Use the isolated workspace"
+        ))
+        client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually { client.resumeThreadCount == 1 }
+
+        let persistedTask = await persistence.lastSnapshot?.tasks.first(where: { $0.id == taskID })
+        let preparedWorkspace = await manager.lastPreparedWorkspace()
+        await resumeGate.open()
+
+        XCTAssertEqual(persistedTask?.workspace.path, preparedWorkspace?.path)
+        XCTAssertEqual(persistedTask?.workspace.preparation, preparedWorkspace?.preparation)
+        XCTAssertEqual(persistedTask?.workspace.preparation?.ownerTaskID, taskID)
+        XCTAssertEqual(persistedTask?.workspace.preparation?.capability, .managedV1)
+        XCTAssertEqual(persistedTask?.workspace.preparation?.repositoryPath, directory.path)
+        let persistedExecutionRun = persistedTask?.runs.last(where: { $0.phase == .execution })
+        XCTAssertEqual(
+            persistedExecutionRun?.policySnapshot?.workspace.preparation,
+            preparedWorkspace?.preparation
+        )
+        XCTAssertEqual(
+            persistedExecutionRun?.policySnapshot?.workspace.path,
+            preparedWorkspace?.path
+        )
+        try await eventually { client.executionTurnCount == 1 }
+    }
+
+    func testDirectProjectExecutionBypassesWorktreeCapabilityAndPreparation() async throws {
+        let manager = ScriptedWorktreeManager(
+            capabilityScript: [.unavailable(reason: "direct-task-must-not-probe")]
+        )
+        let fixture = try Fixture(
+            autoRunDefault: true,
+            isGitRepository: true,
+            worktreeManager: manager
+        )
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+
+        _ = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Direct project task",
+            sourceKind: .issue,
+            sourceText: "Use the selected project directly",
+            autoRun: true,
+            workspaceKind: .project
+        )
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Use the project workspace"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually { fixture.client.executionTurnCount == 1 }
+
+        let calls = await manager.callCounts()
+        XCTAssertEqual(calls.capability, 0)
+        XCTAssertEqual(calls.prepare, 0)
+        XCTAssertEqual(fixture.client.resumeThreadCount, 1)
+        XCTAssertEqual(fixture.client.executionCalls.first?.cwd, fixture.projectPath)
     }
 
     func testManualTaskWaitsInInboxUntilExplicitlyStartedAndThenRequiresConfirmation() async throws {
@@ -3184,6 +3884,12 @@ final class BoardStoreWorkflowTests: XCTestCase {
         ))
         let localClient = MockCodexTaskClient(projectPath: directory.path)
         let remoteClient = MockCodexTaskClient(projectPath: directory.path)
+        remoteClient.projectPathInfoByPath[directory.path] = CodexProjectPathInfo(
+            canonicalWorkingDirectory: directory.path,
+            projectPath: directory.path,
+            exists: true,
+            isGitRepository: true
+        )
         let store = BoardStore(
             client: localClient,
             persistence: persistence,
@@ -3218,13 +3924,13 @@ final class BoardStoreWorkflowTests: XCTestCase {
                 projectID: remoteProject.id,
                 title: "Remote worktree",
                 sourceKind: .issue,
-                sourceText: "Do not create a local worktree",
+                sourceText: "Require an explicitly advertised remote worktree capability",
                 autoRun: false,
                 workspaceKind: .worktree
             )
-            XCTFail("Remote tasks must reject local worktree management")
+            XCTFail("Remote tasks must fail closed when the host does not advertise the required capability")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("远程任务暂不支持"))
+            XCTAssertTrue(error.localizedDescription.contains(WorktreeCapability.managedV1.token))
         }
 
         let localSkill = CodexSkillMetadata(
@@ -4753,6 +5459,74 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTFail("Condition was not met before timeout", file: file, line: line)
     }
 
+    private func eventuallyCapabilityCalls(
+        _ manager: ScriptedWorktreeManager,
+        expected: Int,
+        timeout: TimeInterval = 2,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await manager.callCounts().capability == expected { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Capability call count did not reach \(expected)", file: file, line: line)
+    }
+
+    private func eventuallyWorktreeManagerCalls(
+        _ manager: ScriptedWorktreeManager,
+        capability: Int,
+        prepare: Int,
+        timeout: TimeInterval = 2,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let expected = WorktreeManagerCallCounts(
+            capability: capability,
+            prepare: prepare
+        )
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await manager.callCounts() == expected { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail(
+            "Worktree manager calls did not reach \(expected)",
+            file: file,
+            line: line
+        )
+    }
+
+    private func eventuallyCleanupCalls(
+        _ manager: SuspendedCleanupWorktreeManager,
+        expected: Int,
+        timeout: TimeInterval = 2,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await manager.cleanupCallCount() == expected { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Cleanup call count did not reach \(expected)", file: file, line: line)
+    }
+
+    private func eventuallyPolicySaveBlocked(
+        _ persistence: PolicySaveGatePersistence,
+        timeout: TimeInterval = 2,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await persistence.isBlocking() { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Policy save did not reach the gate", file: file, line: line)
+    }
+
     private func observedUsage(
         totalTokens: Int64,
         lastTokens: Int64
@@ -4825,6 +5599,45 @@ private actor RecordingBoardPersistence: BoardPersisting {
     }
 }
 
+private actor PolicySaveGatePersistence: BoardPersisting {
+    private let initialSnapshot: BoardSnapshot
+    private let phase: TaskRunPhase
+    private let gate: AsyncGate
+    private var didBlock = false
+    private var blocking = false
+
+    init(
+        initialSnapshot: BoardSnapshot,
+        phase: TaskRunPhase,
+        gate: AsyncGate
+    ) {
+        self.initialSnapshot = initialSnapshot
+        self.phase = phase
+        self.gate = gate
+    }
+
+    func load() -> BoardSnapshot { initialSnapshot }
+
+    func save(_ snapshot: BoardSnapshot) async {
+        guard !didBlock,
+              snapshot.tasks.contains(where: { task in
+                  task.runs.contains(where: { run in
+                      run.phase == phase
+                          && run.outcome.isActive
+                          && run.policySnapshot != nil
+                          && run.turnID == nil
+                  })
+              })
+        else { return }
+        didBlock = true
+        blocking = true
+        await gate.wait()
+        blocking = false
+    }
+
+    func isBlocking() -> Bool { blocking }
+}
+
 private struct MockThreadStartCall {
     let cwd: String
     let model: String?
@@ -4861,6 +5674,13 @@ private actor StubWorktreeManager: WorktreeManaging {
         self.root = root
     }
 
+    func capability(
+        projectPath _: String,
+        requiredCapability: WorktreeCapability
+    ) async -> WorktreeCapabilityAvailability {
+        .supported(requiredCapability)
+    }
+
     func prepare(
         taskID: UUID,
         projectPath: String,
@@ -4871,7 +5691,13 @@ private actor StubWorktreeManager: WorktreeManaging {
             kind: .worktree,
             path: root.appendingPathComponent(taskID.uuidString, isDirectory: true).path,
             branch: "codex/task-\(taskID.uuidString.prefix(8).lowercased())",
-            baseBranch: "main"
+            baseBranch: "main",
+            preparation: TaskWorktreePreparation(
+                ownerTaskID: taskID,
+                repositoryPath: projectPath,
+                sourceCommit: "1111111111111111111111111111111111111111",
+                baselineCommit: "2222222222222222222222222222222222222222"
+            )
         )
     }
 
@@ -4884,6 +5710,230 @@ private actor StubWorktreeManager: WorktreeManaging {
         configuration: TaskWorkspaceConfiguration
     ) async throws -> TaskWorkspaceConfiguration {
         TaskWorkspaceConfiguration(kind: configuration.kind)
+    }
+}
+
+private actor SuspendedCleanupWorktreeManager: WorktreeManaging {
+    private let gate: AsyncGate
+    private var cleanupCalls = 0
+
+    init(gate: AsyncGate) {
+        self.gate = gate
+    }
+
+    func capability(
+        projectPath _: String,
+        requiredCapability: WorktreeCapability
+    ) async -> WorktreeCapabilityAvailability {
+        .supported(requiredCapability)
+    }
+
+    func prepare(
+        taskID _: UUID,
+        projectPath _: String,
+        configuration: TaskWorkspaceConfiguration
+    ) async throws -> TaskWorkspaceConfiguration {
+        configuration
+    }
+
+    func status(configuration _: TaskWorkspaceConfiguration) async throws -> WorktreeStatus {
+        WorktreeStatus(isClean: true, changes: [])
+    }
+
+    func cleanup(
+        projectPath _: String,
+        configuration: TaskWorkspaceConfiguration
+    ) async throws -> TaskWorkspaceConfiguration {
+        cleanupCalls += 1
+        await gate.wait()
+        var cleaned = configuration
+        cleaned.path = nil
+        return cleaned
+    }
+
+    func cleanupCallCount() -> Int { cleanupCalls }
+}
+
+private actor SourceFallbackWorktreeManager: WorktreeManaging {
+    func capability(
+        projectPath _: String,
+        requiredCapability: WorktreeCapability
+    ) async -> WorktreeCapabilityAvailability {
+        .supported(requiredCapability)
+    }
+
+    func prepare(
+        taskID: UUID,
+        projectPath: String,
+        configuration: TaskWorkspaceConfiguration
+    ) async throws -> TaskWorkspaceConfiguration {
+        guard configuration.kind == .worktree else { return .project }
+        return TaskWorkspaceConfiguration(
+            kind: .worktree,
+            path: projectPath,
+            branch: "codex/task-\(taskID.uuidString.prefix(8).lowercased())",
+            baseBranch: "main",
+            preparation: TaskWorktreePreparation(
+                ownerTaskID: taskID,
+                repositoryPath: projectPath,
+                sourceCommit: "1111111111111111111111111111111111111111",
+                baselineCommit: "2222222222222222222222222222222222222222"
+            )
+        )
+    }
+
+    func status(configuration _: TaskWorkspaceConfiguration) async throws -> WorktreeStatus {
+        WorktreeStatus(isClean: true, changes: [])
+    }
+
+    func cleanup(
+        projectPath _: String,
+        configuration: TaskWorkspaceConfiguration
+    ) async throws -> TaskWorkspaceConfiguration {
+        TaskWorkspaceConfiguration(kind: configuration.kind)
+    }
+}
+
+private struct WorktreeManagerCallCounts: Equatable, Sendable {
+    let capability: Int
+    let prepare: Int
+}
+
+private actor ScriptedWorktreeManager: WorktreeManaging {
+    private var capabilityScript: [WorktreeCapabilityAvailability]
+    private var capabilityGates: [AsyncGate?]
+    private let preparedRoot: URL
+    private var capabilityCallCount = 0
+    private var prepareCallCount = 0
+    private var preparedWorkspace: TaskWorkspaceConfiguration?
+
+    init(
+        capabilityScript: [WorktreeCapabilityAvailability],
+        capabilityGates: [AsyncGate?] = [],
+        preparedRoot: URL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexboard-scripted-worktrees", isDirectory: true)
+    ) {
+        self.capabilityScript = capabilityScript
+        self.capabilityGates = capabilityGates
+        self.preparedRoot = preparedRoot
+    }
+
+    func capability(
+        projectPath _: String,
+        requiredCapability _: WorktreeCapability
+    ) async -> WorktreeCapabilityAvailability {
+        capabilityCallCount += 1
+        guard !capabilityScript.isEmpty else {
+            return .unavailable(reason: "unexpected-extra-capability-probe")
+        }
+        let result = capabilityScript.removeFirst()
+        let gate = capabilityGates.isEmpty ? nil : capabilityGates.removeFirst()
+        if let gate {
+            await gate.wait()
+        }
+        return result
+    }
+
+    func prepare(
+        taskID: UUID,
+        projectPath: String,
+        configuration: TaskWorkspaceConfiguration
+    ) async throws -> TaskWorkspaceConfiguration {
+        prepareCallCount += 1
+        guard configuration.kind == .worktree else { return .project }
+        return makePreparedWorkspace(
+            taskID: taskID,
+            projectPath: projectPath,
+            configuration: configuration,
+            requiredCapability: .managedV1
+        )
+    }
+
+    func prepare(
+        taskID: UUID,
+        projectPath: String,
+        configuration: TaskWorkspaceConfiguration,
+        requiredCapability: WorktreeCapability
+    ) async throws -> TaskWorkspaceConfiguration {
+        try await requireCapability(projectPath: projectPath, requiredCapability: requiredCapability)
+        prepareCallCount += 1
+        guard configuration.kind == .worktree else { return .project }
+        return makePreparedWorkspace(
+            taskID: taskID,
+            projectPath: projectPath,
+            configuration: configuration,
+            requiredCapability: requiredCapability
+        )
+    }
+
+    func status(configuration _: TaskWorkspaceConfiguration) async throws -> WorktreeStatus {
+        WorktreeStatus(isClean: true, changes: [])
+    }
+
+    func cleanup(
+        projectPath _: String,
+        configuration: TaskWorkspaceConfiguration
+    ) async throws -> TaskWorkspaceConfiguration {
+        TaskWorkspaceConfiguration(kind: configuration.kind)
+    }
+
+    func callCounts() -> WorktreeManagerCallCounts {
+        WorktreeManagerCallCounts(
+            capability: capabilityCallCount,
+            prepare: prepareCallCount
+        )
+    }
+
+    func lastPreparedWorkspace() -> TaskWorkspaceConfiguration? {
+        preparedWorkspace
+    }
+
+    private func requireCapability(
+        projectPath: String,
+        requiredCapability: WorktreeCapability
+    ) async throws {
+        switch await capability(
+            projectPath: projectPath,
+            requiredCapability: requiredCapability
+        ) {
+        case let .supported(actual) where actual == requiredCapability:
+            return
+        case let .supported(actual):
+            throw WorktreeManagerError.capabilityMismatch(
+                required: requiredCapability,
+                actual: actual
+            )
+        case let .unsupported(reason):
+            throw WorktreeManagerError.capabilityUnsupported(reason)
+        case let .unavailable(reason):
+            throw WorktreeManagerError.capabilityUnavailable(reason)
+        }
+    }
+
+    private func makePreparedWorkspace(
+        taskID: UUID,
+        projectPath: String,
+        configuration: TaskWorkspaceConfiguration,
+        requiredCapability: WorktreeCapability
+    ) -> TaskWorkspaceConfiguration {
+        let workspace = TaskWorkspaceConfiguration(
+            kind: .worktree,
+            path: preparedRoot.appendingPathComponent(taskID.uuidString, isDirectory: true).path,
+            branch: configuration.branch ?? "codex/task-\(taskID.uuidString.prefix(8).lowercased())",
+            baseBranch: configuration.baseBranch ?? "main",
+            preparation: TaskWorktreePreparation(
+                capability: requiredCapability,
+                ownerTaskID: taskID,
+                repositoryPath: projectPath,
+                sourceCommit: "1111111111111111111111111111111111111111",
+                baselineCommit: "2222222222222222222222222222222222222222",
+                dirtyBaseCaptured: true,
+                untrackedFilesCaptured: 1,
+                preparedAt: Date(timeIntervalSince1970: 1_700_000_000)
+            )
+        )
+        preparedWorkspace = workspace
+        return workspace
     }
 }
 
@@ -4912,6 +5962,7 @@ private final class MockCodexTaskClient: CodexTaskClient {
     var planningCalls: [MockTurnCall] = []
     var executionCalls: [MockTurnCall] = []
     var planningFailures: [MockClientError] = []
+    var projectPathInfoByPath: [String: CodexProjectPathInfo] = [:]
     var modelIDs = ["gpt-test"]
     var listModelsCallCount = 0
     var listModelsGate: AsyncGate?
@@ -4941,6 +5992,7 @@ private final class MockCodexTaskClient: CodexTaskClient {
     var readThreadGate: AsyncGate?
     var remoteOperations: [MockRemoteOperation] = []
     var resumeThreadCount = 0
+    var resumeThreadGate: AsyncGate?
     var planningTurnError: Error?
     var listThreadsGate: AsyncGate?
     var threadDetails: [String: CodexThreadDetail] = [:]
@@ -4959,6 +6011,14 @@ private final class MockCodexTaskClient: CodexTaskClient {
     func disconnect() {
         disconnectCount += 1
         connectionState = .disconnected
+    }
+    func inspectProjectPath(_ path: String) async throws -> CodexProjectPathInfo {
+        projectPathInfoByPath[path] ?? CodexProjectPathInfo(
+            canonicalWorkingDirectory: path,
+            projectPath: path,
+            exists: true,
+            isGitRepository: false
+        )
     }
     func verifyAccount() async throws -> Bool { true }
     func listModels() async throws -> [CodexModel] {
@@ -5094,6 +6154,9 @@ private final class MockCodexTaskClient: CodexTaskClient {
     }
     func resumeThread(threadID: String, cwd: String) async throws -> CodexStartedThread {
         resumeThreadCount += 1
+        if let resumeThreadGate {
+            await resumeThreadGate.wait()
+        }
         return CodexStartedThread(
             threadID: threadID,
             sessionID: "session-1",

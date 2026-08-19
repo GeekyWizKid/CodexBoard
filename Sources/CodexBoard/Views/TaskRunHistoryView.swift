@@ -74,6 +74,24 @@ private struct TaskRunHistoryRow: View {
             if let endedAt = run.endedAt {
                 metadata("耗时", duration(from: run.startedAt, to: endedAt))
             }
+            if let preparation = run.policySnapshot?.workspace.preparation {
+                metadata(
+                    "来源提交",
+                    gitRevisionPrefix(preparation.sourceCommit),
+                    fullValue: preparation.sourceCommit
+                )
+                metadata(
+                    "基线提交",
+                    gitRevisionPrefix(preparation.baselineCommit),
+                    fullValue: preparation.baselineCommit
+                )
+                metadata(
+                    "初始状态",
+                    preparation.dirtyBaseCaptured
+                        ? "已捕获执行前改动 · 非忽略未跟踪文件 \(preparation.untrackedFilesCaptured) 个"
+                        : "Git 状态干净（忽略文件不计）"
+                )
+            }
         }
     }
 
@@ -109,20 +127,33 @@ private struct TaskRunHistoryRow: View {
         }
     }
 
-    private func metadata(_ label: String, _ value: String) -> some View {
-        HStack(alignment: .firstTextBaseline) {
+    private func metadata(
+        _ label: String,
+        _ value: String,
+        fullValue: String? = nil
+    ) -> some View {
+        let accessibleValue = fullValue ?? value
+        return HStack(alignment: .firstTextBaseline) {
             Text(LocalizedStringKey(label))
                 .foregroundStyle(.secondary)
             Spacer()
             Text(value)
                 .font(.caption2.monospaced())
                 .textSelection(.enabled)
+                .help(accessibleValue)
         }
         .font(.caption2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue(accessibleValue)
     }
 
     private func shortID(_ value: String) -> String {
         value.count > 16 ? "\(value.prefix(8))…\(value.suffix(6))" : value
+    }
+
+    private func gitRevisionPrefix(_ value: String) -> String {
+        value.count > 12 ? String(value.prefix(12)) : value
     }
 
     private func duration(from start: Date, to end: Date) -> String {
