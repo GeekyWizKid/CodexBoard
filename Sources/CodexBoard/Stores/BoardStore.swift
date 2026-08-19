@@ -1347,6 +1347,10 @@ final class BoardStore {
                         return
 
                     case "inprogress", "running", "active", "pending", "queued":
+                        restoreExecutionRunForConfirmedTurn(
+                            at: currentIndex,
+                            turnID: candidateTurn.id
+                        )
                         tasks[currentIndex].stage = .executing
                         tasks[currentIndex].executionApproved = false
                         tasks[currentIndex].lastError = nil
@@ -1804,6 +1808,12 @@ final class BoardStore {
                     )
 
                 case "inprogress", "running", "active", "pending", "queued":
+                    if taskSnapshot.stage == .executing {
+                        restoreExecutionRunForConfirmedTurn(
+                            at: currentIndex,
+                            turnID: turn.id
+                        )
+                    }
                     let resumed = try await hostClient.resumeThread(
                         threadID: threadID,
                         cwd: detail.summary.cwd
@@ -3027,6 +3037,15 @@ final class BoardStore {
     ) {
         guard let runIndex = tasks[taskIndex].runs.lastIndex(where: { $0.phase == .execution }) else { return }
         mutate(&tasks[taskIndex].runs[runIndex])
+    }
+
+    private func restoreExecutionRunForConfirmedTurn(at taskIndex: Int, turnID: String) {
+        guard let runIndex = tasks[taskIndex].runs.lastIndex(where: {
+            $0.phase == .execution && $0.turnID == turnID
+        }) else { return }
+        tasks[taskIndex].runs[runIndex].outcome = .running
+        tasks[taskIndex].runs[runIndex].endedAt = nil
+        tasks[taskIndex].runs[runIndex].error = nil
     }
 
     private func finishActiveRun(

@@ -1403,7 +1403,10 @@ final class BoardStoreWorkflowTests: XCTestCase {
     }
 
     func testStartupReattachesInProgressPersistedTurnWithoutDuplicateExecution() async throws {
-        let fixture = try await persistedExecutionFixture(status: "inProgress")
+        let fixture = try await persistedExecutionFixture(
+            status: "inProgress",
+            includeClosedExecutionRun: true
+        )
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
 
         fixture.store.start()
@@ -1416,6 +1419,11 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(task.executionTurnID, "turn-persisted")
         XCTAssertNil(task.lastError)
         XCTAssertTrue(task.liveMessage.contains("恢复"))
+        let run = try XCTUnwrap(task.runs.last(where: { $0.phase == .execution }))
+        XCTAssertEqual(run.id, fixture.executionRunID)
+        XCTAssertEqual(run.outcome, .running)
+        XCTAssertNil(run.endedAt)
+        XCTAssertNil(run.error)
     }
 
     func testStartupFailsClosedForInterruptedPersistedTurn() async throws {
@@ -3601,6 +3609,12 @@ final class BoardStoreWorkflowTests: XCTestCase {
         try await eventually {
             fixture.store.tasks.first(where: { $0.id == taskID })?.stage == .needsAttention
         }
+        let closedTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let closedRun = try XCTUnwrap(closedTask.runs.last(where: { $0.phase == .execution }))
+        let executionRunID = closedRun.id
+        XCTAssertEqual(closedRun.outcome, .failed)
+        XCTAssertNotNil(closedRun.endedAt)
+        XCTAssertNotNil(closedRun.error)
 
         fixture.store.continueExecution(taskID: taskID)
         try await eventually {
@@ -3612,6 +3626,14 @@ final class BoardStoreWorkflowTests: XCTestCase {
             fixture.store.tasks.first(where: { $0.id == taskID })?.executionTurnID,
             "execute-1"
         )
+        let resumedTask = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let executionRuns = resumedTask.runs.filter { $0.phase == .execution }
+        XCTAssertEqual(executionRuns.count, 1)
+        let resumedRun = try XCTUnwrap(executionRuns.first)
+        XCTAssertEqual(resumedRun.id, executionRunID)
+        XCTAssertEqual(resumedRun.outcome, .running)
+        XCTAssertNil(resumedRun.endedAt)
+        XCTAssertNil(resumedRun.error)
     }
 
     private func makeThreadDetail(
@@ -3649,16 +3671,34 @@ final class BoardStoreWorkflowTests: XCTestCase {
 
     private func persistedExecutionFixture(
         status: String,
-        finalText: String? = nil
+        finalText: String? = nil,
+        includeClosedExecutionRun: Bool = false
     ) async throws -> (
         directory: URL,
         taskID: UUID,
+        executionRunID: UUID,
         client: MockCodexTaskClient,
         store: BoardStore
     ) {
         let directory = try temporaryDirectory()
         let threadID = "thread-persisted"
         let turnID = "turn-persisted"
+        let executionRunID = UUID()
+        let executionRuns = includeClosedExecutionRun ? [TaskRun(
+            id: executionRunID,
+            phase: .execution,
+            attempt: 1,
+            endedAt: Date(),
+            outcome: .failed,
+            threadID: threadID,
+            sessionID: "session-before-relaunch",
+            turnID: turnID,
+            model: "gpt-test",
+            reasoningEffort: .medium,
+            fastMode: false,
+            summary: "Connection was lost",
+            error: "Connection was lost"
+        )] : []
         let task = BoardTask(
             projectID: directory.path,
             title: "Persisted execution",
@@ -3671,7 +3711,8 @@ final class BoardStoreWorkflowTests: XCTestCase {
             hasFinalPlan: true,
             threadID: threadID,
             sessionID: "session-before-relaunch",
-            executionTurnID: turnID
+            executionTurnID: turnID,
+            runs: executionRuns
         )
         let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
         try await persistence.save(BoardSnapshot(
@@ -3691,6 +3732,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
         return (
             directory: directory,
             taskID: task.id,
+            executionRunID: executionRunID,
             client: client,
             store: BoardStore(client: client, persistence: persistence)
         )
