@@ -2370,7 +2370,7 @@ final class BoardStore {
             flushPendingStreamUpdates()
             guard let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             completeTurn(at: index, turnID: turnID, status: status, error: error)
-        case .threadStatus:
+        case .threadStarted, .collabAgentToolCall, .subAgentActivity, .tokenUsageUpdated, .threadStatus:
             break
         case let .interactionRequested(request):
             guard let index = taskIndex(

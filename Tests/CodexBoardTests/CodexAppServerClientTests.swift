@@ -1038,4 +1038,220 @@ final class CodexAppServerClientTests: XCTestCase {
             ])
         ))
     }
+
+    func testStructuredProtocolEventParsesSubagentThreadStarted() throws {
+        let notification = try JSONDecoder().decode(JSONValue.self, from: Data(#"""
+        {
+          "method": "thread/started",
+          "params": {
+            "thread": {
+              "id": "child-1",
+              "sessionId": "root-1",
+              "forkedFromId": null,
+              "parentThreadId": "root-1",
+              "preview": "",
+              "ephemeral": false,
+              "section": null,
+              "sectionEnteredAt": null,
+              "modelProvider": "openai",
+              "createdAt": 1770000000,
+              "updatedAt": 1770000001,
+              "recencyAt": 1770000001,
+              "status": {"type": "active", "activeFlags": []},
+              "path": null,
+              "cwd": "/srv/project",
+              "cliVersion": "0.148.0",
+              "source": {
+                "subAgent": {
+                  "thread_spawn": {
+                    "parent_thread_id": "root-1",
+                    "depth": 1,
+                    "agent_path": "/root/protocol_events",
+                    "agent_nickname": "Popper",
+                    "agent_role": "explorer"
+                  }
+                }
+              },
+              "threadSource": null,
+              "agentNickname": "Popper",
+              "agentRole": "explorer",
+              "gitInfo": null,
+              "name": null,
+              "turns": []
+            }
+          }
+        }
+        """#.utf8))
+        let method = try XCTUnwrap(notification["method"]?.stringValue)
+        let params = try XCTUnwrap(notification["params"])
+        let event = try XCTUnwrap(CodexAppServerClient.structuredProtocolEvent(
+            method: method,
+            params: params
+        ))
+
+        guard case let .threadStarted(thread) = event else {
+            return XCTFail("thread/started must preserve the nested thread")
+        }
+        XCTAssertEqual(thread.id, "child-1")
+        XCTAssertEqual(thread.sessionID, "root-1")
+        XCTAssertEqual(thread.parentThreadID, "root-1")
+        XCTAssertEqual(thread.agentNickname, "Popper")
+        XCTAssertEqual(thread.agentRole, "explorer")
+        XCTAssertEqual(thread.sourceKind, "subAgent")
+    }
+
+    func testStructuredProtocolEventPreservesCollabWireStringsAndLifecycle() throws {
+        let event = try XCTUnwrap(CodexAppServerClient.structuredProtocolEvent(
+            method: "item/started",
+            params: .object([
+                "threadId": .string("root-1"),
+                "turnId": .string("turn-1"),
+                "startedAtMs": .integer(1_770_000_000_123),
+                "item": .object([
+                    "type": .string("collabAgentToolCall"),
+                    "id": .string("call-1"),
+                    "tool": .string("futureTool"),
+                    "status": .string("futureStatus"),
+                    "senderThreadId": .string("root-1"),
+                    "receiverThreadIds": .array([.string("child-1")]),
+                    "prompt": .null,
+                    "model": .string("future-model"),
+                    "agentsStates": .object([
+                        "child-1": .object([
+                            "status": .string("futureAgentStatus"),
+                            "message": .null
+                        ])
+                    ])
+                ])
+            ])
+        ))
+
+        guard case let .collabAgentToolCall(threadID, turnID, lifecycle, call) = event else {
+            return XCTFail("collab item must map to a structured event")
+        }
+        XCTAssertEqual(threadID, "root-1")
+        XCTAssertEqual(turnID, "turn-1")
+        XCTAssertEqual(lifecycle, .started(atMilliseconds: 1_770_000_000_123))
+        XCTAssertEqual(call.tool, "futureTool")
+        XCTAssertEqual(call.status, "futureStatus")
+        XCTAssertEqual(call.receiverThreadIDs, ["child-1"])
+        XCTAssertNil(call.prompt)
+        XCTAssertEqual(call.model, "future-model")
+        XCTAssertNil(call.reasoningEffort)
+        XCTAssertEqual(call.agentStates["child-1"]?.status, "futureAgentStatus")
+    }
+
+    func testStructuredProtocolEventParsesCompletedCollabLifecycle() throws {
+        let event = try XCTUnwrap(CodexAppServerClient.structuredProtocolEvent(
+            method: "item/completed",
+            params: .object([
+                "threadId": .string("root-1"),
+                "turnId": .string("turn-1"),
+                "completedAtMs": .integer(1_770_000_000_456),
+                "item": .object([
+                    "type": .string("collabAgentToolCall"),
+                    "id": .string("call-1"),
+                    "tool": .string("spawnAgent"),
+                    "status": .string("completed"),
+                    "senderThreadId": .string("root-1"),
+                    "receiverThreadIds": .array([.string("child-1")]),
+                    "agentsStates": .object([
+                        "child-1": .object(["status": .string("completed")])
+                    ])
+                ])
+            ])
+        ))
+
+        guard case let .collabAgentToolCall(_, _, lifecycle, call) = event else {
+            return XCTFail("completed collab item must preserve its lifecycle timestamp")
+        }
+        XCTAssertEqual(lifecycle, .completed(atMilliseconds: 1_770_000_000_456))
+        XCTAssertEqual(call.status, "completed")
+    }
+
+    func testStructuredProtocolEventParsesSubAgentActivity() throws {
+        let event = try XCTUnwrap(CodexAppServerClient.structuredProtocolEvent(
+            method: "item/started",
+            params: .object([
+                "threadId": .string("root-1"),
+                "turnId": .string("turn-1"),
+                "startedAtMs": .integer(1_770_000_000_789),
+                "item": .object([
+                    "type": .string("subAgentActivity"),
+                    "id": .string("activity-1"),
+                    "agentThreadId": .string("child-1"),
+                    "agentPath": .string("/root/child"),
+                    "kind": .string("interacted")
+                ])
+            ])
+        ))
+
+        guard case let .subAgentActivity(threadID, turnID, lifecycle, activity) = event else {
+            return XCTFail("sub-agent activity must map to a structured event")
+        }
+        XCTAssertEqual(threadID, "root-1")
+        XCTAssertEqual(turnID, "turn-1")
+        XCTAssertEqual(lifecycle, .started(atMilliseconds: 1_770_000_000_789))
+        XCTAssertEqual(activity.id, "activity-1")
+        XCTAssertEqual(activity.agentThreadID, "child-1")
+        XCTAssertEqual(activity.agentPath, "/root/child")
+        XCTAssertEqual(activity.kind, "interacted")
+    }
+
+    func testStructuredProtocolEventParsesTokenUsageAndDefaultsCacheWrite() throws {
+        let event = try XCTUnwrap(CodexAppServerClient.structuredProtocolEvent(
+            method: "thread/tokenUsage/updated",
+            params: .object([
+                "threadId": .string("thread-1"),
+                "turnId": .string("turn-1"),
+                "tokenUsage": .object([
+                    "total": .object([
+                        "totalTokens": .integer(1_200),
+                        "inputTokens": .integer(900),
+                        "cachedInputTokens": .integer(300),
+                        "cacheWriteInputTokens": .integer(20),
+                        "outputTokens": .integer(250),
+                        "reasoningOutputTokens": .integer(50)
+                    ]),
+                    "last": .object([
+                        "totalTokens": .integer(240),
+                        "inputTokens": .integer(180),
+                        "cachedInputTokens": .integer(60),
+                        "outputTokens": .integer(50),
+                        "reasoningOutputTokens": .integer(10)
+                    ]),
+                    "modelContextWindow": .integer(353_400)
+                ])
+            ])
+        ))
+
+        guard case let .tokenUsageUpdated(threadID, turnID, usage) = event else {
+            return XCTFail("token usage notification must map to a structured event")
+        }
+        XCTAssertEqual(threadID, "thread-1")
+        XCTAssertEqual(turnID, "turn-1")
+        XCTAssertEqual(usage.total.cacheWriteInputTokens, 20)
+        XCTAssertEqual(usage.last.cacheWriteInputTokens, 0)
+        XCTAssertEqual(usage.last.totalTokens, 240)
+        XCTAssertEqual(usage.modelContextWindow, 353_400)
+    }
+
+    func testMalformedStructuredProtocolNotificationIsIgnored() {
+        XCTAssertNil(CodexAppServerClient.structuredProtocolEvent(
+            method: "item/started",
+            params: .object([
+                "threadId": .string("thread-1"),
+                "turnId": .string("turn-1"),
+                "startedAtMs": .integer(1),
+                "item": .object([
+                    "type": .string("collabAgentToolCall"),
+                    "id": .string("call-1"),
+                    "tool": .string("spawnAgent"),
+                    "status": .string("inProgress"),
+                    "senderThreadId": .string("thread-1"),
+                    "receiverThreadIds": .array([])
+                ])
+            ])
+        ))
+    }
 }

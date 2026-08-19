@@ -144,6 +144,37 @@ struct CodexThreadSummary: Equatable, Sendable {
     let isPinned: Bool
     let statusType: String
     let sourceKind: String
+    let parentThreadID: String?
+    let agentNickname: String?
+    let agentRole: String?
+
+    init(
+        id: String,
+        sessionID: String,
+        cwd: String,
+        name: String?,
+        createdAt: Date,
+        updatedAt: Date,
+        isPinned: Bool,
+        statusType: String,
+        sourceKind: String,
+        parentThreadID: String? = nil,
+        agentNickname: String? = nil,
+        agentRole: String? = nil
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.cwd = cwd
+        self.name = name
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.isPinned = isPinned
+        self.statusType = statusType
+        self.sourceKind = sourceKind
+        self.parentThreadID = parentThreadID
+        self.agentNickname = agentNickname
+        self.agentRole = agentRole
+    }
 
     var isActive: Bool { statusType == "active" }
 }
@@ -259,6 +290,68 @@ struct CodexThreadItem: Equatable, Sendable {
     let type: String
     let text: String?
     let status: String?
+    let collaboration: CodexCollabAgentToolCall?
+    let subAgentActivity: CodexSubAgentActivity?
+
+    init(
+        id: String,
+        type: String,
+        text: String?,
+        status: String?,
+        collaboration: CodexCollabAgentToolCall? = nil,
+        subAgentActivity: CodexSubAgentActivity? = nil
+    ) {
+        self.id = id
+        self.type = type
+        self.text = text
+        self.status = status
+        self.collaboration = collaboration
+        self.subAgentActivity = subAgentActivity
+    }
+}
+
+struct CodexCollabAgentState: Equatable, Sendable {
+    let status: String
+    let message: String?
+}
+
+struct CodexCollabAgentToolCall: Equatable, Sendable {
+    let id: String
+    let tool: String
+    let status: String
+    let senderThreadID: String
+    let receiverThreadIDs: [String]
+    let prompt: String?
+    let model: String?
+    let reasoningEffort: String?
+    let agentStates: [String: CodexCollabAgentState]
+}
+
+struct CodexSubAgentActivity: Equatable, Sendable {
+    let id: String
+    let agentThreadID: String
+    let agentPath: String
+    let kind: String
+}
+
+enum CodexItemLifecycle: Equatable, Sendable {
+    case started(atMilliseconds: Int64)
+    case completed(atMilliseconds: Int64)
+}
+
+struct CodexTokenUsageBreakdown: Equatable, Sendable {
+    let totalTokens: Int64
+    let inputTokens: Int64
+    let cachedInputTokens: Int64
+    let cacheWriteInputTokens: Int64
+    let outputTokens: Int64
+    let reasoningOutputTokens: Int64
+}
+
+struct CodexThreadTokenUsage: Equatable, Sendable {
+    let total: CodexTokenUsageBreakdown
+    let last: CodexTokenUsageBreakdown
+    let modelContextWindow: Int64?
 }
 
 struct CodexStartedThread: Equatable, Sendable {
@@ -474,6 +567,7 @@ struct CodexMCPOAuthCompletion: Equatable, Sendable {
 }
 
 enum CodexEvent: Sendable {
+    case threadStarted(CodexThreadSummary)
     case agentDelta(threadID: String, turnID: String, delta: String)
     case agentFinal(threadID: String, turnID: String, text: String)
     case turnDiffUpdated(threadID: String, turnID: String, diff: String)
@@ -484,6 +578,19 @@ enum CodexEvent: Sendable {
     case configurationWarning(threadID: String?, turnID: String?, message: String)
     case warning(threadID: String?, turnID: String?, message: String)
     case threadStatus(threadID: String, status: String)
+    case collabAgentToolCall(
+        threadID: String,
+        turnID: String,
+        lifecycle: CodexItemLifecycle,
+        call: CodexCollabAgentToolCall
+    )
+    case subAgentActivity(
+        threadID: String,
+        turnID: String,
+        lifecycle: CodexItemLifecycle,
+        activity: CodexSubAgentActivity
+    )
+    case tokenUsageUpdated(threadID: String, turnID: String, usage: CodexThreadTokenUsage)
     case interactionRequested(CodexInteractionRequest)
     case interactionResolved(threadID: String, requestID: CodexRequestID)
     case mcpOAuthCompleted(CodexMCPOAuthCompletion)

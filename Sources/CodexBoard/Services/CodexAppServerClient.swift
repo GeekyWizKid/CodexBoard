@@ -1113,6 +1113,9 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             eventContinuation?.yield(event)
             return
         }
+        if let event = Self.structuredProtocolEvent(method: method, params: params) {
+            eventContinuation?.yield(event)
+        }
         switch method {
         case "thread/realtime/started":
             guard let threadID,
@@ -1192,6 +1195,167 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         default:
             break
         }
+    }
+
+    static func structuredProtocolEvent(method: String, params: JSONValue) -> CodexEvent? {
+        switch method {
+        case "thread/started":
+            guard let thread = params["thread"], let summary = parseThread(thread) else { return nil }
+            return .threadStarted(summary)
+        case "item/started", "item/completed":
+            guard let threadID = params["threadId"]?.stringValue,
+                  let turnID = params["turnId"]?.stringValue,
+                  let item = params["item"],
+                  let type = item["type"]?.stringValue
+            else { return nil }
+            let lifecycle: CodexItemLifecycle
+            if method == "item/started" {
+                guard let timestamp = params["startedAtMs"]?.int64Value else { return nil }
+                lifecycle = .started(atMilliseconds: timestamp)
+            } else {
+                guard let timestamp = params["completedAtMs"]?.int64Value else { return nil }
+                lifecycle = .completed(atMilliseconds: timestamp)
+            }
+            switch type {
+            case "collabAgentToolCall":
+                guard let call = parseCollabAgentToolCall(item) else { return nil }
+                return .collabAgentToolCall(
+                    threadID: threadID,
+                    turnID: turnID,
+                    lifecycle: lifecycle,
+                    call: call
+                )
+            case "subAgentActivity":
+                guard let activity = parseSubAgentActivity(item) else { return nil }
+                return .subAgentActivity(
+                    threadID: threadID,
+                    turnID: turnID,
+                    lifecycle: lifecycle,
+                    activity: activity
+                )
+            default:
+                return nil
+            }
+        case "thread/tokenUsage/updated":
+            guard let threadID = params["threadId"]?.stringValue,
+                  let turnID = params["turnId"]?.stringValue,
+                  let rawUsage = params["tokenUsage"],
+                  let usage = parseThreadTokenUsage(rawUsage)
+            else { return nil }
+            return .tokenUsageUpdated(threadID: threadID, turnID: turnID, usage: usage)
+        default:
+            return nil
+        }
+    }
+
+    private static func parseCollabAgentToolCall(_ value: JSONValue) -> CodexCollabAgentToolCall? {
+        guard value["type"]?.stringValue == "collabAgentToolCall",
+              let id = value["id"]?.stringValue,
+              let tool = value["tool"]?.stringValue,
+              let status = value["status"]?.stringValue,
+              let senderThreadID = value["senderThreadId"]?.stringValue,
+              let rawReceiverThreadIDs = value["receiverThreadIds"]?.arrayValue,
+              let rawAgentStates = value["agentsStates"]?.objectValue
+        else { return nil }
+
+        let receiverThreadIDs = rawReceiverThreadIDs.compactMap(\.stringValue)
+        guard receiverThreadIDs.count == rawReceiverThreadIDs.count else { return nil }
+
+        var agentStates: [String: CodexCollabAgentState] = [:]
+        agentStates.reserveCapacity(rawAgentStates.count)
+        for (threadID, rawState) in rawAgentStates {
+            guard let stateStatus = rawState["status"]?.stringValue else { return nil }
+            let message = optionalStringField(rawState["message"])
+            guard message.isValid else { return nil }
+            agentStates[threadID] = CodexCollabAgentState(status: stateStatus, message: message.value)
+        }
+
+        let prompt = optionalStringField(value["prompt"])
+        let model = optionalStringField(value["model"])
+        let reasoningEffort = optionalStringField(value["reasoningEffort"])
+        guard prompt.isValid, model.isValid, reasoningEffort.isValid else { return nil }
+
+        return CodexCollabAgentToolCall(
+            id: id,
+            tool: tool,
+            status: status,
+            senderThreadID: senderThreadID,
+            receiverThreadIDs: receiverThreadIDs,
+            prompt: prompt.value,
+            model: model.value,
+            reasoningEffort: reasoningEffort.value,
+            agentStates: agentStates
+        )
+    }
+
+    private static func parseSubAgentActivity(_ value: JSONValue) -> CodexSubAgentActivity? {
+        guard value["type"]?.stringValue == "subAgentActivity",
+              let id = value["id"]?.stringValue,
+              let agentThreadID = value["agentThreadId"]?.stringValue,
+              let agentPath = value["agentPath"]?.stringValue,
+              let kind = value["kind"]?.stringValue
+        else { return nil }
+        return CodexSubAgentActivity(
+            id: id,
+            agentThreadID: agentThreadID,
+            agentPath: agentPath,
+            kind: kind
+        )
+    }
+
+    private static func parseThreadTokenUsage(_ value: JSONValue) -> CodexThreadTokenUsage? {
+        guard let rawTotal = value["total"],
+              let total = parseTokenUsageBreakdown(rawTotal),
+              let rawLast = value["last"],
+              let last = parseTokenUsageBreakdown(rawLast)
+        else { return nil }
+        let modelContextWindow = optionalInt64Field(value["modelContextWindow"])
+        guard modelContextWindow.isValid else { return nil }
+        return CodexThreadTokenUsage(
+            total: total,
+            last: last,
+            modelContextWindow: modelContextWindow.value
+        )
+    }
+
+    private static func parseTokenUsageBreakdown(_ value: JSONValue) -> CodexTokenUsageBreakdown? {
+        guard let totalTokens = value["totalTokens"]?.int64Value,
+              let inputTokens = value["inputTokens"]?.int64Value,
+              let cachedInputTokens = value["cachedInputTokens"]?.int64Value,
+              let outputTokens = value["outputTokens"]?.int64Value,
+              let reasoningOutputTokens = value["reasoningOutputTokens"]?.int64Value
+        else { return nil }
+        let cacheWriteInputTokens: Int64
+        if let rawCacheWriteInputTokens = value["cacheWriteInputTokens"] {
+            guard let parsed = rawCacheWriteInputTokens.int64Value else { return nil }
+            cacheWriteInputTokens = parsed
+        } else {
+            cacheWriteInputTokens = 0
+        }
+        return CodexTokenUsageBreakdown(
+            totalTokens: totalTokens,
+            inputTokens: inputTokens,
+            cachedInputTokens: cachedInputTokens,
+            cacheWriteInputTokens: cacheWriteInputTokens,
+            outputTokens: outputTokens,
+            reasoningOutputTokens: reasoningOutputTokens
+        )
+    }
+
+    private static func optionalStringField(_ value: JSONValue?) -> (isValid: Bool, value: String?) {
+        guard let value else { return (true, nil) }
+        switch value {
+        case let .string(string): return (true, string)
+        case .null: return (true, nil)
+        default: return (false, nil)
+        }
+    }
+
+    private static func optionalInt64Field(_ value: JSONValue?) -> (isValid: Bool, value: Int64?) {
+        guard let value else { return (true, nil) }
+        if case .null = value { return (true, nil) }
+        guard let integer = value.int64Value else { return (false, nil) }
+        return (true, integer)
     }
 
     static func turnDiffEvent(method: String, params: JSONValue) -> CodexEvent? {
@@ -1859,6 +2023,10 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
               let created = value["createdAt"]?.intValue,
               let updated = value["recencyAt"]?.intValue ?? value["updatedAt"]?.intValue
         else { return nil }
+        let parentThreadID = optionalStringField(value["parentThreadId"])
+        let agentNickname = optionalStringField(value["agentNickname"])
+        let agentRole = optionalStringField(value["agentRole"])
+        guard parentThreadID.isValid, agentNickname.isValid, agentRole.isValid else { return nil }
         return CodexThreadSummary(
             id: id,
             sessionID: sessionID,
@@ -1868,7 +2036,10 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
             updatedAt: Date(timeIntervalSince1970: TimeInterval(updated)),
             isPinned: value["isPinned"]?.boolValue ?? false,
             statusType: value["status"]?["type"]?.stringValue ?? "notLoaded",
-            sourceKind: Self.sourceKind(value["source"])
+            sourceKind: Self.sourceKind(value["source"]),
+            parentThreadID: parentThreadID.value,
+            agentNickname: agentNickname.value,
+            agentRole: agentRole.value
         )
     }
 
@@ -1908,11 +2079,28 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         guard let id = value["id"]?.stringValue,
               let type = value["type"]?.stringValue
         else { return nil }
+        let collaboration: CodexCollabAgentToolCall?
+        let subAgentActivity: CodexSubAgentActivity?
+        switch type {
+        case "collabAgentToolCall":
+            guard let parsed = parseCollabAgentToolCall(value) else { return nil }
+            collaboration = parsed
+            subAgentActivity = nil
+        case "subAgentActivity":
+            guard let parsed = parseSubAgentActivity(value) else { return nil }
+            collaboration = nil
+            subAgentActivity = parsed
+        default:
+            collaboration = nil
+            subAgentActivity = nil
+        }
         return CodexThreadItem(
             id: id,
             type: type,
             text: value["text"]?.stringValue,
-            status: value["status"]?.stringValue
+            status: value["status"]?.stringValue,
+            collaboration: collaboration,
+            subAgentActivity: subAgentActivity
         )
     }
 

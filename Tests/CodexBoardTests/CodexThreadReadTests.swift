@@ -15,7 +15,7 @@ final class CodexThreadReadTests: XCTestCase {
             "createdAt": 1700000000,
             "updatedAt": 1700000030,
             "status": {"type": "active"},
-            "source": {"appServer": {}},
+            "source": "appServer",
             "turns": [
               {
                 "id": "turn-plan",
@@ -94,6 +94,173 @@ final class CodexThreadReadTests: XCTestCase {
 
         XCTAssertThrowsError(try CodexAppServerClient.parseThreadReadResponse(value)) { error in
             XCTAssertEqual(error as? CodexClientError, .invalidResponse("thread/read 缺少 turns"))
+        }
+    }
+
+    func testThreadReadPreservesParentAndCollaborationForRecovery() throws {
+        let value = try JSONDecoder().decode(JSONValue.self, from: Data(#"""
+        {
+          "thread": {
+            "id": "child-1",
+            "sessionId": "root-1",
+            "parentThreadId": "root-1",
+            "agentNickname": "Popper",
+            "agentRole": "explorer",
+            "cwd": "/srv/project",
+            "createdAt": 1700000000,
+            "updatedAt": 1700000030,
+            "status": {"type": "idle"},
+            "source": {
+              "subAgent": {
+                "thread_spawn": {
+                  "parent_thread_id": "root-1",
+                  "depth": 1,
+                  "agent_path": "/root/protocol_events",
+                  "agent_nickname": "Popper",
+                  "agent_role": "explorer"
+                }
+              }
+            },
+            "turns": [
+              {
+                "id": "turn-1",
+                "status": "completed",
+                "items": [
+                  {
+                    "type": "collabAgentToolCall",
+                    "id": "call-1",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "root-1",
+                    "receiverThreadIds": ["child-1"],
+                    "prompt": "Audit protocol events",
+                    "model": null,
+                    "reasoningEffort": null,
+                    "agentsStates": {
+                      "child-1": {"status": "completed", "message": "done"}
+                    }
+                  },
+                  {
+                    "type": "subAgentActivity",
+                    "id": "activity-1",
+                    "agentThreadId": "child-1",
+                    "agentPath": "/root/protocol_events",
+                    "kind": "interrupted"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """#.utf8))
+
+        let detail = try CodexAppServerClient.parseThreadReadResponse(value)
+
+        XCTAssertEqual(detail.summary.parentThreadID, "root-1")
+        XCTAssertEqual(detail.summary.agentNickname, "Popper")
+        XCTAssertEqual(detail.summary.agentRole, "explorer")
+        XCTAssertEqual(detail.summary.sourceKind, "subAgent")
+        let collaboration = try XCTUnwrap(detail.turns.first?.items.first?.collaboration)
+        XCTAssertEqual(collaboration.senderThreadID, "root-1")
+        XCTAssertEqual(collaboration.receiverThreadIDs, ["child-1"])
+        XCTAssertEqual(collaboration.agentStates["child-1"]?.status, "completed")
+        XCTAssertEqual(collaboration.agentStates["child-1"]?.message, "done")
+        let activity = try XCTUnwrap(detail.turns.first?.items.last?.subAgentActivity)
+        XCTAssertEqual(activity.id, "activity-1")
+        XCTAssertEqual(activity.agentThreadID, "child-1")
+        XCTAssertEqual(activity.agentPath, "/root/protocol_events")
+        XCTAssertEqual(activity.kind, "interrupted")
+    }
+
+    func testThreadReadRejectsMalformedCollaborationForFailClosedRecovery() throws {
+        let value = try JSONDecoder().decode(JSONValue.self, from: Data(#"""
+        {
+          "thread": {
+            "id": "thread-1",
+            "sessionId": "session-1",
+            "cwd": "/srv/project",
+            "createdAt": 1700000000,
+            "updatedAt": 1700000030,
+            "status": {"type": "idle"},
+            "source": "appServer",
+            "turns": [
+              {
+                "id": "turn-1",
+                "status": "completed",
+                "items": [
+                  {
+                    "type": "collabAgentToolCall",
+                    "id": "call-1",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "thread-1",
+                    "receiverThreadIds": ["child-1"]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """#.utf8))
+
+        XCTAssertThrowsError(try CodexAppServerClient.parseThreadReadResponse(value)) { error in
+            XCTAssertEqual(error as? CodexClientError, .invalidResponse("thread/read 包含无效 turn"))
+        }
+    }
+
+    func testThreadReadRejectsMalformedParentThreadIDForFailClosedRecovery() throws {
+        let value = try JSONDecoder().decode(JSONValue.self, from: Data(#"""
+        {
+          "thread": {
+            "id": "thread-1",
+            "sessionId": "session-1",
+            "parentThreadId": 42,
+            "cwd": "/srv/project",
+            "createdAt": 1700000000,
+            "updatedAt": 1700000030,
+            "status": {"type": "idle"},
+            "source": "appServer",
+            "turns": []
+          }
+        }
+        """#.utf8))
+
+        XCTAssertThrowsError(try CodexAppServerClient.parseThreadReadResponse(value)) { error in
+            XCTAssertEqual(error as? CodexClientError, .invalidResponse("thread/read 缺少有效 thread"))
+        }
+    }
+
+    func testThreadReadRejectsMalformedSubAgentActivityForFailClosedRecovery() throws {
+        let value = try JSONDecoder().decode(JSONValue.self, from: Data(#"""
+        {
+          "thread": {
+            "id": "thread-1",
+            "sessionId": "session-1",
+            "cwd": "/srv/project",
+            "createdAt": 1700000000,
+            "updatedAt": 1700000030,
+            "status": {"type": "idle"},
+            "source": "appServer",
+            "turns": [
+              {
+                "id": "turn-1",
+                "status": "completed",
+                "items": [
+                  {
+                    "type": "subAgentActivity",
+                    "id": "activity-1",
+                    "agentThreadId": "child-1",
+                    "kind": "started"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """#.utf8))
+
+        XCTAssertThrowsError(try CodexAppServerClient.parseThreadReadResponse(value)) { error in
+            XCTAssertEqual(error as? CodexClientError, .invalidResponse("thread/read 包含无效 turn"))
         }
     }
 }
