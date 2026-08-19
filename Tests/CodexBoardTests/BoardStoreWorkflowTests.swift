@@ -2038,6 +2038,106 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertNotNil(task.latestExecutionRun?.reviewedAt)
     }
 
+    func testObservedRunTelemetryMergesLifecycleAndReplacesPerThreadUsage() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let taskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Observed telemetry",
+            sourceKind: .issue,
+            sourceText: "Preserve exact sub-agent and token observations",
+            autoRun: false
+        )
+
+        await fixture.store.startPlanning(taskID: taskID)
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        let activity = CodexSubAgentActivity(
+            id: "activity-1",
+            agentThreadID: "child-1",
+            agentPath: "/root/child-1",
+            kind: "futureActivityKind"
+        )
+        fixture.client.send(.subAgentActivity(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            lifecycle: .completed(atMilliseconds: 120_000),
+            activity: activity
+        ))
+        fixture.client.send(.subAgentActivity(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            lifecycle: .started(atMilliseconds: 100_000),
+            activity: activity
+        ))
+        fixture.client.send(.tokenUsageUpdated(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            usage: observedUsage(totalTokens: 200, lastTokens: 20)
+        ))
+        fixture.client.send(.tokenUsageUpdated(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            usage: observedUsage(totalTokens: 240, lastTokens: 24)
+        ))
+        fixture.client.send(.tokenUsageUpdated(
+            threadID: "child-1",
+            turnID: "child-turn-1",
+            usage: observedUsage(totalTokens: 80, lastTokens: 8)
+        ))
+        fixture.client.send(.tokenUsageUpdated(
+            threadID: "unknown-thread",
+            turnID: "unknown-turn",
+            usage: observedUsage(totalTokens: 999, lastTokens: 999)
+        ))
+        fixture.client.send(.tokenUsageUpdated(
+            threadID: "thread-1",
+            turnID: "wrong-root-turn",
+            usage: observedUsage(totalTokens: 999, lastTokens: 999)
+        ))
+        fixture.client.send(.subAgentActivity(
+            threadID: "thread-1",
+            turnID: "wrong-root-turn",
+            lifecycle: .started(atMilliseconds: 130_000),
+            activity: CodexSubAgentActivity(
+                id: "stale-activity",
+                agentThreadID: "stale-child",
+                agentPath: "/root/stale-child",
+                kind: "stale"
+            )
+        ))
+
+        try await eventually {
+            let telemetry = fixture.store.tasks.first(where: { $0.id == taskID })?
+                .runs.first?.telemetry
+            return telemetry?.agentActivities.count == 1
+                && telemetry?.tokenUsageByThread.count == 1
+                && telemetry?.tokenUsageByThread.first(where: {
+                    $0.threadID == "thread-1"
+                })?.total.totalTokens == 240
+        }
+
+        let task = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
+        let telemetry = try XCTUnwrap(task.runs.first?.telemetry)
+        let recordedActivity = try XCTUnwrap(telemetry.agentActivities.first)
+        XCTAssertEqual(recordedActivity.kind, "futureActivityKind")
+        XCTAssertEqual(recordedActivity.agentPath, "/root/child-1")
+        XCTAssertEqual(recordedActivity.startedAt, Date(timeIntervalSince1970: 100))
+        XCTAssertEqual(recordedActivity.completedAt, Date(timeIntervalSince1970: 120))
+        XCTAssertEqual(
+            telemetry.tokenUsageByThread.first(where: { $0.threadID == "thread-1" })?.last.totalTokens,
+            24
+        )
+        XCTAssertNil(telemetry.tokenUsageByThread.first(where: { $0.threadID == "child-1" }))
+        XCTAssertFalse(
+            task.runs.first?.multiAgentDrain?.knownThreadIDs.contains("stale-child") == true
+        )
+        let card = try XCTUnwrap(fixture.store.taskCards.first(where: { $0.id == taskID }))
+        XCTAssertEqual(card.latestAgentActivityKind, "futureActivityKind")
+        XCTAssertEqual(card.latestAgentPath, "/root/child-1")
+        XCTAssertEqual(card.rootThreadTotalTokens, 240)
+    }
+
     func testTurnDiffReplacesSnapshotAndRemainsOnCompletedExecutionRun() async throws {
         let fixture = try Fixture(autoRunDefault: false)
         defer { fixture.cleanup() }
@@ -4098,6 +4198,203 @@ final class BoardStoreWorkflowTests: XCTestCase {
         }))
     }
 
+    func testStartupBlockedPlanningDrainDoesNotReserveExecutionSlot() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let observedAt = Date(timeIntervalSince1970: 10)
+        let blockedThreadID = "thread-blocked-planning"
+        let blockedTurnID = "turn-blocked-planning"
+        let readyThreadID = "thread-ready-after-blocked"
+        let blockedRun = TaskRun(
+            phase: .planning,
+            attempt: 1,
+            startedAt: observedAt,
+            outcome: .running,
+            threadID: blockedThreadID,
+            sessionID: "session-blocked-planning",
+            turnID: blockedTurnID,
+            model: "gpt-test",
+            reasoningEffort: .medium,
+            fastMode: false,
+            multiAgentDrain: TaskRunDrainState(
+                phase: .blocked,
+                rootTerminalStatus: "completed",
+                rootTerminalObservedAt: observedAt,
+                knownThreadIDs: [blockedThreadID],
+                consecutiveReconciliationFailureCount: 3,
+                startedAt: observedAt,
+                blockedReason: "Persisted reconciliation failure"
+            )
+        )
+        let blockedTask = BoardTask(
+            projectID: directory.path,
+            title: "Blocked planning drain",
+            sourceKind: .issue,
+            sourceText: "Do not reserve execution capacity while blocked",
+            stage: .planning,
+            autoRun: true,
+            createdAt: observedAt,
+            updatedAt: observedAt,
+            planText: "Blocked task plan",
+            hasFinalPlan: true,
+            threadID: blockedThreadID,
+            sessionID: "session-blocked-planning",
+            planningTurnID: blockedTurnID,
+            runs: [blockedRun]
+        )
+        let readyTask = BoardTask(
+            projectID: directory.path,
+            title: "Approved after blocked drain",
+            sourceKind: .issue,
+            sourceText: "Start despite the blocked planning drain",
+            stage: .awaitingApproval,
+            autoRun: true,
+            executionApproved: true,
+            createdAt: observedAt.addingTimeInterval(1),
+            updatedAt: observedAt.addingTimeInterval(1),
+            planText: "Ready task plan",
+            hasFinalPlan: true,
+            threadID: readyThreadID,
+            sessionID: "session-ready-after-blocked"
+        )
+        var preferences = BoardPreferences()
+        preferences.maxConcurrentExecutions = 1
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        try await persistence.save(BoardSnapshot(
+            tasks: [blockedTask, readyTask],
+            hosts: [.local],
+            manualProjects: [ManualProjectReference(path: directory.path)],
+            preferences: preferences
+        ))
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let drainGate = AsyncGate()
+        client.descendantThreadListGate = drainGate
+        client.descendantThreadSnapshots = [[], []]
+        let store = BoardStore(
+            client: client,
+            persistence: persistence,
+            drainStabilityDelay: .milliseconds(10)
+        )
+
+        store.start()
+
+        try await eventually { client.executionTurnCount == 1 }
+        XCTAssertEqual(client.executionCalls.first?.threadID, readyThreadID)
+        XCTAssertEqual(
+            store.tasks.first(where: { $0.id == readyTask.id })?.stage,
+            .executing
+        )
+        XCTAssertEqual(
+            store.tasks.first(where: { $0.id == blockedTask.id })?.stage,
+            .planning
+        )
+
+        await drainGate.open()
+        try await eventually {
+            store.tasks.first(where: { $0.id == blockedTask.id })?.stage == .awaitingApproval
+        }
+    }
+
+    func testCancellingPlanningDrainDoesNotReserveExecutionSlot() async throws {
+        let fixture = try Fixture(autoRunDefault: false)
+        defer { fixture.cleanup() }
+        fixture.store.updatePreferences { $0.maxConcurrentExecutions = 1 }
+        fixture.store.setHostConcurrency(id: CodexHost.localID, maximum: 1)
+        try await eventually { fixture.store.projects.contains(where: { $0.id == fixture.projectPath }) }
+        let readyTaskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Approved during cancellation",
+            sourceKind: .issue,
+            sourceText: "Run after the older planning drain starts cancelling",
+            autoRun: false
+        )
+        await fixture.store.startPlanning(taskID: readyTaskID)
+        try await eventually { fixture.client.planningTurnCount == 1 }
+        fixture.client.send(.planFinal(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            text: "Initial ready plan"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-1",
+            turnID: "plan-1",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == readyTaskID })?.stage == .awaitingApproval
+        }
+
+        let cancellingTaskID = try await fixture.store.createTask(
+            projectID: fixture.projectPath,
+            title: "Cancelling planning drain",
+            sourceKind: .issue,
+            sourceText: "Do not reserve capacity after cancellation is requested",
+            autoRun: true
+        )
+        try await eventually { fixture.client.planningTurnCount == 2 }
+        let drainGate = AsyncGate()
+        let interruptGate = AsyncGate()
+        fixture.client.descendantThreadListGate = drainGate
+        fixture.client.interruptGate = interruptGate
+        fixture.client.descendantThreadSnapshots = [[], []]
+        fixture.client.threadDetails["thread-2"] = makeThreadDetail(
+            cwd: fixture.projectPath,
+            threadID: "thread-2",
+            turnID: "plan-2",
+            status: "interrupted"
+        )
+        fixture.client.send(.planFinal(
+            threadID: "thread-2",
+            turnID: "plan-2",
+            text: "Plan that must not reserve while cancelling"
+        ))
+        fixture.client.send(.turnCompleted(
+            threadID: "thread-2",
+            turnID: "plan-2",
+            status: "completed",
+            error: nil
+        ))
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == cancellingTaskID })?
+                .runs.last(where: { $0.phase == .planning })?
+                .multiAgentDrain?.phase == .draining
+        }
+
+        let cancellationTask = Task { @MainActor in
+            await fixture.store.cancel(taskID: cancellingTaskID)
+        }
+        try await eventually {
+            let drain = fixture.store.tasks.first(where: { $0.id == cancellingTaskID })?
+                .runs.last(where: { $0.phase == .planning })?
+                .multiAgentDrain
+            return drain?.phase == .cancelling && drain?.cancellationRequestedAt != nil
+        }
+        XCTAssertTrue(fixture.store.updatePlan(
+            taskID: readyTaskID,
+            planText: "Approved after cancellation request"
+        ))
+        fixture.store.confirmPlan(taskID: readyTaskID)
+
+        try await eventually { fixture.client.executionTurnCount == 1 }
+        XCTAssertEqual(fixture.client.executionCalls.first?.threadID, "thread-1")
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == readyTaskID })?.stage,
+            .executing
+        )
+        XCTAssertEqual(
+            fixture.store.tasks.first(where: { $0.id == cancellingTaskID })?.stage,
+            .planning
+        )
+
+        await interruptGate.open()
+        await drainGate.open()
+        await cancellationTask.value
+        try await eventually {
+            fixture.store.tasks.first(where: { $0.id == cancellingTaskID })?.stage == .needsAttention
+        }
+    }
+
     func testLateDescendantAndDuplicateTerminalRequireNewStableFixedPoint() async throws {
         let fixture = try Fixture(autoRunDefault: false)
         defer { fixture.cleanup() }
@@ -4454,6 +4751,31 @@ final class BoardStoreWorkflowTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(20))
         }
         XCTFail("Condition was not met before timeout", file: file, line: line)
+    }
+
+    private func observedUsage(
+        totalTokens: Int64,
+        lastTokens: Int64
+    ) -> CodexThreadTokenUsage {
+        CodexThreadTokenUsage(
+            total: CodexTokenUsageBreakdown(
+                totalTokens: totalTokens,
+                inputTokens: totalTokens - 20,
+                cachedInputTokens: 10,
+                cacheWriteInputTokens: 2,
+                outputTokens: 15,
+                reasoningOutputTokens: 5
+            ),
+            last: CodexTokenUsageBreakdown(
+                totalTokens: lastTokens,
+                inputTokens: max(0, lastTokens - 4),
+                cachedInputTokens: 2,
+                cacheWriteInputTokens: 0,
+                outputTokens: 3,
+                reasoningOutputTokens: 1
+            ),
+            modelContextWindow: 200_000
+        )
     }
 
     private func temporaryDirectory() throws -> URL {

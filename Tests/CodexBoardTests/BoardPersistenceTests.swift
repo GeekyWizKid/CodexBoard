@@ -186,6 +186,7 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertNil(run.policySnapshot)
         XCTAssertNil(run.failure)
         XCTAssertNil(run.multiAgentDrain)
+        XCTAssertNil(run.telemetry)
     }
 
     func testVersionNineSnapshotDefaultsVersionTenRunMetadataAndAttentionToNil() throws {
@@ -302,11 +303,61 @@ final class BoardPersistenceTests: XCTestCase {
         )
 
         let migratedRun = try XCTUnwrap(migrated.tasks.first?.runs.first)
-        XCTAssertEqual(migrated.version, 11)
+        XCTAssertEqual(migrated.version, BoardSnapshot.currentVersion)
         XCTAssertNil(migratedRun.multiAgentDrain)
+        XCTAssertNil(migratedRun.telemetry)
     }
 
-    func testVersionElevenRoundTripPreservesRunMetadataDrainAndAttention() async throws {
+    func testVersionElevenSnapshotDefaultsVersionTwelveTelemetryToNil() throws {
+        let run = TaskRun(
+            id: UUID(uuidString: "4C6ED146-3420-4A0F-A35F-AEAC27B95A47")!,
+            phase: .execution,
+            attempt: 1,
+            startedAt: Date(timeIntervalSinceReferenceDate: 200),
+            outcome: .completed,
+            threadID: "thread-v11",
+            sessionID: "session-v11",
+            turnID: "turn-v11",
+            model: "gpt-v11",
+            reasoningEffort: .high,
+            fastMode: false
+        )
+        let task = BoardTask(
+            projectID: "/tmp/version-eleven",
+            title: "Version eleven task",
+            sourceKind: .issue,
+            sourceText: "Migrate without synthesizing telemetry",
+            stage: .completed,
+            autoRun: false,
+            runs: [run]
+        )
+        let snapshot = BoardSnapshot(
+            tasks: [task],
+            hosts: [.local],
+            manualProjects: [],
+            preferences: BoardPreferences()
+        )
+        var object = try jsonDictionary(snapshot)
+        object["version"] = 11
+        var tasks = try XCTUnwrap(object["tasks"] as? [[String: Any]])
+        var runs = try XCTUnwrap(tasks[0]["runs"] as? [[String: Any]])
+        runs[0].removeValue(forKey: "telemetry")
+        tasks[0]["runs"] = runs
+        object["tasks"] = tasks
+
+        let migrated = try JSONDecoder().decode(
+            BoardSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        )
+
+        let migratedRun = try XCTUnwrap(migrated.tasks.first?.runs.first)
+        XCTAssertEqual(migrated.version, 12)
+        XCTAssertNil(migratedRun.telemetry)
+        XCTAssertEqual(migratedRun.threadID, "thread-v11")
+        XCTAssertEqual(migratedRun.turnID, "turn-v11")
+    }
+
+    func testVersionTwelveRoundTripPreservesRunMetadataTelemetryDrainAndAttention() async throws {
         let fixture = try TemporaryBoardFixture()
         defer { fixture.remove() }
 
@@ -318,6 +369,9 @@ final class BoardPersistenceTests: XCTestCase {
         let rootTerminalObservedAt = Date(timeIntervalSinceReferenceDate: 1_220)
         let cancellationRequestedAt = Date(timeIntervalSinceReferenceDate: 1_225)
         let lastReconciledAt = Date(timeIntervalSinceReferenceDate: 1_230)
+        let activityStartedAt = Date(timeIntervalSinceReferenceDate: 1_212)
+        let activityCompletedAt = Date(timeIntervalSinceReferenceDate: 1_218)
+        let tokenUsageReceivedAt = Date(timeIntervalSinceReferenceDate: 1_219)
         let continuation = TaskRunContinuation(
             mode: .reusedThread,
             sourceRunID: sourceRunID
@@ -367,6 +421,44 @@ final class BoardPersistenceTests: XCTestCase {
             lastReconciledAt: lastReconciledAt,
             blockedReason: "Missing thread detail: child-1"
         )
+        let activity = TaskRunAgentActivity(
+            protocolItemID: "protocol-item-7",
+            sourceThreadID: "thread-10",
+            sourceTurnID: "turn-10",
+            agentThreadID: "child-1",
+            agentPath: "/root/researcher",
+            kind: "spawn_agent",
+            startedAt: activityStartedAt,
+            completedAt: activityCompletedAt
+        )
+        let totalUsage = TaskRunTokenUsageBreakdown(
+            totalTokens: 1_200,
+            inputTokens: 700,
+            cachedInputTokens: 300,
+            cacheWriteInputTokens: 40,
+            outputTokens: 500,
+            reasoningOutputTokens: 200
+        )
+        let lastUsage = TaskRunTokenUsageBreakdown(
+            totalTokens: 120,
+            inputTokens: 70,
+            cachedInputTokens: 30,
+            cacheWriteInputTokens: 4,
+            outputTokens: 50,
+            reasoningOutputTokens: 20
+        )
+        let tokenSnapshot = TaskRunThreadTokenUsageSnapshot(
+            threadID: "child-1",
+            turnID: "child-turn-1",
+            receivedAt: tokenUsageReceivedAt,
+            total: totalUsage,
+            last: lastUsage,
+            modelContextWindow: 200_000
+        )
+        let telemetry = TaskRunTelemetry(
+            agentActivities: [activity],
+            tokenUsageByThread: [tokenSnapshot]
+        )
         let attention = TaskAttention(
             id: UUID(uuidString: "4679089C-4A2C-4DFA-8597-D39BF57B41A1")!,
             kind: .failure,
@@ -390,6 +482,7 @@ final class BoardPersistenceTests: XCTestCase {
             policySnapshot: policy,
             failure: failure,
             multiAgentDrain: drain,
+            telemetry: telemetry,
             summary: "Connection lost",
             error: failure.message
         )
@@ -447,11 +540,30 @@ final class BoardPersistenceTests: XCTestCase {
         let restoredTask = try XCTUnwrap(restored.tasks.first)
         let restoredRun = try XCTUnwrap(restoredTask.runs.first)
 
-        XCTAssertEqual(restored.version, 11)
+        XCTAssertEqual(restored.version, 12)
         XCTAssertEqual(restoredRun.continuation, continuation)
         XCTAssertEqual(restoredRun.policySnapshot, policy)
         XCTAssertEqual(restoredRun.failure, failure)
         XCTAssertEqual(restoredRun.multiAgentDrain, drain)
+        XCTAssertEqual(restoredRun.telemetry, telemetry)
+        XCTAssertEqual(restoredRun.telemetry?.agentActivities.first?.id, activity.id)
+        XCTAssertTrue(activity.id.contains("thread-10"))
+        XCTAssertTrue(activity.id.contains("turn-10"))
+        XCTAssertTrue(activity.id.contains("protocol-item-7"))
+        XCTAssertEqual(restoredRun.telemetry?.agentActivities.first?.protocolItemID, "protocol-item-7")
+        XCTAssertEqual(restoredRun.telemetry?.agentActivities.first?.sourceThreadID, "thread-10")
+        XCTAssertEqual(restoredRun.telemetry?.agentActivities.first?.sourceTurnID, "turn-10")
+        XCTAssertEqual(restoredRun.telemetry?.agentActivities.first?.agentThreadID, "child-1")
+        XCTAssertEqual(restoredRun.telemetry?.agentActivities.first?.agentPath, "/root/researcher")
+        XCTAssertEqual(restoredRun.telemetry?.agentActivities.first?.kind, "spawn_agent")
+        XCTAssertEqual(restoredRun.telemetry?.agentActivities.first?.startedAt, activityStartedAt)
+        XCTAssertEqual(restoredRun.telemetry?.agentActivities.first?.completedAt, activityCompletedAt)
+        XCTAssertEqual(restoredRun.telemetry?.tokenUsageByThread.first?.threadID, "child-1")
+        XCTAssertEqual(restoredRun.telemetry?.tokenUsageByThread.first?.turnID, "child-turn-1")
+        XCTAssertEqual(restoredRun.telemetry?.tokenUsageByThread.first?.receivedAt, tokenUsageReceivedAt)
+        XCTAssertEqual(restoredRun.telemetry?.tokenUsageByThread.first?.total, totalUsage)
+        XCTAssertEqual(restoredRun.telemetry?.tokenUsageByThread.first?.last, lastUsage)
+        XCTAssertEqual(restoredRun.telemetry?.tokenUsageByThread.first?.modelContextWindow, 200_000)
         XCTAssertEqual(restoredRun.threadID, "thread-10")
         XCTAssertEqual(restoredRun.turnID, "turn-10")
         XCTAssertEqual(restoredTask.attention, attention)
@@ -730,7 +842,7 @@ final class BoardPersistenceTests: XCTestCase {
         try legacyData.write(to: fixture.fileURL)
         let persistence = BoardPersistence(fileURL: fixture.fileURL)
 
-        XCTAssertEqual(fixture.migrationBackupURL.lastPathComponent, "board.pre-v11.json")
+        XCTAssertEqual(fixture.migrationBackupURL.lastPathComponent, "board.pre-v12.json")
 
         let migrated = try await persistence.load()
         try await persistence.save(migrated)

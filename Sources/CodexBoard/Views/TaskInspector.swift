@@ -40,6 +40,11 @@ struct TaskInspector: View {
                         if let failure = task.failureState { failureSection(failure) }
                         if !task.attachments.isEmpty { attachmentSection(task) }
                         if !task.planText.isEmpty { planSection(task) }
+                        if let run = task.runs.last,
+                           run.telemetry?.agentActivities.isEmpty == false
+                            || run.telemetry?.tokenUsageByThread.isEmpty == false {
+                            runTelemetrySection(run)
+                        }
                         if let run = task.latestExecutionRun,
                            run.evidence != nil || run.codeDelivery != nil {
                             deliveryEvidenceSection(task: task, run: run)
@@ -505,6 +510,12 @@ struct TaskInspector: View {
     private func deliveryEvidenceSection(task: BoardTask, run: TaskRun) -> some View {
         inspectorSection("交付物", systemImage: "shippingbox") {
             TaskDeliveryEvidenceView(task: task, run: run, store: store)
+        }
+    }
+
+    private func runTelemetrySection(_ run: TaskRun) -> some View {
+        inspectorSection("最近观测运行信息", systemImage: "waveform.path.ecg") {
+            TaskRunTelemetryView(run: run)
         }
     }
 

@@ -83,7 +83,7 @@ private struct TaskRunHistoryRow: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(BoardTheme.accent)
             if !evidence.artifacts.isEmpty {
-                Label("\(evidence.artifacts.count) 个可用交付物", systemImage: "shippingbox")
+                Label("\(evidence.artifacts.count) 个产物引用", systemImage: "shippingbox")
             }
             if run.codeDelivery == nil, !evidence.changedFiles.isEmpty {
                 Label("\(evidence.changedFiles.count) 个改动文件", systemImage: "doc.badge.gearshape")

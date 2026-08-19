@@ -651,7 +651,11 @@ struct BoardTaskCard: Hashable, Identifiable, Sendable {
     let model: String?
     let canContinueExecution: Bool
     let executionAttemptCount: Int
-    let hasDeliveryEvidence: Bool
+    let artifactCount: Int
+    let hasCodeDelivery: Bool
+    let latestAgentActivityKind: String?
+    let latestAgentPath: String?
+    let rootThreadTotalTokens: Int64?
     let workspaceKind: TaskWorkspaceKind
     let dependencyCount: Int
     let blockingDependencyCount: Int
@@ -675,7 +679,28 @@ struct BoardTaskCard: Hashable, Identifiable, Sendable {
             && task.hasFinalPlan
             && !task.planText.isEmpty
         executionAttemptCount = task.executionAttemptCount
-        hasDeliveryEvidence = task.hasDeliverables
+        artifactCount = task.latestDeliveryEvidence?.artifacts.count ?? 0
+        hasCodeDelivery = task.latestCodeDelivery != nil
+        // Never project telemetry from an older attempt onto a newer run that
+        // has not emitted any observations yet.
+        let observedRun = task.runs.last
+        let latestActivity = observedRun?.telemetry?.agentActivities.max { lhs, rhs in
+            let lhsDate = lhs.completedAt ?? lhs.startedAt ?? .distantPast
+            let rhsDate = rhs.completedAt ?? rhs.startedAt ?? .distantPast
+            if lhsDate != rhsDate { return lhsDate < rhsDate }
+            return lhs.id < rhs.id
+        }
+        let activityKind = latestActivity?.kind.trimmingCharacters(in: .whitespacesAndNewlines)
+        latestAgentActivityKind = activityKind.flatMap { $0.isEmpty ? nil : $0 }
+        let agentPath = latestActivity?.agentPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        latestAgentPath = agentPath.flatMap { $0.isEmpty ? nil : $0 }
+        rootThreadTotalTokens = observedRun.flatMap { run in
+            guard let rootThreadID = run.threadID else { return nil }
+            return run.telemetry?.tokenUsageByThread
+                .filter { $0.threadID == rootThreadID }
+                .max(by: { $0.receivedAt < $1.receivedAt })?
+                .total.totalTokens
+        }
         workspaceKind = task.workspace.kind
         dependencyCount = task.dependencyIDs.count
         self.blockingDependencyCount = blockingDependencyCount
@@ -758,7 +783,7 @@ struct BoardPreferences: Codable, Equatable, Sendable {
 }
 
 struct BoardSnapshot: Codable, Sendable {
-    static let currentVersion = 11
+    static let currentVersion = 12
 
     var version: Int
     var tasks: [BoardTask]

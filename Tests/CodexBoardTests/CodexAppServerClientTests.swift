@@ -1236,6 +1236,37 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(usage.modelContextWindow, 353_400)
     }
 
+    func testStructuredProtocolEventRejectsNegativeTokenCountersAndInvalidContextWindow() {
+        func tokenUsageBreakdown(totalTokens: Int64) -> JSONValue {
+            .object([
+                "totalTokens": .integer(totalTokens),
+                "inputTokens": .integer(1),
+                "cachedInputTokens": .integer(0),
+                "cacheWriteInputTokens": .integer(0),
+                "outputTokens": .integer(0),
+                "reasoningOutputTokens": .integer(0)
+            ])
+        }
+
+        func event(lastTotal: Int64, contextWindow: Int64) -> CodexEvent? {
+            CodexAppServerClient.structuredProtocolEvent(
+                method: "thread/tokenUsage/updated",
+                params: .object([
+                    "threadId": .string("thread-1"),
+                    "turnId": .string("turn-1"),
+                    "tokenUsage": .object([
+                        "total": tokenUsageBreakdown(totalTokens: 10),
+                        "last": tokenUsageBreakdown(totalTokens: lastTotal),
+                        "modelContextWindow": .integer(contextWindow)
+                    ])
+                ])
+            )
+        }
+
+        XCTAssertNil(event(lastTotal: -1, contextWindow: 200_000))
+        XCTAssertNil(event(lastTotal: 1, contextWindow: 0))
+    }
+
     func testMalformedStructuredProtocolNotificationIsIgnored() {
         XCTAssertNil(CodexAppServerClient.structuredProtocolEvent(
             method: "item/started",

@@ -2303,6 +2303,10 @@ final class BoardStore {
                       $0.phase == .planning && $0.outcome.isActive
                   }),
                   let drain = run.multiAgentDrain,
+                  drain.phase == .draining,
+                  drain.cancellationRequestedAt == nil,
+                  tasks[index].hasFinalPlan,
+                  !tasks[index].planText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   drain.rootTerminalStatus.map({ normalizedTurnStatus($0) == "completed" }) == true
             else { return nil }
             return ExecutionSchedulingDemand(
@@ -2603,6 +2607,7 @@ final class BoardStore {
             tasks[index].planText = text
             tasks[index].hasFinalPlan = true
             scheduleSave(immediate: true)
+            scheduleExecutionQueue()
         case let .planUpdated(threadID, turnID, explanation, steps):
             guard let index = taskIndex(threadID: threadID, turnID: turnID, hostID: hostID) else { return }
             tasks[index].structuredPlan = steps
@@ -2632,11 +2637,44 @@ final class BoardStore {
             completeTurn(at: index, turnID: turnID, status: status, error: error)
         case let .threadStarted(summary):
             observeStartedSubagentThread(summary, hostID: hostID)
-        case let .collabAgentToolCall(threadID, _, _, call):
-            observeCollaborationCall(threadID: threadID, call: call, hostID: hostID)
-        case let .subAgentActivity(threadID, _, _, activity):
-            observeSubagentActivity(threadID: threadID, activity: activity, hostID: hostID)
-        case .tokenUsageUpdated, .threadStatus:
+        case let .collabAgentToolCall(threadID, turnID, _, call):
+            guard let location = runTelemetryLocation(
+                hostID: hostID,
+                sourceThreadID: threadID,
+                sourceTurnID: turnID
+            ) else { return }
+            observeCollaborationCall(at: location, threadID: threadID, call: call)
+        case let .subAgentActivity(threadID, turnID, lifecycle, activity):
+            guard let location = runTelemetryLocation(
+                hostID: hostID,
+                sourceThreadID: threadID,
+                sourceTurnID: turnID
+            ) else { return }
+            observeSubagentActivity(
+                at: location,
+                threadID: threadID,
+                activity: activity
+            )
+            recordAgentActivity(
+                at: location,
+                sourceThreadID: threadID,
+                sourceTurnID: turnID,
+                lifecycle: lifecycle,
+                activity: activity
+            )
+        case let .tokenUsageUpdated(threadID, turnID, usage):
+            guard let location = runTelemetryLocation(
+                hostID: hostID,
+                sourceThreadID: threadID,
+                sourceTurnID: turnID
+            ) else { return }
+            recordTokenUsage(
+                at: location,
+                threadID: threadID,
+                turnID: turnID,
+                usage: usage
+            )
+        case .threadStatus:
             break
         case let .interactionRequested(request):
             guard let index = taskIndex(
@@ -2782,15 +2820,11 @@ final class BoardStore {
     }
 
     private func observeCollaborationCall(
+        at location: (taskIndex: Int, runIndex: Int),
         threadID: String,
-        call: CodexCollabAgentToolCall,
-        hostID: String
+        call: CodexCollabAgentToolCall
     ) {
         let candidates = Set([threadID, call.senderThreadID] + call.receiverThreadIDs)
-        guard let location = drainEventLocation(
-            hostID: hostID,
-            candidateThreadIDs: candidates
-        ) else { return }
         var spawnParents: [String: String] = [:]
         if call.tool == "spawnAgent" {
             for receiverThreadID in call.receiverThreadIDs {
@@ -2806,14 +2840,10 @@ final class BoardStore {
     }
 
     private func observeSubagentActivity(
+        at location: (taskIndex: Int, runIndex: Int),
         threadID: String,
-        activity: CodexSubAgentActivity,
-        hostID: String
+        activity: CodexSubAgentActivity
     ) {
-        guard let location = drainEventLocation(
-            hostID: hostID,
-            candidateThreadIDs: [threadID]
-        ) else { return }
         mergeDrainObservation(
             at: location.taskIndex,
             runIndex: location.runIndex,
@@ -2821,10 +2851,146 @@ final class BoardStore {
         )
     }
 
+    private func recordAgentActivity(
+        at location: (taskIndex: Int, runIndex: Int),
+        sourceThreadID: String,
+        sourceTurnID: String,
+        lifecycle: CodexItemLifecycle,
+        activity: CodexSubAgentActivity
+    ) {
+        let timestamp: Date
+        let startedAt: Date?
+        let completedAt: Date?
+        switch lifecycle {
+        case let .started(atMilliseconds):
+            timestamp = Date(timeIntervalSince1970: Double(atMilliseconds) / 1_000)
+            startedAt = timestamp
+            completedAt = nil
+        case let .completed(atMilliseconds):
+            timestamp = Date(timeIntervalSince1970: Double(atMilliseconds) / 1_000)
+            startedAt = nil
+            completedAt = timestamp
+        }
+        let record = TaskRunAgentActivity(
+            id: TaskRunTelemetryReducer.activityID(
+                sourceThreadID: sourceThreadID,
+                sourceTurnID: sourceTurnID,
+                protocolItemID: activity.id
+            ),
+            protocolItemID: activity.id,
+            sourceThreadID: sourceThreadID,
+            sourceTurnID: sourceTurnID,
+            agentThreadID: activity.agentThreadID,
+            agentPath: activity.agentPath,
+            kind: activity.kind,
+            startedAt: startedAt,
+            completedAt: completedAt
+        )
+        let reducer = TaskRunTelemetryReducer()
+        tasks[location.taskIndex].runs[location.runIndex].telemetry = reducer.recording(
+            record,
+            in: tasks[location.taskIndex].runs[location.runIndex].telemetry
+        )
+        scheduleSave()
+    }
+
+    private func recordTokenUsage(
+        at location: (taskIndex: Int, runIndex: Int),
+        threadID: String,
+        turnID: String,
+        usage: CodexThreadTokenUsage
+    ) {
+        let snapshot = TaskRunThreadTokenUsageSnapshot(
+            threadID: threadID,
+            turnID: turnID,
+            receivedAt: Date(),
+            total: taskRunTokenUsage(usage.total),
+            last: taskRunTokenUsage(usage.last),
+            modelContextWindow: usage.modelContextWindow
+        )
+        let reducer = TaskRunTelemetryReducer()
+        tasks[location.taskIndex].runs[location.runIndex].telemetry = reducer.recording(
+            snapshot,
+            in: tasks[location.taskIndex].runs[location.runIndex].telemetry
+        )
+        scheduleSave()
+    }
+
+    private func taskRunTokenUsage(
+        _ usage: CodexTokenUsageBreakdown
+    ) -> TaskRunTokenUsageBreakdown {
+        TaskRunTokenUsageBreakdown(
+            totalTokens: usage.totalTokens,
+            inputTokens: usage.inputTokens,
+            cachedInputTokens: usage.cachedInputTokens,
+            cacheWriteInputTokens: usage.cacheWriteInputTokens,
+            outputTokens: usage.outputTokens,
+            reasoningOutputTokens: usage.reasoningOutputTokens
+        )
+    }
+
+    private func runTelemetryLocation(
+        hostID: String,
+        sourceThreadID: String,
+        sourceTurnID: String
+    ) -> (taskIndex: Int, runIndex: Int)? {
+        guard !sourceThreadID.isEmpty, !sourceTurnID.isEmpty else { return nil }
+        var matches: [(taskIndex: Int, runIndex: Int)] = []
+        for taskIndex in tasks.indices
+        where tasks[taskIndex].hostID == hostID && tasks[taskIndex].stage.isActive {
+            let phase: TaskRunPhase = tasks[taskIndex].stage == .planning ? .planning : .execution
+            guard let runIndex = tasks[taskIndex].runs.lastIndex(where: {
+                $0.phase == phase && $0.outcome.isActive
+            }) else { continue }
+            let run = tasks[taskIndex].runs[runIndex]
+            let rootThreadID = run.threadID ?? tasks[taskIndex].threadID
+            if rootThreadID == sourceThreadID {
+                if run.turnID == sourceTurnID {
+                    matches.append((taskIndex, runIndex))
+                }
+                continue
+            }
+            guard run.multiAgentDrain?.knownThreadIDs.contains(sourceThreadID) == true,
+                  runHasObservedTurn(
+                      run,
+                      threadID: sourceThreadID,
+                      turnID: sourceTurnID
+                  )
+            else { continue }
+            matches.append((taskIndex, runIndex))
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
+    }
+
+    private func runHasObservedTurn(
+        _ run: TaskRun,
+        threadID: String,
+        turnID: String
+    ) -> Bool {
+        if run.multiAgentDrain?.activeTurns.contains(where: {
+            $0.threadID == threadID && $0.turnID == turnID
+        }) == true {
+            return true
+        }
+        if run.telemetry?.tokenUsageByThread.contains(where: {
+            $0.threadID == threadID && $0.turnID == turnID
+        }) == true {
+            return true
+        }
+        if run.telemetry?.agentActivities.contains(where: {
+            $0.sourceThreadID == threadID && $0.sourceTurnID == turnID
+        }) == true {
+            return true
+        }
+        return false
+    }
+
     private func drainEventLocation(
         hostID: String,
         candidateThreadIDs: Set<String>
     ) -> (taskIndex: Int, runIndex: Int)? {
+        var matches: [(taskIndex: Int, runIndex: Int)] = []
         for taskIndex in tasks.indices
         where tasks[taskIndex].hostID == hostID && tasks[taskIndex].stage.isActive {
             let phase: TaskRunPhase = tasks[taskIndex].stage == .planning ? .planning : .execution
@@ -2837,10 +3003,11 @@ final class BoardStore {
                 ownedThreadIDs.insert(rootThreadID)
             }
             if !ownedThreadIDs.isDisjoint(with: candidateThreadIDs) {
-                return (taskIndex, runIndex)
+                matches.append((taskIndex, runIndex))
             }
         }
-        return nil
+        guard matches.count == 1 else { return nil }
+        return matches[0]
     }
 
     private func mergeDrainObservation(

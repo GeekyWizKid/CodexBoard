@@ -417,6 +417,140 @@ struct TaskRunDrainState: Codable, Hashable, Sendable {
     }
 }
 
+struct TaskRunAgentActivity: Codable, Hashable, Identifiable, Sendable {
+    let id: String
+    let protocolItemID: String
+    let sourceThreadID: String
+    let sourceTurnID: String
+    let agentThreadID: String
+    let agentPath: String
+    let kind: String
+    var startedAt: Date?
+    var completedAt: Date?
+
+    init(
+        id: String,
+        protocolItemID: String,
+        sourceThreadID: String,
+        sourceTurnID: String,
+        agentThreadID: String,
+        agentPath: String,
+        kind: String,
+        startedAt: Date? = nil,
+        completedAt: Date? = nil
+    ) {
+        self.id = id
+        self.protocolItemID = protocolItemID
+        self.sourceThreadID = sourceThreadID
+        self.sourceTurnID = sourceTurnID
+        self.agentThreadID = agentThreadID
+        self.agentPath = agentPath
+        self.kind = kind
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+    }
+
+    init(
+        protocolItemID: String,
+        sourceThreadID: String,
+        sourceTurnID: String,
+        agentThreadID: String,
+        agentPath: String,
+        kind: String,
+        startedAt: Date? = nil,
+        completedAt: Date? = nil
+    ) {
+        self.init(
+            id: Self.stableID(
+                sourceThreadID: sourceThreadID,
+                sourceTurnID: sourceTurnID,
+                protocolItemID: protocolItemID
+            ),
+            protocolItemID: protocolItemID,
+            sourceThreadID: sourceThreadID,
+            sourceTurnID: sourceTurnID,
+            agentThreadID: agentThreadID,
+            agentPath: agentPath,
+            kind: kind,
+            startedAt: startedAt,
+            completedAt: completedAt
+        )
+    }
+
+    static func stableID(
+        sourceThreadID: String,
+        sourceTurnID: String,
+        protocolItemID: String
+    ) -> String {
+        [sourceThreadID, sourceTurnID, protocolItemID]
+            .map { "\($0.utf8.count):\($0)" }
+            .joined(separator: "|")
+    }
+}
+
+struct TaskRunTokenUsageBreakdown: Codable, Hashable, Sendable {
+    var totalTokens: Int64
+    var inputTokens: Int64
+    var cachedInputTokens: Int64
+    var cacheWriteInputTokens: Int64
+    var outputTokens: Int64
+    var reasoningOutputTokens: Int64
+
+    init(
+        totalTokens: Int64 = 0,
+        inputTokens: Int64 = 0,
+        cachedInputTokens: Int64 = 0,
+        cacheWriteInputTokens: Int64 = 0,
+        outputTokens: Int64 = 0,
+        reasoningOutputTokens: Int64 = 0
+    ) {
+        self.totalTokens = totalTokens
+        self.inputTokens = inputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.cacheWriteInputTokens = cacheWriteInputTokens
+        self.outputTokens = outputTokens
+        self.reasoningOutputTokens = reasoningOutputTokens
+    }
+}
+
+struct TaskRunThreadTokenUsageSnapshot: Codable, Hashable, Sendable {
+    var threadID: String
+    var turnID: String
+    var receivedAt: Date
+    var total: TaskRunTokenUsageBreakdown
+    var last: TaskRunTokenUsageBreakdown
+    var modelContextWindow: Int64?
+
+    init(
+        threadID: String,
+        turnID: String,
+        receivedAt: Date = Date(),
+        total: TaskRunTokenUsageBreakdown = TaskRunTokenUsageBreakdown(),
+        last: TaskRunTokenUsageBreakdown = TaskRunTokenUsageBreakdown(),
+        modelContextWindow: Int64? = nil
+    ) {
+        self.threadID = threadID
+        self.turnID = turnID
+        self.receivedAt = receivedAt
+        self.total = total
+        self.last = last
+        self.modelContextWindow = modelContextWindow
+    }
+}
+
+struct TaskRunTelemetry: Codable, Hashable, Sendable {
+    var agentActivities: [TaskRunAgentActivity]
+    var tokenUsageByThread: [TaskRunThreadTokenUsageSnapshot]
+
+    init(
+        agentActivities: [TaskRunAgentActivity] = [],
+        tokenUsageByThread: [TaskRunThreadTokenUsageSnapshot] = []
+    ) {
+        self.agentActivities = agentActivities
+        self.tokenUsageByThread = tokenUsageByThread
+    }
+}
+
 struct TaskRun: Codable, Hashable, Identifiable, Sendable {
     let id: UUID
     var phase: TaskRunPhase
@@ -434,6 +568,7 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
     var policySnapshot: TaskRunPolicySnapshot?
     var failure: TaskRunFailure?
     var multiAgentDrain: TaskRunDrainState?
+    var telemetry: TaskRunTelemetry?
     var summary: String
     var evidence: TaskDeliveryEvidence?
     var codeDelivery: TaskCodeDelivery?
@@ -458,6 +593,7 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
         policySnapshot: TaskRunPolicySnapshot? = nil,
         failure: TaskRunFailure? = nil,
         multiAgentDrain: TaskRunDrainState? = nil,
+        telemetry: TaskRunTelemetry? = nil,
         summary: String = "",
         evidence: TaskDeliveryEvidence? = nil,
         codeDelivery: TaskCodeDelivery? = nil,
@@ -481,6 +617,7 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
         self.policySnapshot = policySnapshot
         self.failure = failure
         self.multiAgentDrain = multiAgentDrain
+        self.telemetry = telemetry
         self.summary = summary
         self.evidence = evidence
         self.codeDelivery = codeDelivery

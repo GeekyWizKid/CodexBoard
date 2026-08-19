@@ -91,12 +91,13 @@ struct TaskDeliveryEvidenceView: View {
     @ViewBuilder
     private func artifactSection(_ artifacts: [TaskDeliveryArtifact]) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label("可用交付物", systemImage: "shippingbox")
+            Label("产物引用", systemImage: "shippingbox")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(BoardTheme.accent)
 
             ForEach(Array(artifacts.enumerated()), id: \.offset) { _, artifact in
                 let url = store.deliveryArtifactURL(artifact, for: task)
+                let isRemoteReference = task.hostID != CodexHost.localID
                 HStack(spacing: 8) {
                     Image(systemName: artifactIcon(artifact))
                         .foregroundStyle(url == nil ? Color.secondary : BoardTheme.accent)
@@ -110,6 +111,11 @@ struct TaskDeliveryEvidenceView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                        if isRemoteReference {
+                            Text("远程引用 · 未在本机验证")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
                     }
                     Spacer(minLength: 6)
                     Button {
@@ -119,7 +125,11 @@ struct TaskDeliveryEvidenceView: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(url == nil)
-                    .help(url == nil ? "文件不存在或不在任务工作区内" : "打开交付物")
+                    .help(
+                        isRemoteReference
+                            ? "远程产物引用无法在本机验证或打开"
+                            : (url == nil ? "文件不存在或不在任务工作区内" : "打开产物")
+                    )
                     Button {
                         store.revealDeliveryArtifact(artifact, for: task)
                     } label: {

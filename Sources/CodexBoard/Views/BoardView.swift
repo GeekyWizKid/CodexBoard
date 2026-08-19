@@ -287,13 +287,16 @@ private struct TaskCard: View {
                     .foregroundStyle(.secondary)
                 }
 
-                if task.executionAttemptCount > 0 || task.hasDeliveryEvidence {
+                if task.executionAttemptCount > 0 || task.artifactCount > 0 || task.hasCodeDelivery {
                     HStack(spacing: 10) {
                         if task.executionAttemptCount > 0 {
                             Label("执行 #\(task.executionAttemptCount)", systemImage: "arrow.triangle.2.circlepath")
                         }
-                        if task.hasDeliveryEvidence {
-                            Label("交付物", systemImage: "shippingbox")
+                        if task.artifactCount > 0 {
+                            Label("\(task.artifactCount) 个产物引用", systemImage: "shippingbox")
+                        }
+                        if task.hasCodeDelivery {
+                            Label("代码差异", systemImage: "doc.badge.gearshape")
                         }
                     }
                     .font(.caption)
@@ -306,6 +309,24 @@ private struct TaskCard: View {
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.leading)
                         .lineLimit(2)
+                }
+
+                if task.latestAgentActivityKind != nil || task.rootThreadTotalTokens != nil {
+                    HStack(spacing: 10) {
+                        if let activityKind = task.latestAgentActivityKind {
+                            Label(
+                                agentActivityLabel(kind: activityKind, path: task.latestAgentPath),
+                                systemImage: "person.2"
+                            )
+                            .lineLimit(1)
+                        }
+                        if let tokens = task.rootThreadTotalTokens {
+                            Label("\(tokens.formatted()) tokens", systemImage: "number")
+                                .help("根 Thread 上次观测累计：\(tokens.formatted()) tokens")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
 
                 if task.stage.isActive {
@@ -382,5 +403,11 @@ private struct TaskCard: View {
             Button("删除卡片", role: .destructive, action: deleteTask)
                 .disabled(task.stage.isActive)
         }
+    }
+
+    private func agentActivityLabel(kind: String, path: String?) -> String {
+        guard let path else { return kind }
+        let name = (path as NSString).lastPathComponent
+        return name.isEmpty ? kind : "\(name) · \(kind)"
     }
 }

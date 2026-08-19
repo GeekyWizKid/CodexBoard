@@ -1425,7 +1425,9 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
               let last = parseTokenUsageBreakdown(rawLast)
         else { return nil }
         let modelContextWindow = optionalInt64Field(value["modelContextWindow"])
-        guard modelContextWindow.isValid else { return nil }
+        guard modelContextWindow.isValid,
+              modelContextWindow.value.map({ $0 > 0 }) != false
+        else { return nil }
         return CodexThreadTokenUsage(
             total: total,
             last: last,
@@ -1447,6 +1449,14 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         } else {
             cacheWriteInputTokens = 0
         }
+        guard [
+            totalTokens,
+            inputTokens,
+            cachedInputTokens,
+            cacheWriteInputTokens,
+            outputTokens,
+            reasoningOutputTokens
+        ].allSatisfy({ $0 >= 0 }) else { return nil }
         return CodexTokenUsageBreakdown(
             totalTokens: totalTokens,
             inputTokens: inputTokens,
