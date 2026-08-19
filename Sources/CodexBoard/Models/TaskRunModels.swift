@@ -261,6 +261,95 @@ struct TaskDeliveryEvidence: Codable, Hashable, Sendable {
     }
 }
 
+enum TaskRunContextMode: String, Codable, Hashable, Sendable {
+    case freshThread
+    case reusedThread
+}
+
+struct TaskRunContinuation: Codable, Hashable, Sendable {
+    let mode: TaskRunContextMode
+    let sourceRunID: UUID?
+
+    init(mode: TaskRunContextMode, sourceRunID: UUID? = nil) {
+        self.mode = mode
+        self.sourceRunID = sourceRunID
+    }
+}
+
+enum TaskRunSandboxMode: String, Codable, Hashable, Sendable {
+    case readOnly
+    case workspaceWrite
+}
+
+enum TaskRunApprovalPolicy: String, Codable, Hashable, Sendable {
+    case never
+    case onRequest
+}
+
+struct TaskRunWorkspaceSnapshot: Codable, Hashable, Sendable {
+    let kind: TaskWorkspaceKind
+    let path: String
+    let branch: String?
+    let baseBranch: String?
+
+    init(
+        kind: TaskWorkspaceKind,
+        path: String,
+        branch: String? = nil,
+        baseBranch: String? = nil
+    ) {
+        self.kind = kind
+        self.path = path
+        self.branch = branch
+        self.baseBranch = baseBranch
+    }
+}
+
+struct TaskRunPolicySnapshot: Codable, Hashable, Sendable {
+    let hostID: String
+    let workspace: TaskRunWorkspaceSnapshot
+    let sandboxMode: TaskRunSandboxMode
+    let approvalPolicy: TaskRunApprovalPolicy
+    let networkAccess: Bool
+    let writableRoots: [String]
+    let serviceTier: String
+}
+
+enum TaskRunRecoveryDisposition: String, Codable, Hashable, Sendable {
+    case none
+    case automaticRetryScheduled
+    case manualInterventionRequired
+    case reconcileBeforeRetry
+}
+
+struct TaskRunFailure: Codable, Hashable, Sendable {
+    let kind: TaskFailureKind
+    let message: String
+    let occurredAt: Date
+    let recoveryDisposition: TaskRunRecoveryDisposition
+    let nextRetryAt: Date?
+    let consecutiveCount: Int
+    let automaticRetryCount: Int
+
+    init(
+        kind: TaskFailureKind,
+        message: String,
+        occurredAt: Date = Date(),
+        recoveryDisposition: TaskRunRecoveryDisposition,
+        nextRetryAt: Date? = nil,
+        consecutiveCount: Int = 1,
+        automaticRetryCount: Int = 0
+    ) {
+        self.kind = kind
+        self.message = message
+        self.occurredAt = occurredAt
+        self.recoveryDisposition = recoveryDisposition
+        self.nextRetryAt = nextRetryAt
+        self.consecutiveCount = consecutiveCount
+        self.automaticRetryCount = automaticRetryCount
+    }
+}
+
 struct TaskRun: Codable, Hashable, Identifiable, Sendable {
     let id: UUID
     var phase: TaskRunPhase
@@ -274,6 +363,9 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
     var model: String?
     var reasoningEffort: ReasoningEffort
     var fastMode: Bool
+    var continuation: TaskRunContinuation?
+    var policySnapshot: TaskRunPolicySnapshot?
+    var failure: TaskRunFailure?
     var summary: String
     var evidence: TaskDeliveryEvidence?
     var codeDelivery: TaskCodeDelivery?
@@ -294,6 +386,9 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
         model: String? = nil,
         reasoningEffort: ReasoningEffort,
         fastMode: Bool,
+        continuation: TaskRunContinuation? = nil,
+        policySnapshot: TaskRunPolicySnapshot? = nil,
+        failure: TaskRunFailure? = nil,
         summary: String = "",
         evidence: TaskDeliveryEvidence? = nil,
         codeDelivery: TaskCodeDelivery? = nil,
@@ -313,6 +408,9 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.fastMode = fastMode
+        self.continuation = continuation
+        self.policySnapshot = policySnapshot
+        self.failure = failure
         self.summary = summary
         self.evidence = evidence
         self.codeDelivery = codeDelivery

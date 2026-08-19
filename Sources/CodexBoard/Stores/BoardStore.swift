@@ -206,7 +206,7 @@ final class BoardStore {
     @ObservationIgnored
     private var oauthRequestsInProgress = Set<HostServerKey>()
     @ObservationIgnored
-    private var planAttentionIDs: [UUID: UUID] = [:]
+    private var durableAttentionIDs: [UUID: UUID] = [:]
     @ObservationIgnored
     private var shouldRefreshProjectsAgain = false
     @ObservationIgnored
@@ -1156,6 +1156,14 @@ final class BoardStore {
                 projectPath: project.path,
                 dependencies: dependencyHandoffs(for: tasks[inputIndex])
             )
+            let planningPolicy = taskRunPolicySnapshot(
+                for: tasks[inputIndex],
+                phase: .planning,
+                cwd: project.path
+            )
+            updateRun(at: inputIndex, runID: planningRunID) { run in
+                run.policySnapshot = planningPolicy
+            }
             guard await saveImmediately() else {
                 failTask(
                     at: currentIndex,
@@ -1254,7 +1262,7 @@ final class BoardStore {
 
     func revisePlan(taskID: UUID) {
         guard let index = taskIndex(taskID), !tasks[index].stage.isActive else { return }
-        resolvePlanAttention(taskID: taskID)
+        resolveDurableAttention(at: index)
         retryTasks[taskID]?.cancel()
         retryTasks[taskID] = nil
         tasks[index].stage = .inbox
@@ -1335,9 +1343,11 @@ final class BoardStore {
                             tasks[currentIndex].runs[runIndex].outcome = .running
                             tasks[currentIndex].runs[runIndex].endedAt = nil
                             tasks[currentIndex].runs[runIndex].error = nil
+                            tasks[currentIndex].runs[runIndex].failure = nil
                         }
                         tasks[currentIndex].stage = .executing
                         tasks[currentIndex].failureState = nil
+                        resolveFailureAttention(taskID: taskID)
                         completeTurn(
                             at: currentIndex,
                             turnID: candidateTurn.id,
@@ -1353,7 +1363,9 @@ final class BoardStore {
                         )
                         tasks[currentIndex].stage = .executing
                         tasks[currentIndex].executionApproved = false
+                        tasks[currentIndex].failureState = nil
                         tasks[currentIndex].lastError = nil
+                        resolveFailureAttention(taskID: taskID)
                         tasks[currentIndex].liveMessage = "正在重新连接远端执行…"
                         tasks[currentIndex].updatedAt = Date()
                         scheduleSave()
@@ -1416,6 +1428,7 @@ final class BoardStore {
     }
 
     private func enqueueContinuedExecution(at index: Int) {
+        resolveFailureAttention(taskID: tasks[index].id)
         tasks[index].executionTurnID = nil
         tasks[index].failureState = nil
         tasks[index].stage = .awaitingApproval
@@ -1529,7 +1542,7 @@ final class BoardStore {
         retryTasks[taskID]?.cancel()
         retryTasks[taskID] = nil
         clearInteractions(for: taskID)
-        resolvePlanAttention(taskID: taskID)
+        resolveDurableAttention(at: index)
         let deletedTask = tasks.remove(at: index)
         if selectedTaskID == taskID { selectedTaskID = nil }
         if deletedTask.attachments.contains(where: \.isManaged) {
@@ -1553,7 +1566,7 @@ final class BoardStore {
         tasks[index].stage = stage
         tasks[index].executionApproved = false
         if stage != .awaitingApproval {
-            resolvePlanAttention(taskID: taskID)
+            resolveDurableAttention(at: index)
         } else {
             addPlanAttention(taskID: taskID, createdAt: Date())
             focusTask(taskID)
@@ -1692,9 +1705,9 @@ final class BoardStore {
         }
         await refreshSSHSuggestions()
         await refreshProjects()
-        rebuildPlanAttentions()
         await reconcilePersistedActiveTasks(persistedActiveTaskIDs)
         normalizePendingRetriesAfterRestart()
+        rebuildDurableAttentions()
         scheduleEligiblePlanningTasks()
         scheduleExecutionQueue()
     }
@@ -1814,6 +1827,8 @@ final class BoardStore {
                             turnID: turn.id
                         )
                     }
+                    tasks[currentIndex].failureState = nil
+                    resolveFailureAttention(taskID: taskID)
                     let resumed = try await hostClient.resumeThread(
                         threadID: threadID,
                         cwd: detail.summary.cwd
@@ -2213,6 +2228,14 @@ final class BoardStore {
                 scheduleExecutionQueue()
                 return
             }
+            let executionPolicy = taskRunPolicySnapshot(
+                for: tasks[inputIndex],
+                phase: .execution,
+                cwd: executionPath
+            )
+            updateRun(at: inputIndex, runID: runID) { run in
+                run.policySnapshot = executionPolicy
+            }
             guard await saveImmediately() else {
                 failTask(
                     at: currentIndex,
@@ -2503,17 +2526,19 @@ final class BoardStore {
                 outcome: .completed,
                 summary: tasks[index].planText
             )
+            resolveFailureAttention(taskID: tasks[index].id)
             tasks[index].stage = .awaitingApproval
             tasks[index].failureState = nil
             tasks[index].executionApproved = tasks[index].autoRun
             tasks[index].liveMessage = tasks[index].autoRun ? "方案完成，已进入自动执行队列" : "方案完成，等待确认"
             appendLog(at: index, tasks[index].autoRun ? "方案完成；全自动模式已跳过确认。" : "方案已生成，等待确认。", level: .success)
-            tasks[index].updatedAt = Date()
-            scheduleSave(immediate: true)
+            let completedAt = Date()
+            tasks[index].updatedAt = completedAt
             if !tasks[index].autoRun {
-                addPlanAttention(taskID: tasks[index].id, createdAt: Date())
+                addPlanAttention(taskID: tasks[index].id, createdAt: completedAt)
                 focusTask(tasks[index].id)
             }
+            scheduleSave(immediate: true)
             scheduleExecutionQueue()
         } else {
             let evidence = TaskDeliveryEvidenceParser.parse(from: tasks[index].resultText)
@@ -2524,6 +2549,7 @@ final class BoardStore {
                 summary: evidence.summary,
                 evidence: evidence
             )
+            resolveFailureAttention(taskID: tasks[index].id)
             tasks[index].stage = .review
             tasks[index].failureState = nil
             tasks[index].executionApproved = false
@@ -2544,6 +2570,7 @@ final class BoardStore {
         retryPhase: TaskRunPhase? = nil,
         automaticRetryAllowed: Bool = true
     ) {
+        let now = Date()
         let taskID = tasks[index].id
         let cancellationRequested = cancellationIntentTaskIDs.contains(taskID)
         let effectiveMessage = cancellationRequested ? "任务已停止。" : message
@@ -2556,18 +2583,12 @@ final class BoardStore {
         clearInteractions(for: taskID)
         resolvePlanAttention(taskID: taskID)
         pendingStreamUpdates.removeValue(forKey: taskID)
-        if let runIndex = tasks[index].runs.lastIndex(where: { $0.outcome.isActive }) {
-            tasks[index].runs[runIndex].outcome = effectiveRunOutcome
-            tasks[index].runs[runIndex].endedAt = Date()
-            tasks[index].runs[runIndex].error = effectiveMessage
-            if tasks[index].runs[runIndex].summary.isEmpty {
-                tasks[index].runs[runIndex].summary = effectiveMessage
-            }
-        }
+        let failedRunIndex = tasks[index].runs.lastIndex(where: { $0.outcome.isActive })
+        let failedRunID = failedRunIndex.map { tasks[index].runs[$0].id }
         tasks[index].stage = .needsAttention
         tasks[index].executionApproved = false
         tasks[index].lastError = effectiveMessage
-        tasks[index].updatedAt = Date()
+        tasks[index].updatedAt = now
         appendLog(at: index, effectiveMessage, level: cancellationRequested ? .warning : .error)
 
         let resolvedKind = effectiveKind ?? classifyFailure(effectiveMessage)
@@ -2582,6 +2603,8 @@ final class BoardStore {
             && effectiveRetryPhase != nil
             && (resolvedKind == .startup || resolvedKind == .connection)
             && previousRetryCount < max(0, preferences.maxAutomaticRetries)
+        let recoveryDisposition: TaskRunRecoveryDisposition
+        var shouldCreateFailureAttention = false
 
         if cancellationRequested {
             tasks[index].failureState = TaskFailureState(
@@ -2589,21 +2612,25 @@ final class BoardStore {
                 consecutiveCount: consecutiveCount,
                 automaticRetryCount: previousRetryCount,
                 circuitOpen: true,
+                occurredAt: now,
                 message: effectiveMessage
             )
+            recoveryDisposition = .none
             tasks[index].liveMessage = "任务已停止"
         } else if mayRetry, let retryPhase = effectiveRetryPhase {
             let retryCount = previousRetryCount + 1
             let delay = retryCount == 1 ? 1 : min(8, 1 << (retryCount - 1))
-            let retryAt = Date().addingTimeInterval(TimeInterval(delay))
+            let retryAt = now.addingTimeInterval(TimeInterval(delay))
             tasks[index].failureState = TaskFailureState(
                 kind: resolvedKind,
                 consecutiveCount: consecutiveCount,
                 automaticRetryCount: retryCount,
                 circuitOpen: false,
+                occurredAt: now,
                 nextRetryAt: retryAt,
                 message: effectiveMessage
             )
+            recoveryDisposition = .automaticRetryScheduled
             tasks[index].liveMessage = "启动失败，\(delay) 秒后自动重试 \(retryCount)/\(preferences.maxAutomaticRetries)"
             appendLog(at: index, "将在 \(delay) 秒后自动重试（\(retryCount)/\(preferences.maxAutomaticRetries)）。", level: .warning)
             scheduleAutomaticRetry(taskID: taskID, phase: retryPhase, delay: delay)
@@ -2613,9 +2640,11 @@ final class BoardStore {
                 consecutiveCount: consecutiveCount,
                 automaticRetryCount: previousRetryCount,
                 circuitOpen: true,
+                occurredAt: now,
                 message: effectiveMessage
             )
             if !effectiveAutomaticRetryAllowed, effectiveRetryPhase != nil {
+                recoveryDisposition = .reconcileBeforeRetry
                 tasks[index].liveMessage = "请求状态不确定，已暂停以避免重复执行"
                 appendLog(
                     at: index,
@@ -2623,14 +2652,45 @@ final class BoardStore {
                     level: .warning
                 )
             } else {
+                recoveryDisposition = .manualInterventionRequired
                 tasks[index].liveMessage = "已熔断，等待人工处理"
             }
+            shouldCreateFailureAttention = true
             if effectiveAutomaticRetryAllowed,
                effectiveRetryPhase != nil,
                resolvedKind == .startup || resolvedKind == .connection,
                preferences.maxAutomaticRetries > 0 {
                 appendLog(at: index, "自动重试次数已用尽，熔断器已打开。", level: .warning)
             }
+        }
+
+        if let failedRunIndex,
+           let failureState = tasks[index].failureState {
+            tasks[index].runs[failedRunIndex].outcome = effectiveRunOutcome
+            tasks[index].runs[failedRunIndex].endedAt = now
+            tasks[index].runs[failedRunIndex].error = effectiveMessage
+            tasks[index].runs[failedRunIndex].failure = TaskRunFailure(
+                kind: resolvedKind,
+                message: effectiveMessage,
+                occurredAt: now,
+                recoveryDisposition: recoveryDisposition,
+                nextRetryAt: failureState.nextRetryAt,
+                consecutiveCount: failureState.consecutiveCount,
+                automaticRetryCount: failureState.automaticRetryCount
+            )
+            if tasks[index].runs[failedRunIndex].summary.isEmpty {
+                tasks[index].runs[failedRunIndex].summary = effectiveMessage
+            }
+        }
+
+        if shouldCreateFailureAttention {
+            addFailureAttention(
+                taskID: taskID,
+                runID: failedRunID,
+                createdAt: now
+            )
+        } else {
+            resolveFailureAttention(taskID: taskID)
         }
         scheduleSave(immediate: true)
     }
@@ -2831,41 +2891,144 @@ final class BoardStore {
     }
 
     private func addPlanAttention(taskID: UUID, createdAt: Date) {
-        guard planAttentionIDs[taskID] == nil else { return }
-        let notice = TaskAttentionNotice(
-            id: UUID(),
-            taskID: taskID,
-            kind: .planApproval,
-            createdAt: createdAt
-        )
-        planAttentionIDs[taskID] = notice.id
-        attentionNotices.append(notice)
+        guard let index = taskIndex(taskID) else { return }
+        let runID = tasks[index].runs.last(where: { $0.phase == .planning })?.id
+        var attention = tasks[index].attention
+        if attention?.kind != .planApproval {
+            attention = TaskAttention(
+                kind: .planApproval,
+                runID: runID,
+                createdAt: createdAt
+            )
+        } else if attention?.runID != runID {
+            attention?.runID = runID
+        }
+        if let attention {
+            setDurableAttention(attention, at: index)
+        }
     }
 
-    private func rebuildPlanAttentions() {
-        let existingNoticeIDs = Set(planAttentionIDs.values)
-        planAttentionIDs.removeAll()
+    private func addFailureAttention(
+        taskID: UUID,
+        runID: UUID?,
+        createdAt: Date
+    ) {
+        guard let index = taskIndex(taskID) else { return }
+        var attention = tasks[index].attention
+        if attention?.kind != .failure || attention?.runID != runID {
+            attention = TaskAttention(
+                kind: .failure,
+                runID: runID,
+                createdAt: createdAt
+            )
+        }
+        if let attention {
+            setDurableAttention(attention, at: index)
+        }
+    }
+
+    private func rebuildDurableAttentions() {
+        let existingNoticeIDs = Set(durableAttentionIDs.values)
+        durableAttentionIDs.removeAll()
         attentionNotices.removeAll { existingNoticeIDs.contains($0.id) }
 
-        let waitingTasks = tasks
-            .filter {
-                $0.stage == .awaitingApproval
-                    && !$0.executionApproved
-                    && $0.hasFinalPlan
-                    && !$0.planText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        var changed = false
+        var waitingPlanTaskIDs: [UUID] = []
+        for index in tasks.indices {
+            let expectedKind: TaskAttentionKind?
+            if tasks[index].stage == .awaitingApproval,
+               !tasks[index].executionApproved,
+               tasks[index].hasFinalPlan,
+               !tasks[index].planText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                expectedKind = .planApproval
+                waitingPlanTaskIDs.append(tasks[index].id)
+            } else if tasks[index].stage == .needsAttention,
+                      tasks[index].failureState?.circuitOpen == true,
+                      tasks[index].failureState?.kind != .interrupted {
+                expectedKind = .failure
+            } else {
+                expectedKind = nil
             }
-            .sorted { $0.updatedAt < $1.updatedAt }
-        for task in waitingTasks {
-            addPlanAttention(taskID: task.id, createdAt: task.updatedAt)
+
+            guard let expectedKind else {
+                if tasks[index].attention != nil {
+                    tasks[index].attention = nil
+                    changed = true
+                }
+                continue
+            }
+
+            let runID = switch expectedKind {
+            case .planApproval:
+                tasks[index].runs.last(where: { $0.phase == .planning })?.id
+            case .failure:
+                tasks[index].runs.last(where: { $0.failure != nil || $0.error != nil })?.id
+            }
+            var attention = tasks[index].attention
+            if attention?.kind != expectedKind {
+                let createdAt = expectedKind == .failure
+                    ? tasks[index].failureState?.occurredAt ?? tasks[index].updatedAt
+                    : tasks[index].updatedAt
+                attention = TaskAttention(
+                    kind: expectedKind,
+                    runID: runID,
+                    createdAt: createdAt
+                )
+                changed = true
+            } else if attention?.runID != runID {
+                attention?.runID = runID
+                changed = true
+            }
+            if let attention {
+                setDurableAttention(attention, at: index)
+            }
         }
-        if let newest = waitingTasks.last {
-            focusTask(newest.id)
+
+        if changed {
+            scheduleSave()
         }
+        if let newestTaskID = waitingPlanTaskIDs.max(by: { lhs, rhs in
+            guard let lhsIndex = taskIndex(lhs), let rhsIndex = taskIndex(rhs) else { return false }
+            return tasks[lhsIndex].updatedAt < tasks[rhsIndex].updatedAt
+        }) {
+            focusTask(newestTaskID)
+        }
+    }
+
+    private func setDurableAttention(_ attention: TaskAttention, at index: Int) {
+        let taskID = tasks[index].id
+        if let previousID = durableAttentionIDs[taskID], previousID != attention.id {
+            attentionNotices.removeAll { $0.id == previousID }
+        }
+        tasks[index].attention = attention
+        durableAttentionIDs[taskID] = attention.id
+        guard !attentionNotices.contains(where: { $0.id == attention.id }) else { return }
+        attentionNotices.append(TaskAttentionNotice(
+            id: attention.id,
+            taskID: taskID,
+            kind: attention.kind == .planApproval ? .planApproval : .failure,
+            createdAt: attention.createdAt
+        ))
     }
 
     private func resolvePlanAttention(taskID: UUID) {
-        guard let noticeID = planAttentionIDs.removeValue(forKey: taskID) else { return }
-        attentionNotices.removeAll { $0.id == noticeID }
+        guard let index = taskIndex(taskID), tasks[index].attention?.kind == .planApproval else { return }
+        resolveDurableAttention(at: index)
+    }
+
+    private func resolveFailureAttention(taskID: UUID) {
+        guard let index = taskIndex(taskID), tasks[index].attention?.kind == .failure else { return }
+        resolveDurableAttention(at: index)
+    }
+
+    private func resolveDurableAttention(at index: Int) {
+        let taskID = tasks[index].id
+        let noticeID = durableAttentionIDs.removeValue(forKey: taskID)
+            ?? tasks[index].attention?.id
+        tasks[index].attention = nil
+        if let noticeID {
+            attentionNotices.removeAll { $0.id == noticeID }
+        }
     }
 
     private func cancelPendingInteractions(for taskID: UUID) async {
@@ -3009,17 +3172,47 @@ final class BoardStore {
 
     @discardableResult
     private func beginRun(at taskIndex: Int, phase: TaskRunPhase) -> UUID {
+        let threadID = tasks[taskIndex].threadID
+        let sourceRunID = threadID.flatMap { threadID in
+            tasks[taskIndex].runs.last(where: { $0.threadID == threadID })?.id
+        }
         let run = TaskRun(
             phase: phase,
             attempt: tasks[taskIndex].runs.count(where: { $0.phase == phase }) + 1,
-            threadID: tasks[taskIndex].threadID,
+            threadID: threadID,
             sessionID: tasks[taskIndex].sessionID,
             model: tasks[taskIndex].actualModel ?? tasks[taskIndex].requestedModel.nilIfEmpty,
             reasoningEffort: tasks[taskIndex].reasoningEffort,
-            fastMode: tasks[taskIndex].fastMode
+            fastMode: tasks[taskIndex].fastMode,
+            continuation: TaskRunContinuation(
+                mode: threadID == nil ? .freshThread : .reusedThread,
+                sourceRunID: sourceRunID
+            )
         )
         tasks[taskIndex].runs.append(run)
         return run.id
+    }
+
+    private func taskRunPolicySnapshot(
+        for task: BoardTask,
+        phase: TaskRunPhase,
+        cwd: String
+    ) -> TaskRunPolicySnapshot {
+        let isPlanning = phase == .planning
+        return TaskRunPolicySnapshot(
+            hostID: task.hostID,
+            workspace: TaskRunWorkspaceSnapshot(
+                kind: isPlanning ? .project : task.workspace.kind,
+                path: cwd,
+                branch: isPlanning ? nil : task.workspace.branch,
+                baseBranch: isPlanning ? nil : task.workspace.baseBranch
+            ),
+            sandboxMode: isPlanning ? .readOnly : .workspaceWrite,
+            approvalPolicy: isPlanning ? .never : .onRequest,
+            networkAccess: isPlanning ? false : preferences.allowNetworkAccess,
+            writableRoots: isPlanning ? [] : [cwd],
+            serviceTier: task.fastMode ? CodexServiceTier.fast : CodexServiceTier.standard
+        )
     }
 
     private func updateRun(
@@ -3046,6 +3239,7 @@ final class BoardStore {
         tasks[taskIndex].runs[runIndex].outcome = .running
         tasks[taskIndex].runs[runIndex].endedAt = nil
         tasks[taskIndex].runs[runIndex].error = nil
+        tasks[taskIndex].runs[runIndex].failure = nil
     }
 
     private func finishActiveRun(

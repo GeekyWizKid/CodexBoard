@@ -497,6 +497,7 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
     var workspace: TaskWorkspaceConfiguration
     var dependencyIDs: [UUID]
     var failureState: TaskFailureState?
+    var attention: TaskAttention?
 
     init(
         id: UUID = UUID(),
@@ -532,7 +533,8 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         reviewFeedback: String? = nil,
         workspace: TaskWorkspaceConfiguration = .project,
         dependencyIDs: [UUID] = [],
-        failureState: TaskFailureState? = nil
+        failureState: TaskFailureState? = nil,
+        attention: TaskAttention? = nil
     ) {
         self.id = id
         self.projectID = projectID
@@ -569,6 +571,7 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         self.workspace = workspace
         self.dependencyIDs = dependencyIDs
         self.failureState = failureState
+        self.attention = attention
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -577,7 +580,7 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         case executionApproved, createdAt, updatedAt, planText, hasFinalPlan, structuredPlan
         case resultText, liveMessage, threadID, sessionID, planningTurnID, executionTurnID
         case requestedModel, reasoningEffort, fastMode, actualModel, lastError, logs
-        case runs, reviewFeedback, workspace, dependencyIDs, failureState
+        case runs, reviewFeedback, workspace, dependencyIDs, failureState, attention
     }
 
     private enum LegacyCodingKeys: String, CodingKey {
@@ -626,6 +629,7 @@ struct BoardTask: Codable, Hashable, Identifiable, Sendable {
         workspace = try container.decodeIfPresent(TaskWorkspaceConfiguration.self, forKey: .workspace) ?? .project
         dependencyIDs = try container.decodeIfPresent([UUID].self, forKey: .dependencyIDs) ?? []
         failureState = try container.decodeIfPresent(TaskFailureState.self, forKey: .failureState)
+        attention = try container.decodeIfPresent(TaskAttention.self, forKey: .attention)
     }
 }
 
@@ -754,7 +758,7 @@ struct BoardPreferences: Codable, Equatable, Sendable {
 }
 
 struct BoardSnapshot: Codable, Sendable {
-    static let currentVersion = 9
+    static let currentVersion = 10
 
     var version: Int
     var tasks: [BoardTask]

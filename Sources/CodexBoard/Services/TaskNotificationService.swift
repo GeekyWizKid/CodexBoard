@@ -246,6 +246,11 @@ final class TaskNotificationService: NSObject {
                 "notification.attention.plan",
                 fallback: "A task plan is ready and waiting for approval."
             )
+        case .failure:
+            L10n.text(
+                "notification.attention.failure",
+                fallback: "A task needs manual attention. Open CodexBoard to review it."
+            )
         }
         content.sound = .default
         content.categoryIdentifier = TaskNotificationConstants.categoryIdentifier

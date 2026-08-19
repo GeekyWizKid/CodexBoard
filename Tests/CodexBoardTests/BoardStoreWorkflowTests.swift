@@ -137,6 +137,17 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(task.failureState?.kind, .authentication)
         XCTAssertEqual(task.failureState?.automaticRetryCount, 0)
         XCTAssertEqual(task.failureState?.circuitOpen, true)
+        let failedRun = try XCTUnwrap(task.runs.last)
+        let runFailure = try XCTUnwrap(failedRun.failure)
+        XCTAssertEqual(runFailure.kind, .authentication)
+        XCTAssertEqual(runFailure.recoveryDisposition, .manualInterventionRequired)
+        XCTAssertEqual(runFailure.occurredAt, task.failureState?.occurredAt)
+        XCTAssertEqual(failedRun.endedAt, runFailure.occurredAt)
+        XCTAssertEqual(task.attention?.kind, .failure)
+        XCTAssertEqual(task.attention?.runID, failedRun.id)
+        XCTAssertTrue(fixture.store.attentionNotices.contains(where: {
+            $0.id == task.attention?.id && $0.kind == .failure
+        }))
     }
 
     func testTransientPlanningStartupFailureRetriesOnce() async throws {
@@ -164,6 +175,14 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(retrying.stage, .planning)
         XCTAssertEqual(retrying.failureState?.automaticRetryCount, 1)
         XCTAssertEqual(retrying.failureState?.circuitOpen, false)
+        let planningRuns = retrying.runs.filter { $0.phase == .planning }
+        XCTAssertEqual(planningRuns.count, 2)
+        XCTAssertEqual(planningRuns[0].failure?.recoveryDisposition, .automaticRetryScheduled)
+        XCTAssertEqual(planningRuns[0].failure?.automaticRetryCount, 1)
+        XCTAssertNotNil(planningRuns[0].failure?.nextRetryAt)
+        XCTAssertEqual(planningRuns[1].continuation?.mode, .reusedThread)
+        XCTAssertEqual(planningRuns[1].continuation?.sourceRunID, planningRuns[0].id)
+        XCTAssertNil(retrying.attention)
         let retryThreadID = try XCTUnwrap(retrying.threadID)
         let retryTurnID = try XCTUnwrap(retrying.planningTurnID)
 
@@ -187,6 +206,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
         )
         XCTAssertEqual(fixture.client.executionTurnCount, 1)
         XCTAssertNil(recovered.failureState)
+        XCTAssertNil(recovered.attention)
     }
 
     func testCancelDuringPendingPlanningStartupFailureSuppressesAutomaticRetry() async throws {
@@ -219,6 +239,14 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(interrupted.failureState?.automaticRetryCount, 0)
         XCTAssertTrue(interrupted.failureState?.circuitOpen == true)
         XCTAssertNil(interrupted.failureState?.nextRetryAt)
+        XCTAssertEqual(
+            interrupted.runs.last?.failure?.recoveryDisposition,
+            TaskRunRecoveryDisposition.none
+        )
+        XCTAssertNil(interrupted.attention)
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: {
+            $0.taskID == taskID && $0.kind == .failure
+        }))
 
         try await Task.sleep(for: .milliseconds(1_200))
         let settled = try XCTUnwrap(fixture.store.tasks.first(where: { $0.id == taskID }))
@@ -261,6 +289,9 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(task.attachments.count, 1)
         XCTAssertEqual(task.failureState?.automaticRetryCount, 0)
         XCTAssertEqual(task.failureState?.circuitOpen, true)
+        XCTAssertEqual(task.runs.last?.failure?.recoveryDisposition, .reconcileBeforeRetry)
+        XCTAssertEqual(task.attention?.kind, .failure)
+        XCTAssertEqual(task.attention?.runID, task.runs.last?.id)
         XCTAssertEqual(task.liveMessage, "请求状态不确定，已暂停以避免重复执行")
         XCTAssertTrue(task.logs.contains { $0.message.contains("未自动重试") })
     }
@@ -317,6 +348,24 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(client.executionCalls[0].cwd, worktreePath)
         XCTAssertTrue(executing.workspace.branch?.hasPrefix("codex/task-") == true)
         XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath))
+        let planningRun = try XCTUnwrap(executing.runs.first(where: { $0.phase == .planning }))
+        let executionRun = try XCTUnwrap(executing.runs.last(where: { $0.phase == .execution }))
+        XCTAssertEqual(planningRun.continuation?.mode, .freshThread)
+        XCTAssertNil(planningRun.continuation?.sourceRunID)
+        XCTAssertEqual(planningRun.policySnapshot?.workspace.path, projectURL.path)
+        XCTAssertEqual(planningRun.policySnapshot?.workspace.kind, .project)
+        XCTAssertEqual(planningRun.policySnapshot?.sandboxMode, .readOnly)
+        XCTAssertEqual(planningRun.policySnapshot?.approvalPolicy, .never)
+        XCTAssertEqual(planningRun.policySnapshot?.networkAccess, false)
+        XCTAssertEqual(planningRun.policySnapshot?.writableRoots, [])
+        XCTAssertEqual(executionRun.continuation?.mode, .reusedThread)
+        XCTAssertEqual(executionRun.continuation?.sourceRunID, planningRun.id)
+        XCTAssertEqual(executionRun.policySnapshot?.workspace.path, worktreePath)
+        XCTAssertEqual(executionRun.policySnapshot?.workspace.kind, .worktree)
+        XCTAssertEqual(executionRun.policySnapshot?.sandboxMode, .workspaceWrite)
+        XCTAssertEqual(executionRun.policySnapshot?.approvalPolicy, .onRequest)
+        XCTAssertEqual(executionRun.policySnapshot?.networkAccess, true)
+        XCTAssertEqual(executionRun.policySnapshot?.writableRoots, [worktreePath])
 
         client.send(.agentFinal(
             threadID: "thread-1",
@@ -615,6 +664,7 @@ final class BoardStoreWorkflowTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
         let taskID = UUID()
+        let attentionID = UUID()
         let updatedAt = Date(timeIntervalSince1970: 1_750_000_000)
         let task = BoardTask(
             id: taskID,
@@ -629,7 +679,12 @@ final class BoardStoreWorkflowTests: XCTestCase {
             planText: "1. Inspect\n2. Implement\n3. Verify",
             hasFinalPlan: true,
             liveMessage: "方案完成，等待确认",
-            threadID: "thread-persisted"
+            threadID: "thread-persisted",
+            attention: TaskAttention(
+                id: attentionID,
+                kind: .planApproval,
+                createdAt: updatedAt
+            )
         )
         try await persistence.save(BoardSnapshot(
             version: BoardSnapshot.currentVersion,
@@ -656,12 +711,89 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(store.selectedProjectID, directory.path)
         XCTAssertEqual(store.selectedTaskID, taskID)
         XCTAssertEqual(store.taskFocusRequest?.stage, .awaitingApproval)
+        XCTAssertEqual(store.tasks.first?.attention?.id, attentionID)
         XCTAssertEqual(
             store.attentionNotices.first(where: {
                 $0.taskID == taskID && $0.kind == .planApproval
-            })?.createdAt,
-            updatedAt
+            })?.id,
+            attentionID
         )
+        XCTAssertEqual(store.tasks.first?.attention?.createdAt, updatedAt)
+        XCTAssertEqual(client.executionTurnCount, 0)
+    }
+
+    func testPersistedFailureAttentionRestoresSameNoticeAfterRestart() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let persistence = BoardPersistence(fileURL: directory.appendingPathComponent("board.json"))
+        let taskID = UUID()
+        let runID = UUID()
+        let attentionID = UUID()
+        let failedAt = Date(timeIntervalSince1970: 1_750_000_100)
+        let message = "Workspace requires inspection"
+        let run = TaskRun(
+            id: runID,
+            phase: .execution,
+            attempt: 1,
+            startedAt: failedAt.addingTimeInterval(-10),
+            endedAt: failedAt,
+            outcome: .failed,
+            reasoningEffort: .high,
+            fastMode: false,
+            failure: TaskRunFailure(
+                kind: .workspace,
+                message: message,
+                occurredAt: failedAt,
+                recoveryDisposition: .manualInterventionRequired
+            ),
+            summary: message,
+            error: message
+        )
+        let task = BoardTask(
+            id: taskID,
+            projectID: directory.path,
+            title: "Restore failure attention",
+            sourceKind: .issue,
+            sourceText: "Keep the failure actionable after relaunch",
+            stage: .needsAttention,
+            autoRun: false,
+            updatedAt: failedAt,
+            lastError: message,
+            runs: [run],
+            failureState: TaskFailureState(
+                kind: .workspace,
+                circuitOpen: true,
+                occurredAt: failedAt,
+                message: message
+            ),
+            attention: TaskAttention(
+                id: attentionID,
+                kind: .failure,
+                runID: runID,
+                createdAt: failedAt
+            )
+        )
+        try await persistence.save(BoardSnapshot(
+            version: BoardSnapshot.currentVersion,
+            tasks: [task],
+            manualProjectPaths: [directory.path],
+            preferences: BoardPreferences()
+        ))
+        let client = MockCodexTaskClient(projectPath: directory.path)
+        let store = BoardStore(client: client, persistence: persistence)
+
+        store.start()
+        try await eventually {
+            store.projects.contains(where: { $0.id == directory.path })
+                && store.attentionNotices.contains(where: {
+                    $0.id == attentionID && $0.kind == .failure
+                })
+        }
+
+        XCTAssertEqual(store.tasks.first?.attention?.id, attentionID)
+        XCTAssertEqual(store.tasks.first?.attention?.runID, runID)
+        XCTAssertEqual(store.attentionNotices.first(where: { $0.id == attentionID })?.createdAt, failedAt)
+        XCTAssertEqual(client.threadStartCount, 0)
         XCTAssertEqual(client.executionTurnCount, 0)
     }
 
@@ -3615,6 +3747,9 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(closedRun.outcome, .failed)
         XCTAssertNotNil(closedRun.endedAt)
         XCTAssertNotNil(closedRun.error)
+        XCTAssertEqual(closedRun.failure?.kind, .connection)
+        XCTAssertEqual(closedTask.attention?.kind, .failure)
+        XCTAssertEqual(closedTask.attention?.runID, executionRunID)
 
         fixture.store.continueExecution(taskID: taskID)
         try await eventually {
@@ -3634,6 +3769,12 @@ final class BoardStoreWorkflowTests: XCTestCase {
         XCTAssertEqual(resumedRun.outcome, .running)
         XCTAssertNil(resumedRun.endedAt)
         XCTAssertNil(resumedRun.error)
+        XCTAssertNil(resumedRun.failure)
+        XCTAssertNil(resumedTask.failureState)
+        XCTAssertNil(resumedTask.attention)
+        XCTAssertFalse(fixture.store.attentionNotices.contains(where: {
+            $0.taskID == taskID && $0.kind == .failure
+        }))
     }
 
     private func makeThreadDetail(

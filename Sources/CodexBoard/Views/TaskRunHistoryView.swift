@@ -34,7 +34,7 @@ private struct TaskRunHistoryRow: View {
                 if let reviewNote = run.reviewNote {
                     labeledText("验收反馈", reviewNote, tint: BoardTheme.approval)
                 }
-                if let error = run.error {
+                if let error = run.failure?.message ?? run.error {
                     labeledText("错误", error, tint: BoardTheme.danger)
                 }
                 runMetadata

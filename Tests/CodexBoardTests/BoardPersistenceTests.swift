@@ -182,6 +182,199 @@ final class BoardPersistenceTests: XCTestCase {
 
         XCTAssertNil(run.codeDelivery)
         XCTAssertNil(run.evidence)
+        XCTAssertNil(run.continuation)
+        XCTAssertNil(run.policySnapshot)
+        XCTAssertNil(run.failure)
+    }
+
+    func testVersionNineSnapshotDefaultsVersionTenRunMetadataAndAttentionToNil() throws {
+        let run = TaskRun(
+            id: UUID(uuidString: "9C3F24FB-C91E-4A83-993F-3BFFB3EC13DE")!,
+            phase: .execution,
+            attempt: 1,
+            startedAt: Date(timeIntervalSinceReferenceDate: 30),
+            endedAt: Date(timeIntervalSinceReferenceDate: 40),
+            outcome: .failed,
+            threadID: "legacy-thread",
+            sessionID: "legacy-session",
+            turnID: "legacy-turn",
+            model: "gpt-legacy",
+            reasoningEffort: .high,
+            fastMode: false,
+            summary: "Legacy failure",
+            error: "Connection lost"
+        )
+        let task = BoardTask(
+            projectID: "/tmp/version-nine",
+            title: "Version nine task",
+            sourceKind: .issue,
+            sourceText: "Preserve the legacy projection",
+            stage: .needsAttention,
+            autoRun: false,
+            threadID: "current-thread",
+            sessionID: "current-session",
+            executionTurnID: "current-turn",
+            requestedModel: "gpt-current",
+            actualModel: "gpt-current",
+            lastError: "Current projection error",
+            runs: [run]
+        )
+        let snapshot = BoardSnapshot(
+            tasks: [task],
+            hosts: [.local],
+            manualProjects: [],
+            preferences: BoardPreferences()
+        )
+        var object = try jsonDictionary(snapshot)
+        object["version"] = 9
+        var tasks = try XCTUnwrap(object["tasks"] as? [[String: Any]])
+        tasks[0].removeValue(forKey: "attention")
+        var runs = try XCTUnwrap(tasks[0]["runs"] as? [[String: Any]])
+        runs[0].removeValue(forKey: "continuation")
+        runs[0].removeValue(forKey: "policySnapshot")
+        runs[0].removeValue(forKey: "failure")
+        tasks[0]["runs"] = runs
+        object["tasks"] = tasks
+
+        let migrated = try JSONDecoder().decode(
+            BoardSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        )
+        let migratedTask = try XCTUnwrap(migrated.tasks.first)
+        let migratedRun = try XCTUnwrap(migratedTask.runs.first)
+
+        XCTAssertEqual(migrated.version, 10)
+        XCTAssertNil(migratedTask.attention)
+        XCTAssertNil(migratedRun.continuation)
+        XCTAssertNil(migratedRun.policySnapshot)
+        XCTAssertNil(migratedRun.failure)
+        XCTAssertEqual(migratedRun.threadID, "legacy-thread")
+        XCTAssertEqual(migratedRun.error, "Connection lost")
+        XCTAssertEqual(migratedTask.threadID, "current-thread")
+        XCTAssertEqual(migratedTask.lastError, "Current projection error")
+    }
+
+    func testVersionTenRoundTripPreservesRunMetadataAndAttention() async throws {
+        let fixture = try TemporaryBoardFixture()
+        defer { fixture.remove() }
+
+        let sourceRunID = UUID(uuidString: "928A67C4-8FB2-4FB2-90FA-0B17A81F59CB")!
+        let runID = UUID(uuidString: "C87A3084-FD66-49F4-B0EA-4C5B732E4CC5")!
+        let failureDate = Date(timeIntervalSinceReferenceDate: 1_234)
+        let retryDate = Date(timeIntervalSinceReferenceDate: 1_242)
+        let continuation = TaskRunContinuation(
+            mode: .reusedThread,
+            sourceRunID: sourceRunID
+        )
+        let policy = TaskRunPolicySnapshot(
+            hostID: "build-server",
+            workspace: TaskRunWorkspaceSnapshot(
+                kind: .worktree,
+                path: "/tmp/worktrees/task",
+                branch: "codex/task",
+                baseBranch: "main"
+            ),
+            sandboxMode: .workspaceWrite,
+            approvalPolicy: .onRequest,
+            networkAccess: true,
+            writableRoots: ["/tmp/worktrees/task"],
+            serviceTier: "fast"
+        )
+        let failure = TaskRunFailure(
+            kind: .connection,
+            message: "Connection lost",
+            occurredAt: failureDate,
+            recoveryDisposition: .automaticRetryScheduled,
+            nextRetryAt: retryDate,
+            consecutiveCount: 3,
+            automaticRetryCount: 2
+        )
+        let attention = TaskAttention(
+            id: UUID(uuidString: "4679089C-4A2C-4DFA-8597-D39BF57B41A1")!,
+            kind: .failure,
+            runID: runID,
+            createdAt: failureDate
+        )
+        let run = TaskRun(
+            id: runID,
+            phase: .execution,
+            attempt: 2,
+            startedAt: Date(timeIntervalSinceReferenceDate: 1_200),
+            endedAt: failureDate,
+            outcome: .failed,
+            threadID: "thread-10",
+            sessionID: "session-10",
+            turnID: "turn-10",
+            model: "gpt-5",
+            reasoningEffort: .xhigh,
+            fastMode: true,
+            continuation: continuation,
+            policySnapshot: policy,
+            failure: failure,
+            summary: "Connection lost",
+            error: failure.message
+        )
+        let task = BoardTask(
+            projectID: "/tmp/project",
+            hostID: "build-server",
+            title: "Persist v10 metadata",
+            sourceKind: .developmentPlan,
+            sourceText: "Round-trip the v10 ledger",
+            stage: .needsAttention,
+            autoRun: false,
+            threadID: "thread-10",
+            sessionID: "session-10",
+            executionTurnID: "turn-10",
+            requestedModel: "gpt-5",
+            reasoningEffort: .xhigh,
+            fastMode: true,
+            actualModel: "gpt-5",
+            lastError: failure.message,
+            runs: [run],
+            workspace: TaskWorkspaceConfiguration(
+                kind: .worktree,
+                path: "/tmp/worktrees/task",
+                branch: "codex/task",
+                baseBranch: "main"
+            ),
+            failureState: TaskFailureState(
+                kind: .connection,
+                consecutiveCount: 3,
+                automaticRetryCount: 2,
+                nextRetryAt: retryDate,
+                message: failure.message
+            ),
+            attention: attention
+        )
+        let snapshot = BoardSnapshot(
+            tasks: [task],
+            hosts: [
+                .local,
+                CodexHost(
+                    id: "build-server",
+                    name: "Build Server",
+                    kind: .ssh,
+                    sshAlias: "build",
+                    maxConcurrentExecutions: 2
+                )
+            ],
+            manualProjects: [],
+            preferences: BoardPreferences()
+        )
+        let persistence = BoardPersistence(fileURL: fixture.fileURL)
+
+        try await persistence.save(snapshot)
+        let restored = try await persistence.load()
+        let restoredTask = try XCTUnwrap(restored.tasks.first)
+        let restoredRun = try XCTUnwrap(restoredTask.runs.first)
+
+        XCTAssertEqual(restored.version, 10)
+        XCTAssertEqual(restoredRun.continuation, continuation)
+        XCTAssertEqual(restoredRun.policySnapshot, policy)
+        XCTAssertEqual(restoredRun.failure, failure)
+        XCTAssertEqual(restoredTask.attention, attention)
+        XCTAssertEqual(restoredTask.failureState?.consecutiveCount, 3)
+        XCTAssertEqual(restoredTask.failureState?.automaticRetryCount, 2)
     }
 
     func testCodeDeliveryDefaultsMissingTruncationFlag() throws {
@@ -239,12 +432,12 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertEqual(savedObject["version"] as? Int, BoardSnapshot.currentVersion)
     }
 
-    func testSnapshotVersionsOneThroughEightDefaultMissingHostDataToLocal() throws {
+    func testSnapshotVersionsOneThroughNineDefaultMissingHostDataToLocal() throws {
         let legacyTask = makeTask()
         var taskObject = try jsonDictionary(legacyTask)
         taskObject.removeValue(forKey: "hostID")
 
-        for legacyVersion in 1...8 {
+        for legacyVersion in 1...9 {
             let legacyObject: [String: Any] = [
                 "version": legacyVersion,
                 "tasks": [taskObject],
@@ -455,6 +648,8 @@ final class BoardPersistenceTests: XCTestCase {
         try legacyData.write(to: fixture.fileURL)
         let persistence = BoardPersistence(fileURL: fixture.fileURL)
 
+        XCTAssertEqual(fixture.migrationBackupURL.lastPathComponent, "board.pre-v10.json")
+
         let migrated = try await persistence.load()
         try await persistence.save(migrated)
 
@@ -525,6 +720,7 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertEqual(loaded.tasks.first?.runs, [])
         XCTAssertNil(loaded.tasks.first?.reviewFeedback)
         XCTAssertEqual(loaded.tasks.first?.workspace, .project)
+        XCTAssertNil(loaded.tasks.first?.attention)
         XCTAssertEqual(loaded.hiddenProjectPaths, [])
         loaded.version = BoardSnapshot.currentVersion
         try await persistence.save(loaded)

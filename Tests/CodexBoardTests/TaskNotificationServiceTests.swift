@@ -77,4 +77,31 @@ final class TaskNotificationServiceTests: XCTestCase {
             taskID.uuidString
         )
     }
+
+    func testFailureNotificationUsesGenericCopyAndOnlyTaskIdentifier() {
+        let taskID = UUID()
+        let notice = TaskAttentionNotice(
+            id: UUID(),
+            taskID: taskID,
+            kind: .failure,
+            createdAt: Date()
+        )
+
+        let content = TaskNotificationService.notificationContent(for: notice)
+
+        XCTAssertEqual(
+            content.body,
+            L10n.text(
+                "notification.attention.failure",
+                fallback: "A task needs manual attention. Open CodexBoard to review it."
+            )
+        )
+        XCTAssertFalse(content.body.contains("super-secret-answer"))
+        XCTAssertFalse(content.body.contains("/Users/private/worktree"))
+        XCTAssertEqual(content.userInfo.count, 1)
+        XCTAssertEqual(
+            content.userInfo[TaskNotificationConstants.taskIDUserInfoKey] as? String,
+            taskID.uuidString
+        )
+    }
 }
