@@ -1254,4 +1254,138 @@ final class CodexAppServerClientTests: XCTestCase {
             ])
         ))
     }
+
+    func testDescendantThreadListParamsUseExactExperimentalFilters() throws {
+        let params = try XCTUnwrap(CodexAppServerClient.makeDescendantThreadListParams(
+            ancestorThreadID: "root-1",
+            cursor: nil
+        ).objectValue)
+
+        XCTAssertEqual(params["ancestorThreadId"], .string("root-1"))
+        XCTAssertEqual(params["limit"], .integer(100))
+        XCTAssertEqual(params["archived"], .bool(false))
+        XCTAssertEqual(params["useStateDbOnly"], .bool(false))
+        XCTAssertEqual(params["sourceKinds"], .array([
+            "subAgent",
+            "subAgentReview",
+            "subAgentCompact",
+            "subAgentThreadSpawn",
+            "subAgentOther"
+        ].map(JSONValue.string)))
+        XCTAssertNil(params["cursor"])
+        XCTAssertNil(params["parentThreadId"])
+
+        let continued = try XCTUnwrap(CodexAppServerClient.makeDescendantThreadListParams(
+            ancestorThreadID: "root-1",
+            cursor: "cursor-2"
+        ).objectValue)
+        XCTAssertEqual(continued["cursor"], .string("cursor-2"))
+    }
+
+    func testDescendantThreadListResponseParsesStrictPage() throws {
+        let page = try CodexAppServerClient.parseDescendantThreadListResponse(.object([
+            "data": .array([Self.descendantThreadValue(id: "child-1", parentThreadID: "root-1")]),
+            "nextCursor": .string("cursor-2")
+        ]))
+
+        XCTAssertEqual(page.threads.count, 1)
+        XCTAssertEqual(page.threads[0].id, "child-1")
+        XCTAssertEqual(page.threads[0].parentThreadID, "root-1")
+        XCTAssertEqual(page.threads[0].sourceKind, "subAgent")
+        XCTAssertEqual(page.nextCursor, "cursor-2")
+
+        let finalPage = try CodexAppServerClient.parseDescendantThreadListResponse(.object([
+            "data": .array([]),
+            "nextCursor": .null
+        ]))
+        XCTAssertTrue(finalPage.threads.isEmpty)
+        XCTAssertNil(finalPage.nextCursor)
+    }
+
+    func testDescendantThreadListResponseFailsClosedOnMalformedPayload() {
+        XCTAssertThrowsError(try CodexAppServerClient.parseDescendantThreadListResponse(.object([:]))) {
+            XCTAssertEqual($0 as? CodexClientError, .invalidResponse("后代 thread/list 缺少 data"))
+        }
+        XCTAssertThrowsError(try CodexAppServerClient.parseDescendantThreadListResponse(.object([
+            "data": .array([.object(["id": .string("child-1")])])
+        ]))) {
+            XCTAssertEqual($0 as? CodexClientError, .invalidResponse("后代 thread/list 包含无效 thread"))
+        }
+        XCTAssertThrowsError(try CodexAppServerClient.parseDescendantThreadListResponse(.object([
+            "data": .array([]),
+            "nextCursor": .bool(false)
+        ]))) {
+            XCTAssertEqual($0 as? CodexClientError, .invalidResponse("后代 thread/list 包含无效 nextCursor"))
+        }
+    }
+
+    func testDescendantThreadPaginationAccumulatesPagesAndRejectsCyclesAndBounds() throws {
+        let child = try XCTUnwrap(CodexAppServerClient.parseDescendantThreadListResponse(.object([
+            "data": .array([Self.descendantThreadValue(id: "child-1", parentThreadID: "root-1")]),
+            "nextCursor": .null
+        ])).threads.first)
+
+        var pagination = CodexAppServerClient.DescendantThreadPaginationState(
+            maximumPageCount: 2,
+            maximumThreadCount: 2
+        )
+        try pagination.consume(CodexThreadPage(threads: [child], nextCursor: "cursor-2"))
+        try pagination.consume(CodexThreadPage(threads: [child], nextCursor: nil))
+        XCTAssertEqual(pagination.pageCount, 2)
+        XCTAssertEqual(pagination.threads.map(\.id), ["child-1", "child-1"])
+        XCTAssertNil(pagination.nextCursor)
+
+        var cycle = CodexAppServerClient.DescendantThreadPaginationState(
+            maximumPageCount: 3,
+            maximumThreadCount: 3
+        )
+        try cycle.consume(CodexThreadPage(threads: [], nextCursor: "repeat"))
+        XCTAssertThrowsError(try cycle.consume(CodexThreadPage(threads: [], nextCursor: "repeat"))) {
+            XCTAssertEqual($0 as? CodexClientError, .invalidResponse("后代 thread/list cursor 循环：repeat"))
+        }
+
+        var pageBound = CodexAppServerClient.DescendantThreadPaginationState(
+            maximumPageCount: 1,
+            maximumThreadCount: 2
+        )
+        XCTAssertThrowsError(try pageBound.consume(CodexThreadPage(threads: [], nextCursor: "more"))) {
+            XCTAssertEqual($0 as? CodexClientError, .invalidResponse("后代 thread/list 超过分页上限"))
+        }
+
+        var nodeBound = CodexAppServerClient.DescendantThreadPaginationState(
+            maximumPageCount: 2,
+            maximumThreadCount: 1
+        )
+        XCTAssertThrowsError(try nodeBound.consume(CodexThreadPage(threads: [child, child], nextCursor: nil))) {
+            XCTAssertEqual($0 as? CodexClientError, .invalidResponse("后代 thread/list 超过节点上限"))
+        }
+    }
+
+    private static func descendantThreadValue(id: String, parentThreadID: String) -> JSONValue {
+        .object([
+            "id": .string(id),
+            "sessionId": .string("root-1"),
+            "parentThreadId": .string(parentThreadID),
+            "preview": .string(""),
+            "ephemeral": .bool(false),
+            "modelProvider": .string("openai"),
+            "createdAt": .integer(1_770_000_000),
+            "updatedAt": .integer(1_770_000_001),
+            "status": .object(["type": .string("idle")]),
+            "cwd": .string("/srv/project"),
+            "cliVersion": .string("0.148.0"),
+            "source": .object([
+                "subAgent": .object([
+                    "thread_spawn": .object([
+                        "parent_thread_id": .string(parentThreadID),
+                        "depth": .integer(1),
+                        "agent_path": .null,
+                        "agent_nickname": .null,
+                        "agent_role": .null
+                    ])
+                ])
+            ]),
+            "turns": .array([])
+        ])
+    }
 }

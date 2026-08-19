@@ -5,6 +5,19 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     static let mcpServerStatusListMethod = "mcpServerStatus/list"
     static let mcpOAuthLoginMethod = "mcpServer/oauth/login"
     static let mcpOAuthCompletionMethod = "mcpServer/oauthLogin/completed"
+    static let descendantThreadSourceKinds = [
+        "subAgent",
+        "subAgentReview",
+        "subAgentCompact",
+        "subAgentThreadSpawn",
+        "subAgentOther"
+    ]
+    static let descendantThreadPageSize = 100
+    static let maximumDescendantThreadPageCount = 100
+    // Keep network enumeration aligned with the graph validator. A runaway or
+    // cyclic agent tree must fail closed before it can consume an unbounded
+    // amount of memory during reconciliation.
+    static let maximumDescendantThreadCount = 128
 
     @Published private(set) var connectionState: CodexConnectionState = .disconnected
     @Published private(set) var lastError: String?
@@ -50,6 +63,50 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
     struct MCPServerPage: Equatable {
         let servers: [CodexMCPServerStatus]
         let nextCursor: String?
+    }
+
+    struct DescendantThreadPaginationState {
+        private let maximumPageCount: Int
+        private let maximumThreadCount: Int
+        private var seenCursors: Set<String> = []
+
+        private(set) var pageCount = 0
+        private(set) var threads: [CodexThreadSummary] = []
+        private(set) var nextCursor: String?
+
+        init(
+            maximumPageCount: Int,
+            maximumThreadCount: Int
+        ) {
+            self.maximumPageCount = max(1, maximumPageCount)
+            self.maximumThreadCount = max(1, maximumThreadCount)
+        }
+
+        mutating func consume(_ page: CodexThreadPage) throws {
+            let nextPageCount = pageCount + 1
+            guard nextPageCount <= maximumPageCount else {
+                throw CodexClientError.invalidResponse("后代 thread/list 超过分页上限")
+            }
+            guard page.threads.count <= maximumThreadCount - threads.count else {
+                throw CodexClientError.invalidResponse("后代 thread/list 超过节点上限")
+            }
+            if let cursor = page.nextCursor {
+                guard !seenCursors.contains(cursor) else {
+                    throw CodexClientError.invalidResponse("后代 thread/list cursor 循环：\(cursor)")
+                }
+                guard nextPageCount < maximumPageCount else {
+                    throw CodexClientError.invalidResponse("后代 thread/list 超过分页上限")
+                }
+                guard threads.count + page.threads.count < maximumThreadCount else {
+                    throw CodexClientError.invalidResponse("后代 thread/list 超过节点上限")
+                }
+            }
+
+            pageCount = nextPageCount
+            threads.append(contentsOf: page.threads)
+            nextCursor = page.nextCursor
+            if let nextCursor { seenCursors.insert(nextCursor) }
+        }
     }
 
     private struct DynamicToolRegistration {
@@ -360,6 +417,64 @@ final class CodexAppServerClient: ObservableObject, @unchecked Sendable {
         let nextCursor: String?
         if let cursorValue = value["nextCursor"] {
             nextCursor = cursorValue.stringValue
+        } else {
+            nextCursor = nil
+        }
+        return CodexThreadPage(threads: threads, nextCursor: nextCursor)
+    }
+
+    func listDescendantThreads(ancestorThreadID: String) async throws -> [CodexThreadSummary] {
+        try await ensureConnected()
+        var pagination = DescendantThreadPaginationState(
+            maximumPageCount: Self.maximumDescendantThreadPageCount,
+            maximumThreadCount: Self.maximumDescendantThreadCount
+        )
+        while true {
+            let value = try await request(
+                method: "thread/list",
+                params: Self.makeDescendantThreadListParams(
+                    ancestorThreadID: ancestorThreadID,
+                    cursor: pagination.nextCursor
+                )
+            )
+            let page = try Self.parseDescendantThreadListResponse(value)
+            try pagination.consume(page)
+            guard pagination.nextCursor != nil else { return pagination.threads }
+        }
+    }
+
+    static func makeDescendantThreadListParams(
+        ancestorThreadID: String,
+        cursor: String?
+    ) -> JSONValue {
+        var params: [String: JSONValue] = [
+            "ancestorThreadId": .string(ancestorThreadID),
+            "sourceKinds": .array(descendantThreadSourceKinds.map(JSONValue.string)),
+            "limit": .integer(Int64(descendantThreadPageSize)),
+            "archived": .bool(false),
+            "useStateDbOnly": .bool(false)
+        ]
+        if let cursor { params["cursor"] = .string(cursor) }
+        return .object(params)
+    }
+
+    static func parseDescendantThreadListResponse(_ value: JSONValue) throws -> CodexThreadPage {
+        guard let rawThreads = value["data"]?.arrayValue else {
+            throw CodexClientError.invalidResponse("后代 thread/list 缺少 data")
+        }
+        let threads = rawThreads.compactMap(parseThread)
+        guard threads.count == rawThreads.count else {
+            throw CodexClientError.invalidResponse("后代 thread/list 包含无效 thread")
+        }
+
+        let nextCursor: String?
+        if let rawCursor = value["nextCursor"] {
+            switch rawCursor {
+            case let .string(cursor): nextCursor = cursor
+            case .null: nextCursor = nil
+            default:
+                throw CodexClientError.invalidResponse("后代 thread/list 包含无效 nextCursor")
+            }
         } else {
             nextCursor = nil
         }

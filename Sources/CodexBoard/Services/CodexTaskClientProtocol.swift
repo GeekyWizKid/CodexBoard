@@ -16,6 +16,7 @@ protocol CodexTaskClient: AnyObject {
     func beginMCPOAuth(serverName: String, threadID: String?) async throws -> URL
     func respond(to requestID: CodexRequestID, with response: CodexInteractionResponse) async throws
     func listThreads(cursor: String?, archived: Bool) async throws -> CodexThreadPage
+    func listDescendantThreads(ancestorThreadID: String) async throws -> [CodexThreadSummary]
     func inspectProjectPath(_ path: String) async throws -> CodexProjectPathInfo
     func readThread(threadID: String, includeTurns: Bool) async throws -> CodexThreadDetail
     func startThread(cwd: String, model: String?, serviceTier: String) async throws -> CodexStartedThread
@@ -59,6 +60,10 @@ extension CodexTaskClient {
 
     func readThread(threadID: String, includeTurns: Bool) async throws -> CodexThreadDetail {
         throw CodexClientError.invalidResponse("当前 Codex 客户端不支持 thread/read")
+    }
+
+    func listDescendantThreads(ancestorThreadID: String) async throws -> [CodexThreadSummary] {
+        throw CodexClientError.invalidResponse("当前 Codex 客户端不支持后代 thread/list")
     }
 }
 
