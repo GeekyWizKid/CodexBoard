@@ -185,6 +185,7 @@ final class BoardPersistenceTests: XCTestCase {
         XCTAssertNil(run.continuation)
         XCTAssertNil(run.policySnapshot)
         XCTAssertNil(run.failure)
+        XCTAssertNil(run.multiAgentDrain)
     }
 
     func testVersionNineSnapshotDefaultsVersionTenRunMetadataAndAttentionToNil() throws {
@@ -243,18 +244,69 @@ final class BoardPersistenceTests: XCTestCase {
         let migratedTask = try XCTUnwrap(migrated.tasks.first)
         let migratedRun = try XCTUnwrap(migratedTask.runs.first)
 
-        XCTAssertEqual(migrated.version, 10)
+        XCTAssertEqual(migrated.version, BoardSnapshot.currentVersion)
         XCTAssertNil(migratedTask.attention)
         XCTAssertNil(migratedRun.continuation)
         XCTAssertNil(migratedRun.policySnapshot)
         XCTAssertNil(migratedRun.failure)
+        XCTAssertNil(migratedRun.multiAgentDrain)
         XCTAssertEqual(migratedRun.threadID, "legacy-thread")
         XCTAssertEqual(migratedRun.error, "Connection lost")
         XCTAssertEqual(migratedTask.threadID, "current-thread")
         XCTAssertEqual(migratedTask.lastError, "Current projection error")
     }
 
-    func testVersionTenRoundTripPreservesRunMetadataAndAttention() async throws {
+    func testVersionTenSnapshotDefaultsVersionElevenDrainStateToNil() throws {
+        let run = TaskRun(
+            id: UUID(uuidString: "E23B3327-50AB-4408-86F9-B81C96CC115F")!,
+            phase: .execution,
+            attempt: 1,
+            startedAt: Date(timeIntervalSinceReferenceDate: 100),
+            outcome: .running,
+            threadID: "thread-v10",
+            sessionID: "session-v10",
+            turnID: "turn-v10",
+            model: "gpt-v10",
+            reasoningEffort: .high,
+            fastMode: false
+        )
+        let task = BoardTask(
+            projectID: "/tmp/version-ten",
+            title: "Version ten task",
+            sourceKind: .issue,
+            sourceText: "Migrate without synthesizing drain state",
+            stage: .executing,
+            autoRun: true,
+            threadID: "thread-v10",
+            sessionID: "session-v10",
+            executionTurnID: "turn-v10",
+            runs: [run]
+        )
+        let snapshot = BoardSnapshot(
+            tasks: [task],
+            hosts: [.local],
+            manualProjects: [],
+            preferences: BoardPreferences()
+        )
+        var object = try jsonDictionary(snapshot)
+        object["version"] = 10
+        var tasks = try XCTUnwrap(object["tasks"] as? [[String: Any]])
+        var runs = try XCTUnwrap(tasks[0]["runs"] as? [[String: Any]])
+        runs[0].removeValue(forKey: "multiAgentDrain")
+        tasks[0]["runs"] = runs
+        object["tasks"] = tasks
+
+        let migrated = try JSONDecoder().decode(
+            BoardSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        )
+
+        let migratedRun = try XCTUnwrap(migrated.tasks.first?.runs.first)
+        XCTAssertEqual(migrated.version, 11)
+        XCTAssertNil(migratedRun.multiAgentDrain)
+    }
+
+    func testVersionElevenRoundTripPreservesRunMetadataDrainAndAttention() async throws {
         let fixture = try TemporaryBoardFixture()
         defer { fixture.remove() }
 
@@ -262,6 +314,10 @@ final class BoardPersistenceTests: XCTestCase {
         let runID = UUID(uuidString: "C87A3084-FD66-49F4-B0EA-4C5B732E4CC5")!
         let failureDate = Date(timeIntervalSinceReferenceDate: 1_234)
         let retryDate = Date(timeIntervalSinceReferenceDate: 1_242)
+        let drainStartedAt = Date(timeIntervalSinceReferenceDate: 1_210)
+        let rootTerminalObservedAt = Date(timeIntervalSinceReferenceDate: 1_220)
+        let cancellationRequestedAt = Date(timeIntervalSinceReferenceDate: 1_225)
+        let lastReconciledAt = Date(timeIntervalSinceReferenceDate: 1_230)
         let continuation = TaskRunContinuation(
             mode: .reusedThread,
             sourceRunID: sourceRunID
@@ -289,6 +345,28 @@ final class BoardPersistenceTests: XCTestCase {
             consecutiveCount: 3,
             automaticRetryCount: 2
         )
+        let drain = TaskRunDrainState(
+            phase: .blocked,
+            rootTerminalStatus: "completed",
+            rootTerminalError: "A child could not be reconciled",
+            rootTerminalObservedAt: rootTerminalObservedAt,
+            knownThreadIDs: ["thread-10", "child-1", "grandchild-1"],
+            parentByThreadID: [
+                "child-1": "thread-10",
+                "grandchild-1": "child-1"
+            ],
+            activeTurns: [TaskRunDrainTurnReference(
+                threadID: "grandchild-1",
+                turnID: "grandchild-turn"
+            )],
+            stabilitySignature: "root=9:thread-10|nodes=3",
+            stableObservationCount: 1,
+            consecutiveReconciliationFailureCount: 3,
+            cancellationRequestedAt: cancellationRequestedAt,
+            startedAt: drainStartedAt,
+            lastReconciledAt: lastReconciledAt,
+            blockedReason: "Missing thread detail: child-1"
+        )
         let attention = TaskAttention(
             id: UUID(uuidString: "4679089C-4A2C-4DFA-8597-D39BF57B41A1")!,
             kind: .failure,
@@ -311,15 +389,16 @@ final class BoardPersistenceTests: XCTestCase {
             continuation: continuation,
             policySnapshot: policy,
             failure: failure,
+            multiAgentDrain: drain,
             summary: "Connection lost",
             error: failure.message
         )
         let task = BoardTask(
             projectID: "/tmp/project",
             hostID: "build-server",
-            title: "Persist v10 metadata",
+            title: "Persist v11 metadata",
             sourceKind: .developmentPlan,
-            sourceText: "Round-trip the v10 ledger",
+            sourceText: "Round-trip the v11 ledger",
             stage: .needsAttention,
             autoRun: false,
             threadID: "thread-10",
@@ -368,10 +447,13 @@ final class BoardPersistenceTests: XCTestCase {
         let restoredTask = try XCTUnwrap(restored.tasks.first)
         let restoredRun = try XCTUnwrap(restoredTask.runs.first)
 
-        XCTAssertEqual(restored.version, 10)
+        XCTAssertEqual(restored.version, 11)
         XCTAssertEqual(restoredRun.continuation, continuation)
         XCTAssertEqual(restoredRun.policySnapshot, policy)
         XCTAssertEqual(restoredRun.failure, failure)
+        XCTAssertEqual(restoredRun.multiAgentDrain, drain)
+        XCTAssertEqual(restoredRun.threadID, "thread-10")
+        XCTAssertEqual(restoredRun.turnID, "turn-10")
         XCTAssertEqual(restoredTask.attention, attention)
         XCTAssertEqual(restoredTask.failureState?.consecutiveCount, 3)
         XCTAssertEqual(restoredTask.failureState?.automaticRetryCount, 2)
@@ -648,7 +730,7 @@ final class BoardPersistenceTests: XCTestCase {
         try legacyData.write(to: fixture.fileURL)
         let persistence = BoardPersistence(fileURL: fixture.fileURL)
 
-        XCTAssertEqual(fixture.migrationBackupURL.lastPathComponent, "board.pre-v10.json")
+        XCTAssertEqual(fixture.migrationBackupURL.lastPathComponent, "board.pre-v11.json")
 
         let migrated = try await persistence.load()
         try await persistence.save(migrated)

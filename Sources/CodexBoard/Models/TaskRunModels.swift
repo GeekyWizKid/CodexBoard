@@ -350,6 +350,73 @@ struct TaskRunFailure: Codable, Hashable, Sendable {
     }
 }
 
+enum TaskRunDrainPhase: String, Codable, Hashable, Sendable {
+    case observing
+    case draining
+    case cancelling
+    case drained
+    case blocked
+}
+
+struct TaskRunDrainTurnReference: Codable, Hashable, Sendable {
+    let threadID: String
+    let turnID: String
+
+    init(threadID: String, turnID: String) {
+        self.threadID = threadID
+        self.turnID = turnID
+    }
+}
+
+struct TaskRunDrainState: Codable, Hashable, Sendable {
+    var phase: TaskRunDrainPhase
+    var rootTerminalStatus: String?
+    var rootTerminalError: String?
+    var rootTerminalObservedAt: Date?
+    var knownThreadIDs: [String]
+    var parentByThreadID: [String: String]
+    var activeTurns: [TaskRunDrainTurnReference]
+    var stabilitySignature: String?
+    var stableObservationCount: Int
+    var consecutiveReconciliationFailureCount: Int
+    var cancellationRequestedAt: Date?
+    var startedAt: Date
+    var lastReconciledAt: Date?
+    var blockedReason: String?
+
+    init(
+        phase: TaskRunDrainPhase,
+        rootTerminalStatus: String? = nil,
+        rootTerminalError: String? = nil,
+        rootTerminalObservedAt: Date? = nil,
+        knownThreadIDs: [String] = [],
+        parentByThreadID: [String: String] = [:],
+        activeTurns: [TaskRunDrainTurnReference] = [],
+        stabilitySignature: String? = nil,
+        stableObservationCount: Int = 0,
+        consecutiveReconciliationFailureCount: Int = 0,
+        cancellationRequestedAt: Date? = nil,
+        startedAt: Date = Date(),
+        lastReconciledAt: Date? = nil,
+        blockedReason: String? = nil
+    ) {
+        self.phase = phase
+        self.rootTerminalStatus = rootTerminalStatus
+        self.rootTerminalError = rootTerminalError
+        self.rootTerminalObservedAt = rootTerminalObservedAt
+        self.knownThreadIDs = knownThreadIDs
+        self.parentByThreadID = parentByThreadID
+        self.activeTurns = activeTurns
+        self.stabilitySignature = stabilitySignature
+        self.stableObservationCount = stableObservationCount
+        self.consecutiveReconciliationFailureCount = consecutiveReconciliationFailureCount
+        self.cancellationRequestedAt = cancellationRequestedAt
+        self.startedAt = startedAt
+        self.lastReconciledAt = lastReconciledAt
+        self.blockedReason = blockedReason
+    }
+}
+
 struct TaskRun: Codable, Hashable, Identifiable, Sendable {
     let id: UUID
     var phase: TaskRunPhase
@@ -366,6 +433,7 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
     var continuation: TaskRunContinuation?
     var policySnapshot: TaskRunPolicySnapshot?
     var failure: TaskRunFailure?
+    var multiAgentDrain: TaskRunDrainState?
     var summary: String
     var evidence: TaskDeliveryEvidence?
     var codeDelivery: TaskCodeDelivery?
@@ -389,6 +457,7 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
         continuation: TaskRunContinuation? = nil,
         policySnapshot: TaskRunPolicySnapshot? = nil,
         failure: TaskRunFailure? = nil,
+        multiAgentDrain: TaskRunDrainState? = nil,
         summary: String = "",
         evidence: TaskDeliveryEvidence? = nil,
         codeDelivery: TaskCodeDelivery? = nil,
@@ -411,6 +480,7 @@ struct TaskRun: Codable, Hashable, Identifiable, Sendable {
         self.continuation = continuation
         self.policySnapshot = policySnapshot
         self.failure = failure
+        self.multiAgentDrain = multiAgentDrain
         self.summary = summary
         self.evidence = evidence
         self.codeDelivery = codeDelivery
